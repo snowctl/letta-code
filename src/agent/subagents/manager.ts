@@ -123,6 +123,7 @@ const BYOK_PROVIDER_TO_BASE: Record<string, string> = {
   "lc-minimax": "minimax",
   "lc-bedrock": "bedrock",
   "chatgpt-plus-pro": "chatgpt-plus-pro",
+  "openai-proxy": "openai",
 };
 
 function getProviderPrefix(handle: string): string | null {
