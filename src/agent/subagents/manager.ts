@@ -70,8 +70,13 @@ interface ExecutionState {
  * Fetches from API and resolves to a known model ID
  */
 function getModelHandleFromAgent(agent: {
-  llm_config?: { model_endpoint_type?: string | null; model?: string | null };
+  model?: string | null;
+  llm_config?: { handle?: string | null; model_endpoint_type?: string | null; model?: string | null };
 }): string | null {
+  // Prefer the canonical handle fields over reconstructing from endpoint_type/model,
+  // since model_endpoint_type is "openai" for both openai and openai-proxy providers.
+  if (agent.model) return agent.model;
+  if (agent.llm_config?.handle) return agent.llm_config.handle;
   const endpoint = agent.llm_config?.model_endpoint_type;
   const model = agent.llm_config?.model;
   if (endpoint && model) {
