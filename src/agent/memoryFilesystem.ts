@@ -266,7 +266,8 @@ export async function applyMemfsFlags(
   const { settingsManager } = await import("../settings-manager");
 
   // Validate explicit enable on supported backend.
-  if (memfsFlag && !(await isLettaCloud())) {
+  // Allow when LETTA_MEMFS_GIT_URL is set (external git host for memfs).
+  if (memfsFlag && !process.env.LETTA_MEMFS_GIT_URL && !(await isLettaCloud())) {
     throw new Error(
       "--memfs is only available on Letta Cloud (api.letta.com).",
     );
