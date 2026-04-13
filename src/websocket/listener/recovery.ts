@@ -21,12 +21,18 @@ import {
 import { createBuffers } from "../../cli/helpers/accumulator";
 import { drainStreamWithResume } from "../../cli/helpers/stream";
 import { computeDiffPreviews } from "../../helpers/diffPreview";
+import { isInteractiveApprovalTool } from "../../tools/interactivePolicy";
+import { prepareToolExecutionContextForScope } from "../../tools/toolset";
 import type {
   ApprovalResponseBody,
   StopReasonType,
   StreamDelta,
 } from "../../types/protocol_v2";
-import { parseApprovalInput } from "./approval";
+import {
+  applySuggestedPermissionsForApproval,
+  buildApprovalSuggestionPayload,
+  classifyApprovalsWithSuggestions,
+} from "./approval-suggestions";
 import {
   MAX_POST_STOP_APPROVAL_RECOVERY,
   NO_AWAITING_APPROVAL_DETAIL_FRAGMENT,
@@ -38,17 +44,22 @@ import {
   emitToolExecutionStartedEvents,
   normalizeToolReturnWireMessage,
 } from "./interrupts";
+import { getOrCreateConversationPermissionModeStateRef } from "./permissionMode";
 import {
   emitCanonicalMessageDelta,
   emitDequeuedUserMessage,
   emitInterruptedStatusDelta,
-  emitLoopErrorDelta,
   emitLoopStatusUpdate,
   emitRuntimeStateUpdates,
   setLoopStatus,
 } from "./protocol-outbound";
 import { consumeQueuedTurn } from "./queue";
-import { clearActiveRunState, clearRecoveredApprovalState } from "./runtime";
+import { emitLoopErrorNotice } from "./recoverable-notices";
+import {
+  clearActiveRunState,
+  clearRecoveredApprovalState,
+  hasInterruptedCacheForScope,
+} from "./runtime";
 import type {
   ConversationRuntime,
   IncomingMessage,
@@ -89,6 +100,7 @@ export function shouldAttemptPostStopApprovalRecovery(params: {
 export async function isRetriablePostStopError(
   stopReason: StopReasonType,
   lastRunId: string | null | undefined,
+  fallbackDetail?: string | null,
 ): Promise<boolean> {
   if (stopReason === "llm_api_error") {
     return true;
@@ -109,7 +121,7 @@ export async function isRetriablePostStopError(
   }
 
   if (!lastRunId) {
-    return false;
+    return shouldRetryRunMetadataError(undefined, fallbackDetail);
   }
 
   try {
@@ -127,7 +139,7 @@ export async function isRetriablePostStopError(
     const detail = metaError?.detail ?? metaError?.error?.detail ?? "";
     return shouldRetryRunMetadataError(errorType, detail);
   } catch {
-    return false;
+    return shouldRetryRunMetadataError(undefined, fallbackDetail);
   }
 }
 
@@ -165,13 +177,15 @@ export async function drainRecoveryStreamWithEmission(
       }
 
       if (errorInfo) {
-        emitLoopErrorDelta(socket, runtime, {
+        emitLoopErrorNotice(socket, runtime, {
           message: errorInfo.message || "Stream error",
           stopReason: (errorInfo.error_type as StopReasonType) || "error",
           isTerminal: false,
           runId: runtime.activeRunId || errorInfo.run_id,
           agentId: params.agentId ?? undefined,
           conversationId: params.conversationId,
+          errorInfo,
+          abortSignal: params.abortSignal,
         });
       }
 
@@ -245,7 +259,7 @@ export function finalizeHandledRecoveryTurn(
   const runId = runtime.activeRunId;
   clearActiveRunState(runtime);
   emitRuntimeStateUpdates(runtime, scope);
-  emitLoopErrorDelta(socket, runtime, {
+  emitLoopErrorNotice(socket, runtime, {
     message: `Recovery continuation ended unexpectedly: ${terminalStopReason}`,
     stopReason: terminalStopReason,
     isTerminal: true,
@@ -324,10 +338,36 @@ export async function debugLogApprovalResumeState(
   }
 }
 
+function buildRecoveredAutoDecisions(
+  autoAllowed: Awaited<
+    ReturnType<typeof classifyApprovalsWithSuggestions>
+  >["autoAllowed"],
+  autoDenied: Awaited<
+    ReturnType<typeof classifyApprovalsWithSuggestions>
+  >["autoDenied"],
+): ApprovalDecision[] {
+  return [
+    ...autoAllowed.map((ac) => ({
+      type: "approve" as const,
+      approval: ac.approval,
+    })),
+    ...autoDenied.map((ac) => ({
+      type: "deny" as const,
+      approval: ac.approval,
+      reason: ac.denyReason || ac.permission.reason || "Permission denied",
+    })),
+  ];
+}
+
 export async function recoverApprovalStateForSync(
   runtime: ConversationRuntime,
   scope: { agent_id: string; conversation_id: string },
 ): Promise<void> {
+  if (hasInterruptedCacheForScope(runtime.listener, scope)) {
+    clearRecoveredApprovalState(runtime);
+    return;
+  }
+
   const sameActiveScope =
     runtime.agentId === scope.agent_id &&
     runtime.conversationId === scope.conversation_id;
@@ -382,23 +422,46 @@ export async function recoverApprovalStateForSync(
     return;
   }
 
+  const workingDirectory = getConversationWorkingDirectory(
+    runtime.listener,
+    scope.agent_id,
+    scope.conversation_id,
+  );
+  const permissionModeState = getOrCreateConversationPermissionModeStateRef(
+    runtime.listener,
+    scope.agent_id,
+    scope.conversation_id,
+  );
+  const { needsUserInput, autoAllowed, autoDenied } =
+    await classifyApprovalsWithSuggestions(pendingApprovals, {
+      alwaysRequiresUserInput: isInteractiveApprovalTool,
+      requireArgsForAutoApprove: true,
+      missingNameReason: "Tool call incomplete - missing name",
+      workingDirectory,
+      permissionModeState,
+    });
+  const autoDecisions = buildRecoveredAutoDecisions(autoAllowed, autoDenied);
+
+  if (needsUserInput.length === 0) {
+    clearRecoveredApprovalState(runtime);
+    return;
+  }
+
   const approvalsByRequestId = new Map<string, RecoveredPendingApproval>();
   await Promise.all(
-    pendingApprovals.map(async (approval) => {
+    needsUserInput.map(async (approvalEntry) => {
+      const approval = approvalEntry.approval;
       const requestId = `perm-${approval.toolCallId}`;
-      const input = parseApprovalInput(approval.toolArgs);
+      const input = approvalEntry.parsedArgs;
       const diffs = await computeDiffPreviews(
         approval.toolName,
         input,
-        getConversationWorkingDirectory(
-          runtime.listener,
-          scope.agent_id,
-          scope.conversation_id,
-        ),
+        workingDirectory,
       );
 
       approvalsByRequestId.set(requestId, {
         approval,
+        approvalContext: approvalEntry.context,
         controlRequest: {
           type: "control_request",
           request_id: requestId,
@@ -407,7 +470,7 @@ export async function recoverApprovalStateForSync(
             tool_name: approval.toolName,
             input,
             tool_call_id: approval.toolCallId,
-            permission_suggestions: [],
+            ...buildApprovalSuggestionPayload(approvalEntry.context),
             blocked_path: null,
             ...(diffs.length > 0 ? { diffs } : {}),
           },
@@ -424,6 +487,8 @@ export async function recoverApprovalStateForSync(
     approvalsByRequestId,
     pendingRequestIds: new Set(approvalsByRequestId.keys()),
     responsesByRequestId: new Map(),
+    autoDecisions,
+    allApprovals: pendingApprovals,
   };
 }
 
@@ -462,6 +527,73 @@ export async function resolveRecoveredApprovalResponse(
 
   recovered.responsesByRequestId.set(requestId, response);
   recovered.pendingRequestIds.delete(requestId);
+  const workingDirectory = getConversationWorkingDirectory(
+    runtime.listener,
+    recovered.agentId,
+    recovered.conversationId,
+  );
+  const respondedEntry = recovered.approvalsByRequestId.get(requestId);
+  if (
+    respondedEntry &&
+    "decision" in response &&
+    response.decision.behavior === "allow"
+  ) {
+    const savedSuggestions = await applySuggestedPermissionsForApproval({
+      decision: response.decision,
+      context: respondedEntry.approvalContext,
+      workingDirectory,
+    });
+
+    if (savedSuggestions && recovered.pendingRequestIds.size > 0) {
+      const remainingRecoveredEntries = [...recovered.pendingRequestIds]
+        .map((id) => recovered.approvalsByRequestId.get(id))
+        .filter((entry): entry is RecoveredPendingApproval => !!entry);
+      const reclassified = await classifyApprovalsWithSuggestions(
+        remainingRecoveredEntries.map((entry) => entry.approval),
+        {
+          alwaysRequiresUserInput: isInteractiveApprovalTool,
+          requireArgsForAutoApprove: true,
+          missingNameReason: "Tool call incomplete - missing name",
+          workingDirectory,
+          permissionModeState: getOrCreateConversationPermissionModeStateRef(
+            runtime.listener,
+            recovered.agentId,
+            recovered.conversationId,
+          ),
+        },
+      );
+
+      if (
+        reclassified.autoAllowed.length > 0 ||
+        reclassified.autoDenied.length > 0
+      ) {
+        recovered.autoDecisions = [
+          ...(recovered.autoDecisions ?? []),
+          ...buildRecoveredAutoDecisions(
+            reclassified.autoAllowed,
+            reclassified.autoDenied,
+          ),
+        ];
+
+        const reclassifiedToolCallIds = new Set(
+          [...reclassified.autoAllowed, ...reclassified.autoDenied].map(
+            (entry) => entry.approval.toolCallId,
+          ),
+        );
+        for (const pendingId of [...recovered.pendingRequestIds]) {
+          const pendingEntry = recovered.approvalsByRequestId.get(pendingId);
+          if (
+            pendingEntry &&
+            reclassifiedToolCallIds.has(pendingEntry.approval.toolCallId)
+          ) {
+            recovered.pendingRequestIds.delete(pendingId);
+            recovered.approvalsByRequestId.delete(pendingId);
+            recovered.responsesByRequestId.delete(pendingId);
+          }
+        }
+      }
+    }
+  }
 
   if (recovered.pendingRequestIds.size > 0) {
     emitRuntimeStateUpdates(runtime, {
@@ -471,7 +603,7 @@ export async function resolveRecoveredApprovalResponse(
     return true;
   }
 
-  const decisions: ApprovalDecision[] = [];
+  const decisions: ApprovalDecision[] = [...(recovered.autoDecisions ?? [])];
   for (const [id, entry] of recovered.approvalsByRequestId) {
     const approvalResponse = recovered.responsesByRequestId.get(id);
     if (!approvalResponse) {
@@ -511,6 +643,11 @@ export async function resolveRecoveredApprovalResponse(
     agent_id: recovered.agentId,
     conversation_id: recovered.conversationId,
   } as const;
+  if (hasInterruptedCacheForScope(runtime.listener, scope)) {
+    clearRecoveredApprovalState(runtime);
+    emitRuntimeStateUpdates(runtime, scope);
+    return true;
+  }
   const approvedToolCallIds = decisions
     .filter(
       (decision): decision is Extract<ApprovalDecision, { type: "approve" }> =>
@@ -522,11 +659,7 @@ export async function resolveRecoveredApprovalResponse(
   emitRuntimeStateUpdates(runtime, scope);
 
   runtime.isProcessing = true;
-  runtime.activeWorkingDirectory = getConversationWorkingDirectory(
-    runtime.listener,
-    recovered.agentId,
-    recovered.conversationId,
-  );
+  runtime.activeWorkingDirectory = workingDirectory;
   runtime.activeExecutingToolCallIds = [...approvedToolCallIds];
   setLoopStatus(runtime, "EXECUTING_CLIENT_SIDE_TOOL", scope);
   emitRuntimeStateUpdates(runtime, scope);
@@ -538,14 +671,32 @@ export async function resolveRecoveredApprovalResponse(
   });
   const recoveryAbortController = new AbortController();
   runtime.activeAbortController = recoveryAbortController;
+  const preparedToolContext = await prepareToolExecutionContextForScope({
+    agentId: recovered.agentId,
+    conversationId: recovered.conversationId,
+    workingDirectory: runtime.activeWorkingDirectory,
+    permissionModeState: getOrCreateConversationPermissionModeStateRef(
+      runtime.listener,
+      recovered.agentId,
+      recovered.conversationId,
+    ),
+  });
+  runtime.currentToolset = preparedToolContext.toolset;
+  runtime.currentToolsetPreference = preparedToolContext.toolsetPreference;
+  runtime.currentLoadedTools =
+    preparedToolContext.preparedToolContext.loadedToolNames;
   try {
     const approvalResults = await executeApprovalBatch(decisions, undefined, {
       abortSignal: recoveryAbortController.signal,
-      workingDirectory: getConversationWorkingDirectory(
-        runtime.listener,
-        recovered.agentId,
-        recovered.conversationId,
-      ),
+      toolContextId: preparedToolContext.preparedToolContext.contextId,
+      workingDirectory,
+      parentScope:
+        recovered.agentId && recovered.conversationId
+          ? {
+              agentId: recovered.agentId,
+              conversationId: recovered.conversationId,
+            }
+          : undefined,
     });
 
     emitToolExecutionFinishedEvents(socket, runtime, {

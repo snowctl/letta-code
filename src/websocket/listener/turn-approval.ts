@@ -9,10 +9,10 @@ import {
   type ApprovalResult,
   executeApprovalBatch,
 } from "../../agent/approval-execution";
-import { classifyApprovals } from "../../cli/helpers/approvalClassification";
 import { computeDiffPreviews } from "../../helpers/diffPreview";
 import { isInteractiveApprovalTool } from "../../tools/interactivePolicy";
 import type {
+  ApprovalResponseBody,
   ApprovalResponseDecision,
   ControlRequest,
 } from "../../types/protocol_v2";
@@ -25,23 +25,30 @@ import {
   validateApprovalResultIds,
 } from "./approval";
 import {
+  applySuggestedPermissionsForApproval,
+  buildApprovalSuggestionPayload,
+  classifyApprovalsWithSuggestions,
+} from "./approval-suggestions";
+import {
   emitInterruptToolReturnMessage,
   emitToolExecutionFinishedEvents,
   emitToolExecutionStartedEvents,
   normalizeExecutionResultsForInterruptParity,
+  populateInterruptQueue,
 } from "./interrupts";
 import {
   emitDequeuedUserMessage,
-  emitLoopErrorDelta,
   emitRuntimeStateUpdates,
   setLoopStatus,
 } from "./protocol-outbound";
 import { consumeQueuedTurn } from "./queue";
+import { emitLoopErrorNotice } from "./recoverable-notices";
 import { debugLogApprovalResumeState } from "./recovery";
 import {
   markAwaitingAcceptedApprovalContinuationRunId,
   sendApprovalContinuationWithRetry,
 } from "./send";
+import { injectQueuedSkillContent } from "./skill-injection";
 import type { ConversationRuntime } from "./types";
 
 type Decision =
@@ -136,7 +143,7 @@ export async function handleApprovalStop(params: {
       conversation_id: conversationId,
     });
 
-    emitLoopErrorDelta(socket, runtime, {
+    emitLoopErrorNotice(socket, runtime, {
       message: "requires_approval stop returned no approvals",
       stopReason: "error",
       isTerminal: true,
@@ -160,22 +167,50 @@ export async function handleApprovalStop(params: {
   clearPendingApprovalBatchIds(runtime, approvals);
   rememberPendingApprovalBatchIds(runtime, approvals, dequeuedBatchId);
 
-  const { autoAllowed, autoDenied, needsUserInput } = await classifyApprovals(
-    approvals,
-    {
+  const { autoAllowed, autoDenied, needsUserInput } =
+    await classifyApprovalsWithSuggestions(approvals, {
       alwaysRequiresUserInput: isInteractiveApprovalTool,
       treatAskAsDeny: false,
       requireArgsForAutoApprove: true,
       missingNameReason: "Tool call incomplete - missing name",
       workingDirectory: turnWorkingDirectory,
       permissionModeState: turnPermissionModeState,
-    },
-  );
+    });
 
-  const lastNeedsUserInputToolCallIds = needsUserInput.map(
+  let pendingNeedsUserInput = [...needsUserInput];
+  let lastNeedsUserInputToolCallIds = pendingNeedsUserInput.map(
     (ac) => ac.approval.toolCallId,
   );
   let lastExecutionResults: ApprovalResult[] | null = null;
+  let lastExecutingToolCallIds: string[] = [];
+
+  const shouldInterrupt = () =>
+    abortController.signal.aborted || runtime.cancelRequested;
+
+  const interruptTermination = (
+    interruptedInput: Array<MessageCreate | ApprovalCreate> = currentInput,
+    interruptedBatchId: string = dequeuedBatchId,
+  ): ApprovalBranchResult => {
+    populateInterruptQueue(runtime, {
+      lastExecutionResults,
+      lastExecutingToolCallIds,
+      lastNeedsUserInputToolCallIds,
+      agentId: agentId || "",
+      conversationId,
+    });
+    return {
+      terminated: true,
+      stream: null,
+      currentInput: interruptedInput,
+      dequeuedBatchId: interruptedBatchId,
+      pendingNormalizationInterruptedToolCallIds: [],
+      turnToolContextId,
+      lastExecutionResults,
+      lastExecutingToolCallIds,
+      lastNeedsUserInputToolCallIds,
+      lastApprovalContinuationAccepted: false,
+    };
+  };
 
   const decisions: Decision[] = [
     ...autoAllowed.map((ac) => ({
@@ -189,20 +224,34 @@ export async function handleApprovalStop(params: {
     })),
   ];
 
-  if (needsUserInput.length > 0) {
-    runtime.lastStopReason = "requires_approval";
-    setLoopStatus(runtime, "WAITING_ON_APPROVAL", {
-      agent_id: agentId,
-      conversation_id: conversationId,
-    });
+  if (shouldInterrupt()) {
+    return interruptTermination();
+  }
 
-    for (const ac of needsUserInput) {
+  if (pendingNeedsUserInput.length > 0) {
+    if (shouldInterrupt()) {
+      return interruptTermination();
+    }
+
+    while (pendingNeedsUserInput.length > 0) {
+      const ac = pendingNeedsUserInput.shift();
+      if (!ac) {
+        break;
+      }
+
+      if (shouldInterrupt()) {
+        return interruptTermination();
+      }
+
       const requestId = `perm-${ac.approval.toolCallId}`;
       const diffs = await computeDiffPreviews(
         ac.approval.toolName,
         ac.parsedArgs,
         turnWorkingDirectory,
       );
+      if (shouldInterrupt()) {
+        return interruptTermination();
+      }
       const controlRequest: ControlRequest = {
         type: "control_request",
         request_id: requestId,
@@ -211,7 +260,7 @@ export async function handleApprovalStop(params: {
           tool_name: ac.approval.toolName,
           input: ac.parsedArgs,
           tool_call_id: ac.approval.toolCallId,
-          permission_suggestions: [],
+          ...buildApprovalSuggestionPayload(ac.context),
           blocked_path: null,
           ...(diffs.length > 0 ? { diffs } : {}),
         },
@@ -219,16 +268,33 @@ export async function handleApprovalStop(params: {
         conversation_id: conversationId,
       };
 
-      const responseBody = await requestApprovalOverWS(
-        runtime,
-        socket,
-        requestId,
-        controlRequest,
-      );
+      let responseBody: ApprovalResponseBody;
+      try {
+        responseBody = await requestApprovalOverWS(
+          runtime,
+          socket,
+          requestId,
+          controlRequest,
+        );
+      } catch (error) {
+        if (shouldInterrupt()) {
+          return interruptTermination();
+        }
+        throw error;
+      }
+
+      if (shouldInterrupt()) {
+        return interruptTermination();
+      }
 
       if ("decision" in responseBody) {
         const response = responseBody.decision as ApprovalResponseDecision;
         if (response.behavior === "allow") {
+          const savedSuggestions = await applySuggestedPermissionsForApproval({
+            decision: response,
+            context: ac.context,
+            workingDirectory: turnWorkingDirectory,
+          });
           const finalApproval = response.updated_input
             ? {
                 ...ac.approval,
@@ -240,6 +306,39 @@ export async function handleApprovalStop(params: {
             approval: finalApproval,
             reason: response.message,
           });
+
+          if (savedSuggestions && pendingNeedsUserInput.length > 0) {
+            const reclassified = await classifyApprovalsWithSuggestions(
+              pendingNeedsUserInput.map((entry) => entry.approval),
+              {
+                alwaysRequiresUserInput: isInteractiveApprovalTool,
+                treatAskAsDeny: false,
+                requireArgsForAutoApprove: true,
+                missingNameReason: "Tool call incomplete - missing name",
+                workingDirectory: turnWorkingDirectory,
+                permissionModeState: turnPermissionModeState,
+              },
+            );
+
+            decisions.push(
+              ...reclassified.autoAllowed.map((entry) => ({
+                type: "approve" as const,
+                approval: entry.approval,
+              })),
+              ...reclassified.autoDenied.map((entry) => ({
+                type: "deny" as const,
+                approval: entry.approval,
+                reason:
+                  entry.denyReason ||
+                  entry.permission.reason ||
+                  "Permission denied",
+              })),
+            );
+            pendingNeedsUserInput = [...reclassified.needsUserInput];
+            lastNeedsUserInputToolCallIds = pendingNeedsUserInput.map(
+              (entry) => entry.approval.toolCallId,
+            );
+          }
         } else {
           decisions.push({
             type: "deny",
@@ -257,7 +356,11 @@ export async function handleApprovalStop(params: {
     }
   }
 
-  const lastExecutingToolCallIds = decisions
+  if (shouldInterrupt()) {
+    return interruptTermination();
+  }
+
+  lastExecutingToolCallIds = decisions
     .filter(
       (decision): decision is Extract<Decision, { type: "approve" }> =>
         decision.type === "approve",
@@ -281,10 +384,16 @@ export async function handleApprovalStop(params: {
     conversationId,
   });
 
+  if (shouldInterrupt()) {
+    return interruptTermination();
+  }
+
   const executionResults = await executeApprovalBatch(decisions, undefined, {
     toolContextId: turnToolContextId ?? undefined,
     abortSignal: abortController.signal,
     workingDirectory: turnWorkingDirectory,
+    parentScope:
+      agentId && conversationId ? { agentId, conversationId } : undefined,
   });
   const persistedExecutionResults = normalizeExecutionResultsForInterruptParity(
     runtime,
@@ -317,6 +426,10 @@ export async function handleApprovalStop(params: {
     "tool-return",
   );
 
+  if (shouldInterrupt()) {
+    return interruptTermination();
+  }
+
   const nextInput: Array<MessageCreate | ApprovalCreate> = [
     {
       type: "approval",
@@ -332,23 +445,40 @@ export async function handleApprovalStop(params: {
     emitDequeuedUserMessage(socket, runtime, queuedTurn, dequeuedBatch);
   }
 
+  const nextInputWithSkillContent = injectQueuedSkillContent(nextInput);
+
+  if (shouldInterrupt()) {
+    return interruptTermination(nextInputWithSkillContent, continuationBatchId);
+  }
+
   setLoopStatus(runtime, "SENDING_API_REQUEST", {
     agent_id: agentId,
     conversation_id: conversationId,
   });
-  const stream = await sendApprovalContinuationWithRetry(
-    conversationId,
-    nextInput,
-    buildSendOptions(),
-    socket,
-    runtime,
-    abortController.signal,
-  );
+  let stream: Stream<LettaStreamingResponse> | null;
+  try {
+    stream = await sendApprovalContinuationWithRetry(
+      conversationId,
+      nextInputWithSkillContent,
+      buildSendOptions(),
+      socket,
+      runtime,
+      abortController.signal,
+    );
+  } catch (error) {
+    if (shouldInterrupt()) {
+      return interruptTermination(
+        nextInputWithSkillContent,
+        continuationBatchId,
+      );
+    }
+    throw error;
+  }
   if (!stream) {
     return {
       terminated: true,
       stream: null,
-      currentInput: nextInput,
+      currentInput: nextInputWithSkillContent,
       dequeuedBatchId: continuationBatchId,
       pendingNormalizationInterruptedToolCallIds: [],
       turnToolContextId,
@@ -392,7 +522,7 @@ export async function handleApprovalStop(params: {
   return {
     terminated: false,
     stream,
-    currentInput: nextInput,
+    currentInput: nextInputWithSkillContent,
     dequeuedBatchId: continuationBatchId,
     pendingNormalizationInterruptedToolCallIds: [],
     turnToolContextId: null,

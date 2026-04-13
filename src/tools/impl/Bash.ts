@@ -1,16 +1,44 @@
 import { spawn } from "node:child_process";
+import { resolve } from "node:path";
 import { INTERRUPTED_BY_USER } from "../../constants";
 import {
+  appendBackgroundProcessOutput,
   appendToOutputFile,
+  assertBackgroundProcessCapacity,
   backgroundProcesses,
   createBackgroundOutputFile,
   getNextBashId,
+  scheduleBackgroundProcessCleanup,
+  unrefTimer,
 } from "./process_manager.js";
 import { getShellEnv } from "./shellEnv.js";
 import { buildShellLaunchers } from "./shellLaunchers.js";
 import { spawnWithLauncher } from "./shellRunner.js";
 import { LIMITS, truncateByChars } from "./truncation.js";
 import { validateRequiredParams } from "./validation.js";
+
+/**
+ * Check if a `git worktree add` command targets `.letta/worktrees/`.
+ * Returns an error message if the path is invalid, or null if OK.
+ */
+function validateWorktreePath(command: string, cwd: string): string | null {
+  // Match `git worktree add` with optional flags before the path
+  const match = command.match(/\bgit\s+worktree\s+add\s+(?:-b\s+\S+\s+)?(\S+)/);
+  if (!match?.[1]) return null;
+
+  const targetPath = match[1];
+  const resolved = resolve(cwd, targetPath);
+  const requiredPrefix = resolve(cwd, ".letta/worktrees");
+
+  if (!resolved.startsWith(requiredPrefix)) {
+    return (
+      `Error: Worktrees must be created under .letta/worktrees/. ` +
+      `Use: git worktree add -b <branch> .letta/worktrees/<name> main\n` +
+      `Got: ${targetPath}`
+    );
+  }
+  return null;
+}
 
 // Cache the working shell launcher after first successful spawn
 let cachedWorkingLauncher: string[] | null = null;
@@ -150,6 +178,15 @@ export async function bash(args: BashArgs): Promise<BashResult> {
   } = args;
   const userCwd = process.env.USER_CWD || process.cwd();
 
+  // Block worktree creation outside .letta/worktrees/
+  const worktreeError = validateWorktreePath(command, userCwd);
+  if (worktreeError) {
+    return {
+      content: [{ type: "text", text: worktreeError }],
+      status: "error",
+    };
+  }
+
   if (command === "/bg") {
     const processes = Array.from(backgroundProcesses.entries());
     if (processes.length === 0) {
@@ -172,6 +209,20 @@ export async function bash(args: BashArgs): Promise<BashResult> {
   }
 
   if (run_in_background) {
+    try {
+      assertBackgroundProcessCapacity();
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: error instanceof Error ? error.message : String(error),
+          },
+        ],
+        status: "error",
+      };
+    }
+
     const bashId = getNextBashId();
     const outputFile = createBackgroundOutputFile(bashId);
     const launcher = getBackgroundLauncher(command);
@@ -197,6 +248,8 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       lastReadIndex: { stdout: 0, stderr: 0 },
       startTime: new Date(),
       outputFile,
+      totalStdoutLines: 0,
+      totalStderrLines: 0,
     });
     const bgProcess = backgroundProcesses.get(bashId);
     if (!bgProcess) {
@@ -204,15 +257,13 @@ export async function bash(args: BashArgs): Promise<BashResult> {
     }
     childProcess.stdout?.on("data", (data: Buffer) => {
       const text = data.toString();
-      const lines = text.split("\n").filter(Boolean);
-      bgProcess.stdout.push(...lines);
+      appendBackgroundProcessOutput(bgProcess, "stdout", text);
       // Also write to output file
       appendToOutputFile(outputFile, text);
     });
     childProcess.stderr?.on("data", (data: Buffer) => {
       const text = data.toString();
-      const lines = text.split("\n").filter(Boolean);
-      bgProcess.stderr.push(...lines);
+      appendBackgroundProcessOutput(bgProcess, "stderr", text);
       // Also write to output file (prefixed with [stderr])
       appendToOutputFile(outputFile, `[stderr] ${text}`);
     });
@@ -220,21 +271,29 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       bgProcess.status = code === 0 ? "completed" : "failed";
       bgProcess.exitCode = code;
       appendToOutputFile(outputFile, `\n[exit code: ${code}]\n`);
+      scheduleBackgroundProcessCleanup(bashId);
     });
     childProcess.on("error", (err: Error) => {
       bgProcess.status = "failed";
-      bgProcess.stderr.push(err.message);
+      appendBackgroundProcessOutput(bgProcess, "stderr", err.message);
       appendToOutputFile(outputFile, `\n[error] ${err.message}\n`);
+      scheduleBackgroundProcessCleanup(bashId);
     });
     if (timeout && timeout > 0) {
-      setTimeout(() => {
+      const timeoutHandle = setTimeout(() => {
         if (bgProcess.status === "running") {
           childProcess.kill("SIGTERM");
           bgProcess.status = "failed";
-          bgProcess.stderr.push(`Command timed out after ${timeout}ms`);
+          appendBackgroundProcessOutput(
+            bgProcess,
+            "stderr",
+            `Command timed out after ${timeout}ms`,
+          );
           appendToOutputFile(outputFile, `\n[timeout after ${timeout}ms]\n`);
+          scheduleBackgroundProcessCleanup(bashId);
         }
       }, timeout);
+      unrefTimer(timeoutHandle);
     }
     return {
       content: [

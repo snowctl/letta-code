@@ -7,7 +7,10 @@ import {
   type ReflectionSettings,
   shouldFireStepCountTrigger,
 } from "../cli/helpers/memoryReminder";
-import { buildSessionContext } from "../cli/helpers/sessionContext";
+import {
+  buildSessionContext,
+  type SessionContextSource,
+} from "../cli/helpers/sessionContext";
 import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "../constants";
 import { permissionMode } from "../permissions/mode";
 import { settingsManager } from "../settings-manager";
@@ -17,7 +20,7 @@ import {
   type SharedReminderId,
   type SharedReminderMode,
 } from "./catalog";
-import type { SharedReminderState } from "./state";
+import type { SessionContextReason, SharedReminderState } from "./state";
 
 type ReflectionTriggerSource = "step-count" | "compaction-event";
 
@@ -26,7 +29,7 @@ export interface AgentReminderContext {
   name: string | null;
   description?: string | null;
   lastRunAt?: string | null;
-  serverUrl?: string;
+  conversationId?: string;
 }
 
 export interface SharedReminderContext {
@@ -40,6 +43,12 @@ export interface SharedReminderContext {
   maybeLaunchReflectionSubagent?: (
     triggerSource: ReflectionTriggerSource,
   ) => Promise<boolean>;
+  /** Explicit working directory (overrides process.cwd() in session context). */
+  workingDirectory?: string;
+  /** Source of the session context (varies intro text). */
+  sessionContextSource?: SessionContextSource;
+  /** Reason the session context is being (re)generated. */
+  sessionContextReason?: SessionContextReason;
 }
 
 export type ReminderTextPart = { type: "text"; text: string };
@@ -67,11 +76,38 @@ async function buildAgentInfoReminder(
       description: context.agent.description,
       lastRunAt: context.agent.lastRunAt,
     },
-    serverUrl: context.agent.serverUrl,
+    conversationId: context.agent.conversationId,
   });
 
   context.state.hasSentAgentInfo = true;
   return reminder || null;
+}
+
+async function buildSecretsInfoReminder(
+  context: SharedReminderContext,
+): Promise<string | null> {
+  if (context.state.hasSentSecretsInfo) {
+    return null;
+  }
+
+  context.state.hasSentSecretsInfo = true;
+
+  try {
+    const { listSecretNames } = await import("../utils/secretsStore");
+    const names = listSecretNames();
+    if (names.length === 0) {
+      return null;
+    }
+
+    const list = names.map((n) => `- \`$${n}\``).join("\n");
+    return `${SYSTEM_REMINDER_OPEN}Use \`$SECRET_NAME\` syntax in shell commands to reference these secrets:\n\n${list}\n\nThe actual secret value will be automatically substituted before the command runs, and scrubbed from the output. You never see the real value — just use \`$SECRET_NAME\` directly (e.g. \`curl -H "Authorization: Bearer $MY_API_KEY" ...\`).\n${SYSTEM_REMINDER_CLOSE}`;
+  } catch (error) {
+    debugLog(
+      "secrets",
+      `Failed to build secrets reminder: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
 }
 
 async function buildSessionContextReminder(
@@ -88,9 +124,19 @@ async function buildSessionContextReminder(
     return null;
   }
 
-  const reminder = buildSessionContext();
+  const reason =
+    context.sessionContextReason ??
+    context.state.pendingSessionContextReason ??
+    "initial_attach";
+
+  const reminder = buildSessionContext({
+    cwd: context.workingDirectory,
+    source: context.sessionContextSource,
+    reason,
+  });
 
   context.state.hasSentSessionContext = true;
+  context.state.pendingSessionContextReason = undefined;
   return reminder || null;
 }
 
@@ -109,6 +155,8 @@ const PERMISSION_MODE_DESCRIPTIONS = {
   default: "Normal approval flow.",
   acceptEdits: "File edits auto-approved.",
   plan: "Read-only mode. Focus on exploration and planning.",
+  memory:
+    "Memory-scoped mode. Reads are broad; mutations are limited to allowed memory roots.",
   bypassPermissions: "All tools auto-approved. Bias toward action.",
 } as const;
 
@@ -207,15 +255,6 @@ async function buildReflectionCompactionReminder(
   }
 
   return buildCompactionMemoryReminder(context.agent.id);
-}
-
-async function buildAutoInitReminder(
-  context: SharedReminderContext,
-): Promise<string | null> {
-  if (!context.state.pendingAutoInitReminder) return null;
-  context.state.pendingAutoInitReminder = false;
-  const { AUTO_INIT_REMINDER } = await import("../agent/promptAssets.js");
-  return AUTO_INIT_REMINDER;
 }
 
 const MAX_COMMAND_REMINDERS_PER_TURN = 10;
@@ -326,6 +365,7 @@ export const sharedReminderProviders: Record<
   SharedReminderProvider
 > = {
   "agent-info": buildAgentInfoReminder,
+  "secrets-info": buildSecretsInfoReminder,
   "session-context": buildSessionContextReminder,
   "permission-mode": buildPermissionModeReminder,
   "plan-mode": buildPlanModeReminder,
@@ -333,7 +373,6 @@ export const sharedReminderProviders: Record<
   "reflection-compaction": buildReflectionCompactionReminder,
   "command-io": buildCommandIoReminder,
   "toolset-change": buildToolsetChangeReminder,
-  "auto-init": buildAutoInitReminder,
 };
 
 export function assertSharedReminderCoverage(): void {

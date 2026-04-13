@@ -8,6 +8,7 @@ import type {
 } from "../../queue/queueRuntime";
 import { isCoalescable } from "../../queue/queueRuntime";
 import { mergeQueuedTurnInput } from "../../queue/turnQueueRuntime";
+import { trackBoundaryError } from "../../telemetry/errorReporting";
 import { getListenerBlockedReason } from "../helpers/listenerQueueAdapter";
 import { emitDequeuedUserMessage } from "./protocol-outbound";
 import {
@@ -70,6 +71,10 @@ function mergeDequeuedBatchContent(
         kind: "task_notification";
         text: string;
       }
+    | {
+        kind: "cron_prompt";
+        text: string;
+      }
   > = [];
 
   for (const item of items) {
@@ -83,6 +88,13 @@ function mergeDequeuedBatchContent(
     if (item.kind === "task_notification") {
       queuedInputs.push({
         kind: "task_notification",
+        text: item.text,
+      });
+      continue;
+    }
+    if (item.kind === "cron_prompt") {
+      queuedInputs.push({
+        kind: "cron_prompt",
         text: item.text,
       });
     }
@@ -207,10 +219,30 @@ function buildQueuedTurnMessage(
 ): IncomingMessage | null {
   const primaryItem = getPrimaryQueueMessageItem(batch.items);
   if (!primaryItem) {
+    // No user message in the batch — this is a notification-only batch.
+    // Build a synthetic IncomingMessage to restart the agent loop.
     for (const item of batch.items) {
       runtime.queuedMessagesByItemId.delete(item.id);
     }
-    return null;
+
+    const mergedContent = mergeDequeuedBatchContent(batch.items);
+    if (mergedContent === null) {
+      return null;
+    }
+
+    // Determine scope from the batch items (they all share the same scope)
+    const scopeItem = batch.items[0];
+    return {
+      type: "message",
+      agentId: scopeItem?.agentId ?? runtime.agentId ?? undefined,
+      conversationId: scopeItem?.conversationId ?? runtime.conversationId,
+      messages: [
+        {
+          role: "user",
+          content: mergedContent,
+        } satisfies MessageCreate,
+      ],
+    };
   }
 
   const template = runtime.queuedMessagesByItemId.get(primaryItem.id);
@@ -266,6 +298,8 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
 
   let queueLen = 0;
   let hasMessage = false;
+  let hasTaskNotification = false;
+  let hasCronPrompt = false;
   for (const item of queuedItems) {
     if (
       !isCoalescable(item.kind) ||
@@ -273,13 +307,23 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
     ) {
       break;
     }
+
     queueLen += 1;
     if (item.kind === "message") {
       hasMessage = true;
     }
+    if (item.kind === "task_notification") {
+      hasTaskNotification = true;
+    }
+    if (item.kind === "cron_prompt") {
+      hasCronPrompt = true;
+    }
   }
 
-  if (!hasMessage || queueLen === 0) {
+  if (
+    (!hasMessage && !hasTaskNotification && !hasCronPrompt) ||
+    queueLen === 0
+  ) {
     return null;
   }
 
@@ -406,6 +450,11 @@ export function scheduleQueuePump(
     })
     .catch((error: unknown) => {
       runtime.queuePumpScheduled = false;
+      trackBoundaryError({
+        errorType: "listener_queue_pump_failed",
+        error,
+        context: "listener_queue_pump",
+      });
       console.error("[Listen] Error in queue pump:", error);
       emitListenerStatus(
         runtime.listener,

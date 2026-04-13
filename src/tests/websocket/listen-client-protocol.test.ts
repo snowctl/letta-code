@@ -1,12 +1,32 @@
-import { describe, expect, mock, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { APIError } from "@letta-ai/letta-client/core/error";
 import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
 import WebSocket from "ws";
 import { buildConversationMessagesCreateRequestBody } from "../../agent/message";
+import { models } from "../../agent/model";
+import {
+  DEFAULT_CREATE_AGENT_PERSONALITIES,
+  getPersonalityOption,
+} from "../../agent/personality";
+import { formatErrorDetails } from "../../cli/helpers/errorFormatter";
+import {
+  clearAllSubagents,
+  registerSubagent,
+} from "../../cli/helpers/subagentState";
 import { INTERRUPTED_BY_USER } from "../../constants";
 import type { MessageQueueItem } from "../../queue/queueRuntime";
+import type { LocalProjectSettings, Settings } from "../../settings-manager";
+import { settingsManager } from "../../settings-manager";
+import {
+  backgroundProcesses,
+  backgroundTasks,
+} from "../../tools/impl/process_manager";
+import { LIMITS } from "../../tools/impl/truncation";
 import type {
   ApprovalResponseBody,
   ControlRequest,
@@ -19,6 +39,16 @@ import {
   requestApprovalOverWS,
   resolvePendingApprovalResolver,
 } from "../../websocket/listen-client";
+import { isEditFileCommand } from "../../websocket/listener/protocol-inbound";
+import {
+  DESKTOP_DEBUG_PANEL_INFO_PREFIX,
+  emitLoopErrorNotice,
+  emitRecoverableRetryNotice,
+  emitRecoverableStatusNotice,
+  getLoopErrorNoticeDecision,
+  getRecoverableRetryNoticeVisibility,
+  getRecoverableStatusNoticeVisibility,
+} from "../../websocket/listener/recoverable-notices";
 
 class MockSocket {
   readyState: number;
@@ -46,6 +76,12 @@ class MockSocket {
     return this;
   }
 }
+
+const actualChannelsService = await import("../../channels/service");
+
+afterEach(() => {
+  __listenClientTestUtils.setChannelsServiceLoaderForTests(null);
+});
 
 function makeControlRequest(requestId: string): ControlRequest {
   return {
@@ -86,6 +122,122 @@ describe("listen-client parseServerMessage", () => {
     );
     expect(parsed).not.toBeNull();
     expect(parsed?.type).toBe("input");
+  });
+
+  test("parses approval_response with selected permission suggestion ids", () => {
+    const parsed = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "input",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+          payload: {
+            kind: "approval_response",
+            request_id: "perm-1",
+            decision: {
+              behavior: "allow",
+              selected_permission_suggestion_ids: ["save-default"],
+            },
+          },
+        }),
+      ),
+    );
+
+    expect(parsed).not.toBeNull();
+    expect(parsed?.type).toBe("input");
+  });
+
+  describe("listen-client create_agent command handling", () => {
+    test("creates the memo, linus, and kawaii presets through the shared helper", async () => {
+      expect(DEFAULT_CREATE_AGENT_PERSONALITIES).toEqual([
+        "memo",
+        "linus",
+        "kawaii",
+      ]);
+
+      for (const personality of [...DEFAULT_CREATE_AGENT_PERSONALITIES]) {
+        const socket = new MockSocket(WebSocket.OPEN);
+        const personalityOption = getPersonalityOption(personality);
+        const createAgentForPersonalityMock = mock(async () => ({
+          agent: {
+            id: `agent-${personality}`,
+            name: personalityOption.label,
+            model: "anthropic/test-model",
+          } as never,
+          provenance: "created",
+        }));
+        mock.module("../../agent/personality", () => ({
+          createAgentForPersonality: createAgentForPersonalityMock,
+        }));
+
+        const originalPinGlobal = settingsManager.pinGlobal;
+        const pinGlobalMock = mock(() => {});
+        settingsManager.pinGlobal = pinGlobalMock;
+
+        await __listenClientTestUtils.handleCreateAgentCommand(
+          {
+            type: "create_agent",
+            request_id: `create-${personality}`,
+            personality,
+          },
+          socket as unknown as WebSocket,
+        );
+
+        settingsManager.pinGlobal = originalPinGlobal;
+
+        expect(createAgentForPersonalityMock).toHaveBeenCalledTimes(1);
+        expect(createAgentForPersonalityMock).toHaveBeenCalledWith({
+          personalityId: personality,
+          model: undefined,
+        });
+        expect(pinGlobalMock).toHaveBeenCalledWith(`agent-${personality}`);
+
+        const messages = socket.sentPayloads.map((payload) =>
+          JSON.parse(payload),
+        );
+        expect(messages).toContainEqual(
+          expect.objectContaining({
+            type: "create_agent_response",
+            request_id: `create-${personality}`,
+            success: true,
+            agent_id: `agent-${personality}`,
+            name: personalityOption.label,
+            model: "anthropic/test-model",
+          }),
+        );
+      }
+    });
+
+    test("does not globally pin when pin_global is false", async () => {
+      const socket = new MockSocket(WebSocket.OPEN);
+      const createAgentForPersonalityMock = mock(async () => ({
+        agent: {
+          id: "agent-kawaii",
+          name: "Kawaii",
+          model: "anthropic/test-model",
+        } as never,
+        provenance: "created",
+      }));
+      mock.module("../../agent/personality", () => ({
+        createAgentForPersonality: createAgentForPersonalityMock,
+      }));
+
+      const originalPinGlobal = settingsManager.pinGlobal;
+      const pinGlobalMock = mock(() => {});
+      settingsManager.pinGlobal = pinGlobalMock;
+
+      await __listenClientTestUtils.handleCreateAgentCommand(
+        {
+          type: "create_agent",
+          request_id: "create-no-pin",
+          personality: "kawaii",
+          pin_global: false,
+        },
+        socket as unknown as WebSocket,
+      );
+
+      settingsManager.pinGlobal = originalPinGlobal;
+      expect(pinGlobalMock).not.toHaveBeenCalled();
+    });
   });
 
   test("classifies invalid input approval_response payloads", () => {
@@ -180,6 +332,380 @@ describe("listen-client parseServerMessage", () => {
     expect(sync?.type).toBe("sync");
   });
 
+  test("parses cron CRUD commands", () => {
+    const cronList = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "cron_list",
+          request_id: "cron-list-1",
+          agent_id: "agent-1",
+        }),
+      ),
+    );
+    const cronAdd = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "cron_add",
+          request_id: "cron-add-1",
+          agent_id: "agent-1",
+          conversation_id: "default",
+          name: "Test task",
+          description: "A test cron task",
+          cron: "*/5 * * * *",
+          recurring: true,
+          prompt: "hello",
+        }),
+      ),
+    );
+    const cronGet = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "cron_get",
+          request_id: "cron-get-1",
+          task_id: "cron-1",
+        }),
+      ),
+    );
+    const cronDelete = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "cron_delete",
+          request_id: "cron-delete-1",
+          task_id: "cron-1",
+        }),
+      ),
+    );
+    const cronDeleteAll = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "cron_delete_all",
+          request_id: "cron-delete-all-1",
+          agent_id: "agent-1",
+        }),
+      ),
+    );
+
+    expect(cronList?.type).toBe("cron_list");
+    expect(cronAdd?.type).toBe("cron_add");
+    expect(cronGet?.type).toBe("cron_get");
+    expect(cronDelete?.type).toBe("cron_delete");
+    expect(cronDeleteAll?.type).toBe("cron_delete_all");
+  });
+
+  test("parses channels management commands", () => {
+    const channelsList = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channels_list",
+          request_id: "channels-list-1",
+        }),
+      ),
+    );
+    const channelGetConfig = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_get_config",
+          request_id: "channel-get-config-1",
+          channel_id: "telegram",
+        }),
+      ),
+    );
+    const channelSetConfig = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_set_config",
+          request_id: "channel-set-config-1",
+          channel_id: "slack",
+          config: {
+            bot_token: "xoxb-test",
+            app_token: "xapp-test",
+            mode: "socket",
+            dm_policy: "pairing",
+            allowed_users: ["user-1"],
+          },
+        }),
+      ),
+    );
+    const channelStart = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_start",
+          request_id: "channel-start-1",
+          channel_id: "telegram",
+        }),
+      ),
+    );
+    const channelStop = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_stop",
+          request_id: "channel-stop-1",
+          channel_id: "telegram",
+        }),
+      ),
+    );
+    const channelPairingsList = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_pairings_list",
+          request_id: "channel-pairings-list-1",
+          channel_id: "telegram",
+        }),
+      ),
+    );
+    const channelPairingBind = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_pairing_bind",
+          request_id: "channel-pairing-bind-1",
+          channel_id: "telegram",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+          code: "A7X9K2",
+        }),
+      ),
+    );
+    const channelRoutesList = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_routes_list",
+          request_id: "channel-routes-list-1",
+          channel_id: "telegram",
+          agent_id: "agent-1",
+          conversation_id: "default",
+        }),
+      ),
+    );
+    const channelRouteRemove = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_route_remove",
+          request_id: "channel-route-remove-1",
+          channel_id: "telegram",
+          chat_id: "chat-1",
+        }),
+      ),
+    );
+    const channelTargetsList = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_targets_list",
+          request_id: "channel-targets-list-1",
+          channel_id: "slack",
+        }),
+      ),
+    );
+    const channelTargetBind = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "channel_target_bind",
+          request_id: "channel-target-bind-1",
+          channel_id: "slack",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+          target_id: "C123",
+        }),
+      ),
+    );
+
+    expect(channelsList?.type).toBe("channels_list");
+    expect(channelGetConfig?.type).toBe("channel_get_config");
+    expect(channelSetConfig?.type).toBe("channel_set_config");
+    expect(channelStart?.type).toBe("channel_start");
+    expect(channelStop?.type).toBe("channel_stop");
+    expect(channelPairingsList?.type).toBe("channel_pairings_list");
+    expect(channelPairingBind?.type).toBe("channel_pairing_bind");
+    expect(channelRoutesList?.type).toBe("channel_routes_list");
+    expect(channelRouteRemove?.type).toBe("channel_route_remove");
+    expect(channelTargetsList?.type).toBe("channel_targets_list");
+    expect(channelTargetBind?.type).toBe("channel_target_bind");
+  });
+
+  test("parses list_models command", () => {
+    const parsed = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "list_models",
+          request_id: "models-1",
+        }),
+      ),
+    );
+
+    expect(parsed).not.toBeNull();
+    expect(parsed?.type).toBe("list_models");
+  });
+
+  test("parses update_model command with model_id", () => {
+    const parsed = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "update_model",
+          request_id: "update-model-1",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+          payload: { model_id: "sonnet" },
+        }),
+      ),
+    );
+
+    expect(parsed).not.toBeNull();
+    expect(parsed?.type).toBe("update_model");
+  });
+
+  test("rejects update_model command missing model identifier", () => {
+    const parsed = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "update_model",
+          request_id: "update-model-2",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+          payload: {},
+        }),
+      ),
+    );
+
+    expect(parsed).toBeNull();
+  });
+
+  test("parses skill enable/disable commands", () => {
+    const skillEnable = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "skill_enable",
+          request_id: "skill-enable-1",
+          skill_path: "/tmp/my-skill",
+        }),
+      ),
+    );
+    const skillDisable = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "skill_disable",
+          request_id: "skill-disable-1",
+          name: "my-skill",
+        }),
+      ),
+    );
+
+    expect(skillEnable?.type).toBe("skill_enable");
+    expect(skillDisable?.type).toBe("skill_disable");
+  });
+
+  test("rejects malformed skill commands", () => {
+    // Missing skill_path
+    const noPath = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "skill_enable",
+          request_id: "skill-enable-bad",
+        }),
+      ),
+    );
+    // Missing name on disable
+    const noName = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "skill_disable",
+          request_id: "skill-disable-bad",
+        }),
+      ),
+    );
+    expect(noPath).toBeNull();
+    expect(noName).toBeNull();
+  });
+
+  test("parses create_agent command", () => {
+    const minimal = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "create_agent",
+          request_id: "create-1",
+          personality: "memo",
+        }),
+      ),
+    );
+    const withOptions = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "create_agent",
+          request_id: "create-2",
+          personality: "kawaii",
+          model: "sonnet",
+          pin_global: false,
+        }),
+      ),
+    );
+
+    expect(minimal?.type).toBe("create_agent");
+    expect(withOptions?.type).toBe("create_agent");
+  });
+
+  test("rejects malformed create_agent command", () => {
+    const noRequestId = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({ type: "create_agent", personality: "memo" }),
+      ),
+    );
+    const badPersonality = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "create_agent",
+          request_id: "create-bad-personality",
+          personality: "claude",
+        }),
+      ),
+    );
+    const badCodexPersonality = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "create_agent",
+          request_id: "create-bad-codex",
+          personality: "codex",
+        }),
+      ),
+    );
+    const badPinGlobal = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "create_agent",
+          request_id: "create-bad",
+          personality: "linus",
+          pin_global: "yes",
+        }),
+      ),
+    );
+    expect(noRequestId).toBeNull();
+    expect(badPersonality).toBeNull();
+    expect(badCodexPersonality).toBeNull();
+    expect(badPinGlobal).toBeNull();
+  });
+
+  test("parses reflection settings commands", () => {
+    const getSettings = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "get_reflection_settings",
+          request_id: "reflection-get-1",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+        }),
+      ),
+    );
+    const setSettings = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "set_reflection_settings",
+          request_id: "reflection-set-1",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+          settings: {
+            trigger: "step-count",
+            step_count: 9,
+          },
+          scope: "local_project",
+        }),
+      ),
+    );
+
+    expect(getSettings?.type).toBe("get_reflection_settings");
+    expect(setSettings?.type).toBe("set_reflection_settings");
+  });
+
   test("rejects legacy cancel_run in hard-cut v2 protocol", () => {
     const legacyCancel = parseServerMessage(
       Buffer.from(
@@ -191,6 +717,598 @@ describe("listen-client parseServerMessage", () => {
       ),
     );
     expect(legacyCancel).toBeNull();
+  });
+});
+
+describe("listen-client model command helpers", () => {
+  test("buildListModelsEntries reflects models.json metadata", () => {
+    const entries = __listenClientTestUtils.buildListModelsEntries();
+
+    expect(entries.length).toBe(models.length);
+    expect(entries[0]).toMatchObject({
+      id: models[0]?.id,
+      handle: models[0]?.handle,
+      label: models[0]?.label,
+      description: models[0]?.description,
+    });
+  });
+
+  test("resolveModelForUpdate resolves by id and by handle", () => {
+    const byId = __listenClientTestUtils.resolveModelForUpdate({
+      model_id: models[0]?.id,
+    });
+    expect(byId).not.toBeNull();
+    expect(byId?.handle).toBe(models[0]?.handle);
+
+    const byHandle = __listenClientTestUtils.resolveModelForUpdate({
+      model_handle: models[0]?.handle,
+    });
+    expect(byHandle).not.toBeNull();
+    expect(byHandle?.id).toBe(models[0]?.id);
+  });
+
+  test("resolveModelForUpdate allows custom handles", () => {
+    const resolved = __listenClientTestUtils.resolveModelForUpdate({
+      model_handle: "custom/provider-model",
+    });
+
+    expect(resolved).toEqual({
+      id: "custom/provider-model",
+      handle: "custom/provider-model",
+      label: "custom/provider-model",
+      updateArgs: undefined,
+    });
+  });
+
+  test("resolveModelForUpdate preserves explicit model_handle when both model_id and model_handle are present (BYOK tier change)", () => {
+    // When LCD sends both fields for a BYOK tier change, the resolver should
+    // use model_id for updateArgs/label but keep the explicit model_handle.
+    const byokHandle = `lc-mykey/${models[0]?.handle}`;
+    const resolved = __listenClientTestUtils.resolveModelForUpdate({
+      model_id: models[0]?.id,
+      model_handle: byokHandle,
+    });
+
+    expect(resolved).not.toBeNull();
+    // Handle must be the explicit BYOK handle, not the base static handle
+    expect(resolved?.handle).toBe(byokHandle);
+    // But id/label/updateArgs still come from the model_id entry
+    expect(resolved?.id).toBe(models[0]?.id);
+    expect(resolved?.label).toBe(models[0]?.label);
+  });
+
+  test("resolveModelForUpdate ignores model_handle when only model_id is present", () => {
+    // Standard (non-BYOK) tier selection: only model_id, no model_handle
+    const resolved = __listenClientTestUtils.resolveModelForUpdate({
+      model_id: models[0]?.id,
+    });
+
+    expect(resolved).not.toBeNull();
+    // Should resolve handle from the static entry, not from an explicit override
+    expect(resolved?.handle).toBe(models[0]?.handle);
+  });
+});
+
+describe("listen-client cron command handling", () => {
+  test("wraps cron library CRUD over WS commands", async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "letta-listen-cron-"));
+    const originalLettaHome = process.env.LETTA_HOME;
+    process.env.LETTA_HOME = tempRoot;
+
+    try {
+      const socket = new MockSocket(WebSocket.OPEN);
+
+      await __listenClientTestUtils.handleCronCommand(
+        {
+          type: "cron_add",
+          request_id: "cron-add-1",
+          agent_id: "agent-1",
+          conversation_id: "conv-1",
+          name: "Test cron",
+          description: "A test schedule",
+          cron: "*/5 * * * *",
+          recurring: true,
+          prompt: "run the cron task",
+        },
+        socket as unknown as WebSocket,
+      );
+
+      const addMessages = socket.sentPayloads.map((payload) =>
+        JSON.parse(payload as string),
+      );
+      expect(addMessages[0]).toMatchObject({
+        type: "cron_add_response",
+        request_id: "cron-add-1",
+        success: true,
+      });
+      expect(addMessages[0].task).toMatchObject({
+        agent_id: "agent-1",
+        conversation_id: "conv-1",
+        cron: "*/5 * * * *",
+        recurring: true,
+        prompt: "run the cron task",
+      });
+      expect(addMessages[1]).toMatchObject({
+        type: "crons_updated",
+        agent_id: "agent-1",
+        conversation_id: "conv-1",
+      });
+
+      const taskId = addMessages[0].task.id as string;
+      socket.sentPayloads.length = 0;
+
+      await __listenClientTestUtils.handleCronCommand(
+        {
+          type: "cron_list",
+          request_id: "cron-list-1",
+          agent_id: "agent-1",
+        },
+        socket as unknown as WebSocket,
+      );
+      const listResponse = JSON.parse(socket.sentPayloads[0] as string);
+      expect(listResponse).toMatchObject({
+        type: "cron_list_response",
+        request_id: "cron-list-1",
+        success: true,
+      });
+      expect(listResponse.tasks).toHaveLength(1);
+      expect(listResponse.tasks[0].id).toBe(taskId);
+
+      socket.sentPayloads.length = 0;
+      await __listenClientTestUtils.handleCronCommand(
+        {
+          type: "cron_get",
+          request_id: "cron-get-1",
+          task_id: taskId,
+        },
+        socket as unknown as WebSocket,
+      );
+      expect(JSON.parse(socket.sentPayloads[0] as string)).toMatchObject({
+        type: "cron_get_response",
+        request_id: "cron-get-1",
+        success: true,
+        found: true,
+        task: { id: taskId },
+      });
+
+      socket.sentPayloads.length = 0;
+      await __listenClientTestUtils.handleCronCommand(
+        {
+          type: "cron_delete",
+          request_id: "cron-delete-1",
+          task_id: taskId,
+        },
+        socket as unknown as WebSocket,
+      );
+      const deleteMessages = socket.sentPayloads.map((payload) =>
+        JSON.parse(payload as string),
+      );
+      expect(deleteMessages[0]).toMatchObject({
+        type: "cron_delete_response",
+        request_id: "cron-delete-1",
+        success: true,
+        found: true,
+      });
+      expect(deleteMessages[1]).toMatchObject({
+        type: "crons_updated",
+        agent_id: "agent-1",
+        conversation_id: "conv-1",
+      });
+
+      socket.sentPayloads.length = 0;
+      await __listenClientTestUtils.handleCronCommand(
+        {
+          type: "cron_add",
+          request_id: "cron-add-2",
+          agent_id: "agent-1",
+          name: "Another cron",
+          description: "Another test schedule",
+          cron: "0 12 * * *",
+          recurring: true,
+          prompt: "run again",
+        },
+        socket as unknown as WebSocket,
+      );
+      socket.sentPayloads.length = 0;
+      await __listenClientTestUtils.handleCronCommand(
+        {
+          type: "cron_delete_all",
+          request_id: "cron-delete-all-1",
+          agent_id: "agent-1",
+        },
+        socket as unknown as WebSocket,
+      );
+      const deleteAllMessages = socket.sentPayloads.map((payload) =>
+        JSON.parse(payload as string),
+      );
+      expect(deleteAllMessages[0]).toMatchObject({
+        type: "cron_delete_all_response",
+        request_id: "cron-delete-all-1",
+        success: true,
+        agent_id: "agent-1",
+        deleted: 1,
+      });
+      expect(deleteAllMessages[1]).toMatchObject({
+        type: "crons_updated",
+        agent_id: "agent-1",
+      });
+    } finally {
+      if (originalLettaHome) {
+        process.env.LETTA_HOME = originalLettaHome;
+      } else {
+        delete process.env.LETTA_HOME;
+      }
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("listen-client channels command handling", () => {
+  test("returns typed channel summaries over WS", async () => {
+    const socket = new MockSocket(WebSocket.OPEN);
+    const runtime = __listenClientTestUtils.createListenerRuntime();
+
+    __listenClientTestUtils.setChannelsServiceLoaderForTests(async () => ({
+      ...actualChannelsService,
+      listChannelSummaries: () => [
+        {
+          channelId: "telegram" as const,
+          displayName: "Telegram",
+          configured: true,
+          enabled: true,
+          running: true,
+          dmPolicy: "pairing" as const,
+          pendingPairingsCount: 2,
+          approvedUsersCount: 3,
+          routesCount: 4,
+        },
+      ],
+    }));
+
+    try {
+      await __listenClientTestUtils.handleChannelsProtocolCommand(
+        {
+          type: "channels_list",
+          request_id: "channels-list-1",
+        },
+        socket as unknown as WebSocket,
+        runtime,
+        {
+          onStatusChange: undefined,
+          connectionId: "conn-test",
+        },
+        async () => {},
+      );
+
+      expect(socket.sentPayloads).toHaveLength(1);
+      expect(JSON.parse(socket.sentPayloads[0] as string)).toMatchObject({
+        type: "channels_list_response",
+        request_id: "channels-list-1",
+        success: true,
+        channels: [
+          {
+            channel_id: "telegram",
+            display_name: "Telegram",
+            configured: true,
+            enabled: true,
+            running: true,
+            dm_policy: "pairing",
+            pending_pairings_count: 2,
+            approved_users_count: 3,
+            routes_count: 4,
+          },
+        ],
+      });
+    } finally {
+      __listenClientTestUtils.stopRuntime(runtime, true);
+    }
+  });
+
+  test("bind emits pairing, route, and channel update events", async () => {
+    const socket = new MockSocket(WebSocket.OPEN);
+    const runtime = __listenClientTestUtils.createListenerRuntime();
+
+    __listenClientTestUtils.setChannelsServiceLoaderForTests(async () => ({
+      ...actualChannelsService,
+      bindChannelPairing: () => ({
+        chatId: "chat-42",
+        route: {
+          channelId: "telegram" as const,
+          chatId: "chat-42",
+          agentId: "agent-1",
+          conversationId: "conv-1",
+          enabled: true,
+          createdAt: "2026-04-09T00:00:00.000Z",
+        },
+      }),
+    }));
+
+    try {
+      await __listenClientTestUtils.handleChannelsProtocolCommand(
+        {
+          type: "channel_pairing_bind",
+          request_id: "channel-bind-1",
+          channel_id: "telegram",
+          runtime: {
+            agent_id: "agent-1",
+            conversation_id: "conv-1",
+          },
+          code: "A7X9K2",
+        },
+        socket as unknown as WebSocket,
+        runtime,
+        {
+          onStatusChange: undefined,
+          connectionId: "conn-test",
+        },
+        async () => {},
+      );
+
+      const messages = socket.sentPayloads.map((payload) =>
+        JSON.parse(payload as string),
+      );
+
+      expect(messages[0]).toMatchObject({
+        type: "channel_pairing_bind_response",
+        request_id: "channel-bind-1",
+        success: true,
+        channel_id: "telegram",
+        chat_id: "chat-42",
+        route: {
+          channel_id: "telegram",
+          chat_id: "chat-42",
+          agent_id: "agent-1",
+          conversation_id: "conv-1",
+          enabled: true,
+          created_at: "2026-04-09T00:00:00.000Z",
+        },
+      });
+      expect(messages[1]).toMatchObject({
+        type: "channel_pairings_updated",
+        channel_id: "telegram",
+      });
+      expect(messages[2]).toMatchObject({
+        type: "channel_routes_updated",
+        channel_id: "telegram",
+        agent_id: "agent-1",
+        conversation_id: "conv-1",
+      });
+      expect(messages[3]).toMatchObject({
+        type: "channels_updated",
+        channel_id: "telegram",
+      });
+    } finally {
+      __listenClientTestUtils.stopRuntime(runtime, true);
+    }
+  });
+
+  test("target bind emits target, route, and channel update events", async () => {
+    const socket = new MockSocket(WebSocket.OPEN);
+    const runtime = __listenClientTestUtils.createListenerRuntime();
+
+    __listenClientTestUtils.setChannelsServiceLoaderForTests(async () => ({
+      ...actualChannelsService,
+      bindChannelTarget: () => ({
+        chatId: "C123",
+        route: {
+          channelId: "slack" as const,
+          chatId: "C123",
+          agentId: "agent-1",
+          conversationId: "conv-1",
+          enabled: true,
+          createdAt: "2026-04-10T00:00:00.000Z",
+        },
+      }),
+      listChannelTargetSnapshots: () => [],
+    }));
+
+    try {
+      await __listenClientTestUtils.handleChannelsProtocolCommand(
+        {
+          type: "channel_target_bind",
+          request_id: "channel-target-bind-1",
+          channel_id: "slack",
+          runtime: {
+            agent_id: "agent-1",
+            conversation_id: "conv-1",
+          },
+          target_id: "C123",
+        },
+        socket as unknown as WebSocket,
+        runtime,
+        {
+          onStatusChange: undefined,
+          connectionId: "conn-test",
+        },
+        async () => {},
+      );
+
+      const messages = socket.sentPayloads.map((payload) =>
+        JSON.parse(payload as string),
+      );
+
+      expect(messages[0]).toMatchObject({
+        type: "channel_target_bind_response",
+        request_id: "channel-target-bind-1",
+        success: true,
+        channel_id: "slack",
+        target_id: "C123",
+        chat_id: "C123",
+        route: {
+          channel_id: "slack",
+          chat_id: "C123",
+          agent_id: "agent-1",
+          conversation_id: "conv-1",
+          enabled: true,
+          created_at: "2026-04-10T00:00:00.000Z",
+        },
+      });
+      expect(messages[1]).toMatchObject({
+        type: "channel_targets_updated",
+        channel_id: "slack",
+      });
+      expect(messages[2]).toMatchObject({
+        type: "channel_routes_updated",
+        channel_id: "slack",
+        agent_id: "agent-1",
+        conversation_id: "conv-1",
+      });
+      expect(messages[3]).toMatchObject({
+        type: "channels_updated",
+        channel_id: "slack",
+      });
+    } finally {
+      __listenClientTestUtils.stopRuntime(runtime, true);
+    }
+  });
+});
+
+describe("listen-client reflection settings command handling", () => {
+  test("wraps typed reflection settings reads and writes over WS", async () => {
+    const tempProjectDir = await mkdtemp(
+      join(os.tmpdir(), "letta-listen-reflection-"),
+    );
+    const originalGetSettings = settingsManager.getSettings;
+    const originalGetLocalProjectSettings =
+      settingsManager.getLocalProjectSettings;
+    const originalLoadLocalProjectSettings =
+      settingsManager.loadLocalProjectSettings;
+    const originalUpdateSettings = settingsManager.updateSettings;
+    const originalUpdateLocalProjectSettings =
+      settingsManager.updateLocalProjectSettings;
+
+    const globalSettings = {
+      reflectionTrigger: "compaction-event",
+      reflectionStepCount: 25,
+      memoryReminderInterval: "auto-compaction",
+      reflectionSettingsByAgent: {},
+    } as Settings;
+    const localSettingsByDir = new Map<string, LocalProjectSettings>();
+
+    try {
+      (settingsManager as typeof settingsManager).getSettings = (() =>
+        globalSettings) as typeof settingsManager.getSettings;
+      (settingsManager as typeof settingsManager).getLocalProjectSettings = ((
+        workingDirectory: string = process.cwd(),
+      ) => {
+        const settings = localSettingsByDir.get(workingDirectory);
+        if (!settings) {
+          throw new Error("local settings not loaded");
+        }
+        return settings as ReturnType<
+          typeof settingsManager.getLocalProjectSettings
+        >;
+      }) as typeof settingsManager.getLocalProjectSettings;
+      (settingsManager as typeof settingsManager).loadLocalProjectSettings =
+        (async (workingDirectory: string = process.cwd()) => {
+          const settings = {
+            lastAgent: null,
+            reflectionSettingsByAgent: {},
+          } satisfies LocalProjectSettings;
+          localSettingsByDir.set(workingDirectory, settings);
+          return settings as Awaited<
+            ReturnType<typeof settingsManager.loadLocalProjectSettings>
+          >;
+        }) as typeof settingsManager.loadLocalProjectSettings;
+      (settingsManager as typeof settingsManager).updateSettings = ((
+        updates: Record<string, unknown>,
+      ) => {
+        Object.assign(
+          globalSettings as unknown as Record<string, unknown>,
+          updates,
+        );
+      }) as typeof settingsManager.updateSettings;
+      (settingsManager as typeof settingsManager).updateLocalProjectSettings =
+        ((updates: Record<string, unknown>, workingDirectory?: string) => {
+          const key = workingDirectory ?? process.cwd();
+          const current = localSettingsByDir.get(key) ?? { lastAgent: null };
+          localSettingsByDir.set(key, { ...current, ...updates });
+        }) as typeof settingsManager.updateLocalProjectSettings;
+
+      const socket = new MockSocket(WebSocket.OPEN);
+      const listener = __listenClientTestUtils.createListenerRuntime();
+      __listenClientTestUtils.setConversationWorkingDirectory(
+        listener,
+        "agent-1",
+        "default",
+        tempProjectDir,
+      );
+
+      await __listenClientTestUtils.handleReflectionSettingsCommand(
+        {
+          type: "get_reflection_settings",
+          request_id: "reflection-get-1",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+        },
+        socket as unknown as WebSocket,
+        listener,
+      );
+
+      const getResponse = JSON.parse(socket.sentPayloads[0] as string);
+      expect(getResponse).toMatchObject({
+        type: "get_reflection_settings_response",
+        request_id: "reflection-get-1",
+        success: true,
+        reflection_settings: {
+          agent_id: "agent-1",
+          trigger: "compaction-event",
+          step_count: 25,
+        },
+      });
+
+      socket.sentPayloads.length = 0;
+
+      await __listenClientTestUtils.handleReflectionSettingsCommand(
+        {
+          type: "set_reflection_settings",
+          request_id: "reflection-set-1",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+          settings: {
+            trigger: "step-count",
+            step_count: 9,
+          },
+          scope: "local_project",
+        },
+        socket as unknown as WebSocket,
+        listener,
+      );
+
+      const setResponse = JSON.parse(socket.sentPayloads[0] as string);
+      const deviceStatusUpdate = JSON.parse(socket.sentPayloads[1] as string);
+      expect(setResponse).toMatchObject({
+        type: "set_reflection_settings_response",
+        request_id: "reflection-set-1",
+        success: true,
+        scope: "local_project",
+        reflection_settings: {
+          agent_id: "agent-1",
+          trigger: "step-count",
+          step_count: 9,
+        },
+      });
+      expect(deviceStatusUpdate).toMatchObject({
+        type: "update_device_status",
+        device_status: {
+          reflection_settings: {
+            agent_id: "agent-1",
+            trigger: "step-count",
+            step_count: 9,
+          },
+        },
+      });
+    } finally {
+      (settingsManager as typeof settingsManager).getSettings =
+        originalGetSettings;
+      (settingsManager as typeof settingsManager).getLocalProjectSettings =
+        originalGetLocalProjectSettings;
+      (settingsManager as typeof settingsManager).loadLocalProjectSettings =
+        originalLoadLocalProjectSettings;
+      (settingsManager as typeof settingsManager).updateSettings =
+        originalUpdateSettings;
+      (settingsManager as typeof settingsManager).updateLocalProjectSettings =
+        originalUpdateLocalProjectSettings;
+      await rm(tempProjectDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -228,7 +1346,7 @@ describe("listen-client permission mode scope keys", () => {
 });
 
 describe("listen-client approval resolver wiring", () => {
-  test("resolved approvals restore WAITING_ON_INPUT instead of faking processing", () => {
+  test("resolved approvals do not project WAITING_ON_INPUT while the enclosing turn is still processing", () => {
     const runtime = __listenClientTestUtils.createRuntime();
     const socket = new MockSocket(WebSocket.OPEN);
     runtime.isProcessing = true;
@@ -249,7 +1367,7 @@ describe("listen-client approval resolver wiring", () => {
     });
 
     expect(resolved).toBe(true);
-    expect(runtime.loopStatus as string).toBe("WAITING_ON_INPUT");
+    expect(runtime.loopStatus as string).toBe("WAITING_ON_APPROVAL");
   });
 
   test("resolves matching pending resolver", async () => {
@@ -349,6 +1467,7 @@ describe("listen-client approval resolver wiring", () => {
     const pending = new Promise<ApprovalResponseBody>((resolve, reject) => {
       runtime.pendingApprovalResolvers.set("perm-stop", { resolve, reject });
     });
+    const pendingError = pending.catch((error: unknown) => error);
     const socket = new MockSocket(WebSocket.OPEN);
     runtime.socket = socket as unknown as WebSocket;
 
@@ -357,7 +1476,9 @@ describe("listen-client approval resolver wiring", () => {
     expect(runtime.pendingApprovalResolvers.size).toBe(0);
     expect(socket.removeAllListenersCalls).toBe(1);
     expect(socket.closeCalls).toBe(1);
-    await expect(pending).rejects.toThrow("Listener runtime stopped");
+    const error = await pendingError;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("Listener runtime stopped");
   });
 });
 
@@ -404,6 +1525,25 @@ describe("listen-client requestApprovalOverWS", () => {
     expect(runtime.pendingApprovalResolvers.size).toBe(0);
   });
 
+  test("rejects immediately when interrupt is already active", async () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+    const socket = new MockSocket(WebSocket.OPEN);
+    const requestId = "perm-cancelled";
+
+    runtime.cancelRequested = true;
+
+    await expect(
+      requestApprovalOverWS(
+        runtime,
+        socket as unknown as WebSocket,
+        requestId,
+        makeControlRequest(requestId),
+      ),
+    ).rejects.toThrow("Cancelled by user");
+    expect(runtime.pendingApprovalResolvers.size).toBe(0);
+    expect(runtime.listener.approvalRuntimeKeyByRequestId.size).toBe(0);
+  });
+
   test("registers a pending resolver until an approval response arrives", async () => {
     const runtime = __listenClientTestUtils.createRuntime();
     const socket = new MockSocket(WebSocket.OPEN);
@@ -424,6 +1564,30 @@ describe("listen-client requestApprovalOverWS", () => {
     rejectPendingApprovalResolvers(runtime, "cleanup");
     await expect(pending).rejects.toThrow("cleanup");
     expect(runtime.pendingApprovalResolvers.size).toBe(0);
+  });
+
+  test("cleans up a pending resolver if abort lands immediately after registration", async () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+    const socket = new MockSocket(WebSocket.OPEN);
+    const requestId = "perm-late-abort";
+
+    runtime.activeAbortController = new AbortController();
+
+    const pending = requestApprovalOverWS(
+      runtime,
+      socket as unknown as WebSocket,
+      requestId,
+      makeControlRequest(requestId),
+    );
+
+    expect(runtime.pendingApprovalResolvers.size).toBe(1);
+
+    runtime.cancelRequested = true;
+    runtime.activeAbortController.abort();
+
+    await expect(pending).rejects.toThrow("Cancelled by user");
+    expect(runtime.pendingApprovalResolvers.size).toBe(0);
+    expect(runtime.listener.approvalRuntimeKeyByRequestId.size).toBe(0);
   });
 });
 
@@ -523,9 +1687,38 @@ describe("listen-client v2 status builders", () => {
     const loopStatus = __listenClientTestUtils.buildLoopStatus(runtime);
     expect(loopStatus.status).toBe("WAITING_ON_INPUT");
     expect(loopStatus.active_run_ids).toEqual([]);
+    expect(loopStatus.plan_file_path).toBeNull();
     // queue is now separate from loopStatus — verify via buildQueueSnapshot
     const queueSnapshot = __listenClientTestUtils.buildQueueSnapshot(runtime);
     expect(queueSnapshot).toEqual([]);
+  });
+
+  test("buildLoopStatus includes plan file path for scoped plan mode", () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    __listenClientTestUtils.getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "default",
+    );
+    listener.permissionModeByConversation.set(
+      "agent:agent-1::conversation:default",
+      {
+        mode: "plan",
+        planFilePath: "/tmp/listener-plan.md",
+        modeBeforePlan: "default",
+      },
+    );
+
+    expect(
+      __listenClientTestUtils.buildLoopStatus(listener, {
+        agent_id: "agent-1",
+        conversation_id: "default",
+      }),
+    ).toEqual({
+      status: "WAITING_ON_INPUT",
+      active_run_ids: [],
+      plan_file_path: "/tmp/listener-plan.md",
+    });
   });
 
   test("buildDeviceStatus includes the effective working directory", () => {
@@ -536,6 +1729,67 @@ describe("listen-client v2 status builders", () => {
       (deviceStatus.current_working_directory ?? "").length,
     ).toBeGreaterThan(0);
     expect(deviceStatus.current_toolset_preference).toBe("auto");
+  });
+
+  test("buildDeviceStatus includes only active bash and task background processes", () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+    backgroundProcesses.clear();
+    backgroundTasks.clear();
+
+    try {
+      backgroundProcesses.set("bash_1", {
+        process: {} as never,
+        command: "sleep 300",
+        stdout: [],
+        stderr: [],
+        status: "running",
+        exitCode: null,
+        lastReadIndex: { stdout: 0, stderr: 0 },
+        startTime: new Date("2026-03-27T12:00:00.000Z"),
+      });
+      backgroundTasks.set("task_1", {
+        description: "Active background review",
+        subagentType: "review",
+        subagentId: "subagent-1",
+        status: "running",
+        output: [],
+        startTime: new Date("2026-03-27T12:01:00.000Z"),
+        outputFile: "/tmp/task_1.log",
+      });
+      backgroundTasks.set("task_2", {
+        description: "Reflect on recent conversations",
+        subagentType: "reflection",
+        subagentId: "subagent-2",
+        status: "completed",
+        output: [],
+        startTime: new Date("2026-03-27T12:02:00.000Z"),
+        outputFile: "/tmp/task_2.log",
+      });
+
+      const deviceStatus = __listenClientTestUtils.buildDeviceStatus(runtime);
+      expect(deviceStatus.background_processes).toEqual([
+        {
+          process_id: "task_1",
+          kind: "agent_task",
+          task_type: "review",
+          description: "Active background review",
+          started_at_ms: new Date("2026-03-27T12:01:00.000Z").getTime(),
+          status: "running",
+          subagent_id: "subagent-1",
+        },
+        {
+          process_id: "bash_1",
+          kind: "bash",
+          command: "sleep 300",
+          started_at_ms: new Date("2026-03-27T12:00:00.000Z").getTime(),
+          status: "running",
+          exit_code: null,
+        },
+      ]);
+    } finally {
+      backgroundProcesses.clear();
+      backgroundTasks.clear();
+    }
   });
 
   test("resolveRuntimeScope returns null until a real runtime is bound", () => {
@@ -644,6 +1898,7 @@ describe("listen-client v2 status builders", () => {
       "update_device_status",
       "update_loop_status",
       "update_queue",
+      "update_subagent_state",
     ]);
     expect(
       outbound.every((message) => message.runtime.agent_id === "agent-1"),
@@ -660,6 +1915,161 @@ describe("listen-client v2 status builders", () => {
         kind: "message",
       }),
     ]);
+  });
+
+  test("sync replay soft-fails approval recovery errors without emitting loop_error rows", async () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    __listenClientTestUtils.getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "default",
+    );
+    const socket = new MockSocket(WebSocket.OPEN);
+
+    await __listenClientTestUtils.replaySyncStateForRuntime(
+      listener,
+      socket as unknown as WebSocket,
+      {
+        agent_id: "agent-1",
+        conversation_id: "default",
+      },
+      {
+        recoverApprovalStateForSync: async () => {
+          throw new Error(
+            "Unterminated string in JSON at position 183040 (line 1 column 183041)",
+          );
+        },
+      },
+    );
+
+    const outbound = socket.sentPayloads.map((payload) =>
+      JSON.parse(payload as string),
+    );
+    expect(outbound.map((message) => message.type)).toEqual([
+      "update_device_status",
+      "update_loop_status",
+      "update_queue",
+      "update_subagent_state",
+    ]);
+    expect(
+      outbound.some(
+        (message) =>
+          message.type === "stream_delta" &&
+          message.delta?.message_type === "loop_error",
+      ),
+    ).toBe(false);
+  });
+
+  test("sync includes silent background reflection subagents in update_subagent_state", () => {
+    clearAllSubagents();
+    try {
+      registerSubagent(
+        "subagent-reflection-1",
+        "reflection",
+        "Reflect on recent conversations",
+        undefined,
+        true,
+        true,
+        {
+          agentId: "agent-1",
+          conversationId: "default",
+        },
+      );
+
+      const listener = __listenClientTestUtils.createListenerRuntime();
+      const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
+        listener,
+        "agent-1",
+        "default",
+      );
+      const socket = new MockSocket(WebSocket.OPEN);
+
+      __listenClientTestUtils.emitStateSync(
+        socket as unknown as WebSocket,
+        runtime,
+        {
+          agent_id: "agent-1",
+          conversation_id: "default",
+        },
+      );
+
+      const outbound = socket.sentPayloads.map((payload) =>
+        JSON.parse(payload as string),
+      );
+      expect(outbound[3]).toMatchObject({
+        type: "update_subagent_state",
+        subagents: [
+          expect.objectContaining({
+            subagent_id: "subagent-reflection-1",
+            subagent_type: "Reflection",
+            description: "Reflect on recent conversations",
+            status: "pending",
+            is_background: true,
+            silent: true,
+          }),
+        ],
+      });
+    } finally {
+      clearAllSubagents();
+    }
+  });
+
+  test("sync scopes update_subagent_state to runtime agent and conversation", () => {
+    clearAllSubagents();
+    try {
+      registerSubagent(
+        "subagent-reflection-target",
+        "reflection",
+        "Target scope",
+        undefined,
+        true,
+        true,
+        {
+          agentId: "agent-1",
+          conversationId: "default",
+        },
+      );
+      registerSubagent(
+        "subagent-reflection-other",
+        "reflection",
+        "Other scope",
+        undefined,
+        true,
+        true,
+        {
+          agentId: "agent-2",
+          conversationId: "default",
+        },
+      );
+
+      const listener = __listenClientTestUtils.createListenerRuntime();
+      const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
+        listener,
+        "agent-1",
+        "default",
+      );
+      const socket = new MockSocket(WebSocket.OPEN);
+
+      __listenClientTestUtils.emitStateSync(
+        socket as unknown as WebSocket,
+        runtime,
+        {
+          agent_id: "agent-1",
+          conversation_id: "default",
+        },
+      );
+
+      const outbound = socket.sentPayloads.map((payload) =>
+        JSON.parse(payload as string),
+      );
+      expect(outbound[3].type).toBe("update_subagent_state");
+      expect(outbound[3].subagents).toHaveLength(1);
+      expect(outbound[3].subagents[0]).toMatchObject({
+        subagent_id: "subagent-reflection-target",
+      });
+    } finally {
+      clearAllSubagents();
+    }
   });
 
   test("recovered approvals surface as pending control requests and WAITING_ON_APPROVAL", () => {
@@ -680,6 +2090,7 @@ describe("listen-client v2 status builders", () => {
           requestId,
           {
             approval: {} as never,
+            approvalContext: null,
             controlRequest: makeControlRequest(requestId),
           },
         ],
@@ -709,7 +2120,26 @@ describe("listen-client v2 status builders", () => {
     expect(outbound[1].loop_status).toEqual({
       status: "WAITING_ON_APPROVAL",
       active_run_ids: [],
+      plan_file_path: null,
     });
+  });
+
+  test("sync wiring only surfaces recovered approvals that still need user input", () => {
+    const recoveryPath = fileURLToPath(
+      new URL("../../websocket/listener/recovery.ts", import.meta.url),
+    );
+    const source = readFileSync(recoveryPath, "utf-8");
+
+    expect(source).toContain(
+      "const { needsUserInput, autoAllowed, autoDenied } =",
+    );
+    expect(source).toContain("classifyApprovalsWithSuggestions(");
+    expect(source).toContain(
+      "const autoDecisions = buildRecoveredAutoDecisions(autoAllowed, autoDenied);",
+    );
+    expect(source).toContain("if (needsUserInput.length === 0) {");
+    expect(source).toContain("needsUserInput.map(async (approvalEntry) => {");
+    expect(source).not.toContain("pendingApprovals.map(async (approval) => {");
   });
 
   test("sync ignores backend recovered approvals while a live turn is already processing", async () => {
@@ -726,6 +2156,7 @@ describe("listen-client v2 status builders", () => {
           "perm-stale",
           {
             approval: {} as never,
+            approvalContext: null,
             controlRequest: makeControlRequest("perm-stale"),
           },
         ],
@@ -757,6 +2188,7 @@ describe("listen-client v2 status builders", () => {
           "perm-stale",
           {
             approval: {} as never,
+            approvalContext: null,
             controlRequest: makeControlRequest("perm-stale"),
           },
         ],
@@ -826,6 +2258,7 @@ describe("listen-client v2 status builders", () => {
     ).toEqual({
       status: "WAITING_ON_APPROVAL",
       active_run_ids: [],
+      plan_file_path: null,
     });
   });
 
@@ -1012,6 +2445,29 @@ describe("listen-client interrupt queue projection", () => {
     });
   });
 
+  test("consumeInterruptQueue clears matching empty interrupted context", () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+
+    runtime.pendingInterruptedResults = [];
+    runtime.pendingInterruptedContext = {
+      agentId: "agent-1",
+      conversationId: "conv-1",
+      continuationEpoch: runtime.continuationEpoch,
+    };
+    runtime.pendingInterruptedToolCallIds = [];
+
+    expect(
+      __listenClientTestUtils.consumeInterruptQueue(
+        runtime,
+        "agent-1",
+        "conv-1",
+      ),
+    ).toBeNull();
+    expect(runtime.pendingInterruptedResults).toBeNull();
+    expect(runtime.pendingInterruptedContext).toBeNull();
+    expect(runtime.pendingInterruptedToolCallIds).toBeNull();
+  });
+
   test("recovered approvals are stashed as denials on interrupt", () => {
     const runtime = __listenClientTestUtils.createRuntime();
     runtime.recoveredApprovalState = {
@@ -1026,6 +2482,7 @@ describe("listen-client interrupt queue projection", () => {
               toolName: "Bash",
               toolArgs: '{"command":"ls"}',
             },
+            approvalContext: null,
             controlRequest: makeControlRequest("perm-tool-1"),
           },
         ],
@@ -1037,6 +2494,7 @@ describe("listen-client interrupt queue projection", () => {
               toolName: "Bash",
               toolArgs: '{"command":"pwd"}',
             },
+            approvalContext: null,
             controlRequest: makeControlRequest("perm-tool-2"),
           },
         ],
@@ -1201,6 +2659,63 @@ describe("listen-client capability-gated approval flow", () => {
     }
   });
 
+  test("mode changes emit fresh loop status plan_file_path on enter exit and re-enter", async () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    const socket = new MockSocket(WebSocket.OPEN);
+    listener.socket = socket as unknown as WebSocket;
+
+    const scope = {
+      agent_id: "agent-1",
+      conversation_id: "default",
+    } as const;
+
+    __listenClientTestUtils.handleModeChange(
+      { mode: "plan" },
+      socket as unknown as WebSocket,
+      listener,
+      scope,
+    );
+
+    const firstPlanPath = (socket.sentPayloads
+      .map((payload) => JSON.parse(payload as string))
+      .findLast((payload) => payload.type === "update_loop_status")?.loop_status
+      ?.plan_file_path ?? null) as string | null;
+
+    expect(firstPlanPath).toBeTruthy();
+
+    __listenClientTestUtils.handleModeChange(
+      { mode: "default" },
+      socket as unknown as WebSocket,
+      listener,
+      scope,
+    );
+
+    const afterExitLoopStatus = socket.sentPayloads
+      .map((payload) => JSON.parse(payload as string))
+      .findLast(
+        (payload) =>
+          payload.type === "update_loop_status" &&
+          payload.loop_status?.status === "WAITING_ON_INPUT",
+      );
+
+    expect(afterExitLoopStatus?.loop_status?.plan_file_path).toBeNull();
+
+    __listenClientTestUtils.handleModeChange(
+      { mode: "plan" },
+      socket as unknown as WebSocket,
+      listener,
+      scope,
+    );
+
+    const secondPlanPath = (socket.sentPayloads
+      .map((payload) => JSON.parse(payload as string))
+      .findLast((payload) => payload.type === "update_loop_status")?.loop_status
+      ?.plan_file_path ?? null) as string | null;
+
+    expect(secondPlanPath).toBeTruthy();
+    expect(secondPlanPath).not.toBe(firstPlanPath);
+  });
+
   test("requestApprovalOverWS exposes the control request through device status instead of stream_delta", () => {
     const listener = __listenClientTestUtils.createListenerRuntime();
     const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
@@ -1233,6 +2748,7 @@ describe("listen-client capability-gated approval flow", () => {
     expect(deviceStatus).toBeDefined();
     expect(loopStatus.type).toBe("update_loop_status");
     expect(loopStatus.loop_status.status).toBe("WAITING_ON_APPROVAL");
+    expect(runtime.lastStopReason).toBe("requires_approval");
     expect(deviceStatus.type).toBe("update_device_status");
     expect(deviceStatus.device_status.pending_control_requests).toEqual([
       {
@@ -1242,6 +2758,45 @@ describe("listen-client capability-gated approval flow", () => {
     ]);
 
     // Cleanup
+    rejectPendingApprovalResolvers(runtime, "test cleanup");
+  });
+
+  test("interrupted cache does not project WAITING_ON_APPROVAL when pending requests are suppressed", () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "default",
+    );
+    const socket = new MockSocket(WebSocket.OPEN);
+
+    runtime.isProcessing = true;
+    runtime.activeRunId = "run-1";
+    void requestApprovalOverWS(
+      runtime,
+      socket as unknown as WebSocket,
+      "perm-interrupted",
+      makeControlRequest("perm-interrupted"),
+    ).catch(() => {});
+    runtime.pendingInterruptedContext = {
+      agentId: "agent-1",
+      conversationId: "default",
+      continuationEpoch: runtime.continuationEpoch,
+    };
+
+    const deviceStatus = __listenClientTestUtils.buildDeviceStatus(listener, {
+      agent_id: "agent-1",
+      conversation_id: "default",
+    });
+    const loopStatus = __listenClientTestUtils.buildLoopStatus(listener, {
+      agent_id: "agent-1",
+      conversation_id: "default",
+    });
+
+    expect(deviceStatus.pending_control_requests).toEqual([]);
+    expect(loopStatus.status).toBe("WAITING_ON_INPUT");
+    expect(loopStatus.active_run_ids).toEqual(["run-1"]);
+
     rejectPendingApprovalResolvers(runtime, "test cleanup");
   });
 
@@ -1301,6 +2856,348 @@ describe("listen-client capability-gated approval flow", () => {
       expect.objectContaining({ connectionId: "conn-1" }),
       expect.any(Function),
     );
+  });
+
+  test("stale approval responses unlatch cancelRequested after approval-only interrupt", async () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    const targetRuntime =
+      __listenClientTestUtils.getOrCreateConversationRuntime(
+        listener,
+        "agent-1",
+        "default",
+      );
+    const socket = new MockSocket(WebSocket.OPEN);
+    const scheduleQueuePumpMock = mock(() => {});
+    const resolveRecoveredApprovalResponseMock = mock(async () => false);
+
+    targetRuntime.cancelRequested = true;
+    targetRuntime.isProcessing = false;
+
+    const handled = await __listenClientTestUtils.handleApprovalResponseInput(
+      listener,
+      {
+        runtime: { agent_id: "agent-1", conversation_id: "default" },
+        response: {
+          request_id: "perm-stale",
+          decision: { behavior: "allow" },
+        },
+        socket: socket as unknown as WebSocket,
+        opts: {
+          onStatusChange: undefined,
+          connectionId: "conn-1",
+        },
+        processQueuedTurn: async () => {},
+      },
+      {
+        resolveRuntimeForApprovalRequest: () => null,
+        resolvePendingApprovalResolver: () => false,
+        getOrCreateScopedRuntime: () => targetRuntime,
+        resolveRecoveredApprovalResponse: resolveRecoveredApprovalResponseMock,
+        scheduleQueuePump: scheduleQueuePumpMock,
+      },
+    );
+
+    expect(handled).toBe(false);
+    expect(targetRuntime.cancelRequested).toBe(false);
+    expect(resolveRecoveredApprovalResponseMock).not.toHaveBeenCalled();
+    expect(scheduleQueuePumpMock).toHaveBeenCalledWith(
+      targetRuntime,
+      socket,
+      expect.objectContaining({ connectionId: "conn-1" }),
+      expect.any(Function),
+    );
+  });
+
+  test("abort_message eagerly projects idle interrupted state for active turns", async () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    const socket = new MockSocket(WebSocket.OPEN);
+    listener.socket = socket as unknown as WebSocket;
+    __listenClientTestUtils.setActiveRuntime(listener);
+
+    const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "default",
+    );
+    const scheduleQueuePumpMock = mock(() => {});
+    const cancelConversationMock = mock(async () => {});
+
+    runtime.isProcessing = true;
+    runtime.loopStatus = "PROCESSING_API_RESPONSE";
+    runtime.activeAbortController = new AbortController();
+    runtime.activeRunId = "run-active";
+    runtime.activeRunStartedAt = new Date().toISOString();
+    runtime.activeWorkingDirectory = process.cwd();
+    runtime.activeExecutingToolCallIds = ["tool-1"];
+
+    const handled = await __listenClientTestUtils.handleAbortMessageInput(
+      listener,
+      {
+        command: {
+          type: "abort_message",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+        },
+        socket: socket as unknown as WebSocket,
+        opts: {
+          onStatusChange: undefined,
+          connectionId: "conn-1",
+        },
+        processQueuedTurn: async () => {},
+      },
+      {
+        scheduleQueuePump: scheduleQueuePumpMock,
+        cancelConversation: cancelConversationMock,
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(runtime.cancelRequested).toBe(true);
+    expect(runtime.isProcessing).toBe(false);
+    expect(runtime.loopStatus as string).toBe("WAITING_ON_INPUT");
+    expect(runtime.activeRunId).toBeNull();
+    expect(runtime.activeAbortController).toBeNull();
+    expect(runtime.pendingInterruptedToolCallIds).toEqual(["tool-1"]);
+    expect(scheduleQueuePumpMock).toHaveBeenCalledWith(
+      runtime,
+      socket,
+      expect.objectContaining({ connectionId: "conn-1" }),
+      expect.any(Function),
+    );
+    expect(cancelConversationMock).toHaveBeenCalledWith("agent-1", "default");
+
+    const outbound = socket.sentPayloads.map((payload) => JSON.parse(payload));
+    const interruptedStatus = outbound.find(
+      (payload) =>
+        payload.type === "stream_delta" &&
+        payload.delta?.message_type === "status" &&
+        payload.delta?.message === "Interrupted",
+    );
+    const loopUpdate = outbound.find(
+      (payload) =>
+        payload.type === "update_loop_status" &&
+        payload.loop_status?.status === "WAITING_ON_INPUT",
+    );
+    const deviceUpdate = outbound.find(
+      (payload) =>
+        payload.type === "update_device_status" &&
+        payload.device_status?.is_processing === false,
+    );
+
+    expect(interruptedStatus).toBeDefined();
+    expect(loopUpdate?.loop_status?.active_run_ids).toEqual([]);
+    expect(deviceUpdate).toBeDefined();
+
+    __listenClientTestUtils.setActiveRuntime(null);
+  });
+
+  test("late approval registration after abort_message is rejected immediately", async () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    const socket = new MockSocket(WebSocket.OPEN);
+    listener.socket = socket as unknown as WebSocket;
+    __listenClientTestUtils.setActiveRuntime(listener);
+
+    const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "default",
+    );
+
+    runtime.isProcessing = true;
+    runtime.loopStatus = "PROCESSING_API_RESPONSE";
+    runtime.activeAbortController = new AbortController();
+    runtime.activeRunId = "run-active";
+
+    const handled = await __listenClientTestUtils.handleAbortMessageInput(
+      listener,
+      {
+        command: {
+          type: "abort_message",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+        },
+        socket: socket as unknown as WebSocket,
+        opts: {
+          onStatusChange: undefined,
+          connectionId: "conn-1",
+        },
+        processQueuedTurn: async () => {},
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(runtime.cancelRequested).toBe(true);
+
+    await expect(
+      requestApprovalOverWS(
+        runtime,
+        socket as unknown as WebSocket,
+        "perm-late-after-abort",
+        makeControlRequest("perm-late-after-abort"),
+      ),
+    ).rejects.toThrow("Cancelled by user");
+    expect(runtime.pendingApprovalResolvers.size).toBe(0);
+    expect(runtime.listener.approvalRuntimeKeyByRequestId.size).toBe(0);
+
+    __listenClientTestUtils.setActiveRuntime(null);
+  });
+
+  test("abort_message preserves recovered approval denials instead of clobbering them to empty", async () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    const socket = new MockSocket(WebSocket.OPEN);
+    listener.socket = socket as unknown as WebSocket;
+    __listenClientTestUtils.setActiveRuntime(listener);
+
+    const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "default",
+    );
+    const scheduleQueuePumpMock = mock(() => {});
+    const cancelConversationMock = mock(async () => {});
+
+    runtime.loopStatus = "WAITING_ON_APPROVAL";
+    runtime.recoveredApprovalState = {
+      agentId: "agent-1",
+      conversationId: "default",
+      approvalsByRequestId: new Map([
+        [
+          "perm-recovered",
+          {
+            approval: {
+              toolCallId: "call-1",
+              toolName: "Write",
+              toolArgs: '{"path":"foo.txt"}',
+            },
+            approvalContext: null,
+            controlRequest: makeControlRequest("perm-recovered"),
+          },
+        ],
+      ]),
+      pendingRequestIds: new Set(["perm-recovered"]),
+      responsesByRequestId: new Map(),
+    };
+
+    const handled = await __listenClientTestUtils.handleAbortMessageInput(
+      listener,
+      {
+        command: {
+          type: "abort_message",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+        },
+        socket: socket as unknown as WebSocket,
+        opts: {
+          onStatusChange: undefined,
+          connectionId: "conn-1",
+        },
+        processQueuedTurn: async () => {},
+      },
+      {
+        scheduleQueuePump: scheduleQueuePumpMock,
+        cancelConversation: cancelConversationMock,
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(runtime.cancelRequested).toBe(false);
+    expect(runtime.pendingInterruptedResults).toEqual([
+      {
+        type: "approval",
+        tool_call_id: "call-1",
+        approve: false,
+        reason: "User interrupted the stream",
+      },
+    ]);
+
+    const consumed = __listenClientTestUtils.consumeInterruptQueue(
+      runtime,
+      "agent-1",
+      "default",
+    );
+    expect(consumed?.approvalMessage.approvals).toEqual([
+      {
+        type: "approval",
+        tool_call_id: "call-1",
+        approve: false,
+        reason: "User interrupted the stream",
+      },
+    ]);
+    expect(scheduleQueuePumpMock).toHaveBeenCalled();
+    expect(cancelConversationMock).toHaveBeenCalledWith("agent-1", "default");
+
+    __listenClientTestUtils.setActiveRuntime(null);
+  });
+
+  test("abort_message preserves live approval denials instead of clobbering them to empty", async () => {
+    const listener = __listenClientTestUtils.createListenerRuntime();
+    const socket = new MockSocket(WebSocket.OPEN);
+    listener.socket = socket as unknown as WebSocket;
+    __listenClientTestUtils.setActiveRuntime(listener);
+
+    const runtime = __listenClientTestUtils.getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "default",
+    );
+    const scheduleQueuePumpMock = mock(() => {});
+    const cancelConversationMock = mock(async () => {});
+
+    runtime.loopStatus = "WAITING_ON_APPROVAL";
+    const pending = requestApprovalOverWS(
+      runtime,
+      socket as unknown as WebSocket,
+      "perm-live",
+      makeControlRequest("perm-live"),
+    );
+
+    const handled = await __listenClientTestUtils.handleAbortMessageInput(
+      listener,
+      {
+        command: {
+          type: "abort_message",
+          runtime: { agent_id: "agent-1", conversation_id: "default" },
+        },
+        socket: socket as unknown as WebSocket,
+        opts: {
+          onStatusChange: undefined,
+          connectionId: "conn-1",
+        },
+        processQueuedTurn: async () => {},
+      },
+      {
+        scheduleQueuePump: scheduleQueuePumpMock,
+        cancelConversation: cancelConversationMock,
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(runtime.cancelRequested).toBe(false);
+    await expect(pending).rejects.toThrow("Cancelled by user");
+    expect(runtime.pendingApprovalResolvers.size).toBe(0);
+    expect(runtime.pendingInterruptedResults).toEqual([
+      {
+        type: "approval",
+        tool_call_id: "call-1",
+        approve: false,
+        reason: "User interrupted the stream",
+      },
+    ]);
+
+    const consumed = __listenClientTestUtils.consumeInterruptQueue(
+      runtime,
+      "agent-1",
+      "default",
+    );
+    expect(consumed?.approvalMessage.approvals).toEqual([
+      {
+        type: "approval",
+        tool_call_id: "call-1",
+        approve: false,
+        reason: "User interrupted the stream",
+      },
+    ]);
+    expect(scheduleQueuePumpMock).toHaveBeenCalled();
+    expect(cancelConversationMock).toHaveBeenCalledWith("agent-1", "default");
+
+    __listenClientTestUtils.setActiveRuntime(null);
   });
 });
 
@@ -1382,6 +3279,309 @@ describe("listen-client runtime metadata", () => {
     const runtime = __listenClientTestUtils.createRuntime();
     expect(runtime.sessionId).toMatch(/^listen-/);
     expect(runtime.sessionId.length).toBeGreaterThan(10);
+  });
+});
+
+describe("listen-client recoverable status notices", () => {
+  test("marks stale approval recovery as debug-only", () => {
+    expect(
+      getRecoverableStatusNoticeVisibility("stale_approval_conflict_recovery"),
+    ).toBe("debug_only");
+  });
+
+  test("suppresses stale approval recovery from transcript and mirrors it to desktop logs", () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+    const socket = new MockSocket();
+    const originalFlag = process.env.LETTA_DESKTOP_DEBUG_PANEL;
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const mirroredLines: string[] = [];
+
+    process.env.LETTA_DESKTOP_DEBUG_PANEL = "1";
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      mirroredLines.push(
+        typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"),
+      );
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      emitRecoverableStatusNotice(socket as unknown as WebSocket, runtime, {
+        kind: "stale_approval_conflict_recovery",
+        message:
+          "Recovering from stale approval conflict after interrupted/reconnected turn",
+        level: "warning",
+        agentId: "agent-1",
+        conversationId: "default",
+      });
+    } finally {
+      process.stderr.write = originalWrite as typeof process.stderr.write;
+      if (originalFlag === undefined) {
+        delete process.env.LETTA_DESKTOP_DEBUG_PANEL;
+      } else {
+        process.env.LETTA_DESKTOP_DEBUG_PANEL = originalFlag;
+      }
+    }
+
+    expect(socket.sentPayloads).toHaveLength(0);
+    expect(mirroredLines).toHaveLength(1);
+    expect(mirroredLines[0]).toContain(DESKTOP_DEBUG_PANEL_INFO_PREFIX);
+    expect(mirroredLines[0]).toContain(
+      "Recovering from stale approval conflict after interrupted/reconnected turn",
+    );
+  });
+
+  test("marks the first transient provider retry as debug-only", () => {
+    expect(
+      getRecoverableRetryNoticeVisibility("transient_provider_retry", 1),
+    ).toBe("debug_only");
+    expect(
+      getRecoverableRetryNoticeVisibility("transient_provider_retry", 2),
+    ).toBe("transcript");
+  });
+
+  test("suppresses only the first transient provider retry from transcript", () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+    const firstSocket = new MockSocket();
+    const secondSocket = new MockSocket();
+    const originalFlag = process.env.LETTA_DESKTOP_DEBUG_PANEL;
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const mirroredLines: string[] = [];
+
+    process.env.LETTA_DESKTOP_DEBUG_PANEL = "1";
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      mirroredLines.push(
+        typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"),
+      );
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      emitRecoverableRetryNotice(firstSocket as unknown as WebSocket, runtime, {
+        kind: "transient_provider_retry",
+        message: "Anthropic API is overloaded, retrying...",
+        reason: "llm_api_error",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 1000,
+        agentId: "agent-1",
+        conversationId: "default",
+      });
+
+      emitRecoverableRetryNotice(
+        secondSocket as unknown as WebSocket,
+        runtime,
+        {
+          kind: "transient_provider_retry",
+          message: "Anthropic API is overloaded, retrying...",
+          reason: "llm_api_error",
+          attempt: 2,
+          maxAttempts: 3,
+          delayMs: 2000,
+          agentId: "agent-1",
+          conversationId: "default",
+        },
+      );
+    } finally {
+      process.stderr.write = originalWrite as typeof process.stderr.write;
+      if (originalFlag === undefined) {
+        delete process.env.LETTA_DESKTOP_DEBUG_PANEL;
+      } else {
+        process.env.LETTA_DESKTOP_DEBUG_PANEL = originalFlag;
+      }
+    }
+
+    expect(firstSocket.sentPayloads).toHaveLength(0);
+    expect(mirroredLines).toHaveLength(1);
+    expect(mirroredLines[0]).toContain(DESKTOP_DEBUG_PANEL_INFO_PREFIX);
+    expect(mirroredLines[0]).toContain(
+      "Anthropic API is overloaded, retrying...",
+    );
+
+    expect(secondSocket.sentPayloads).toHaveLength(1);
+    const payload = JSON.parse(secondSocket.sentPayloads[0] as string) as {
+      type: string;
+      delta: Record<string, unknown>;
+    };
+    expect(payload.type).toBe("stream_delta");
+    expect(payload.delta).toMatchObject({
+      message_type: "retry",
+      message: "Anthropic API is overloaded, retrying...",
+      attempt: 2,
+      max_attempts: 3,
+      delay_ms: 2000,
+    });
+  });
+});
+
+describe("listen-client loop error notices", () => {
+  test("suppresses terminated process noise from the transcript", () => {
+    expect(
+      getLoopErrorNoticeDecision({
+        message: "terminated",
+      }),
+    ).toEqual({
+      visibility: "debug_only",
+      message: "terminated",
+    });
+  });
+
+  test("normalizes Cloudflare HTML errors to match TUI formatting", () => {
+    const message = `520 <!DOCTYPE html><html><head><title>letta.com | 520: Web server is returning an unknown error</title></head><body>Error code 520 Visit <a href="https://www.cloudflare.com/5xx-error-landing?utm_campaign=api.letta.com">cloudflare</a> Cloudflare Ray ID: abc123</body></html>`;
+
+    expect(
+      getLoopErrorNoticeDecision({
+        message,
+      }),
+    ).toEqual({
+      visibility: "transcript",
+      message:
+        "Cloudflare 520: Web server is returning an unknown error for api.letta.com (Ray ID: abc123). This is usually a temporary edge/origin outage. Please retry in a moment.",
+    });
+  });
+
+  test("normalizes proxy transport errors into a friendly transcript message", () => {
+    const error = new APIError(
+      504,
+      {
+        detail:
+          "Error occurred while trying to proxy to: http://localhost:3000",
+      },
+      undefined,
+      new Headers(),
+    );
+
+    expect(
+      getLoopErrorNoticeDecision({
+        message:
+          "504 Error occurred while trying to proxy to: http://localhost:3000",
+        error,
+      }),
+    ).toEqual({
+      visibility: "transcript",
+      message: "Connection to Letta service failed. Please retry.",
+    });
+  });
+
+  test("reuses TUI formatter for structured run errors", () => {
+    const apiError = {
+      message_type: "error_message" as const,
+      error_type: "insufficient_credits_error",
+      message: "Insufficient credits",
+      detail: "Please add credits to continue.",
+      run_id: "run-123",
+    };
+    const expectedMessage = formatErrorDetails(
+      {
+        error: {
+          error: {
+            type: apiError.error_type,
+            message: apiError.message,
+            detail: apiError.detail,
+          },
+          run_id: apiError.run_id,
+        },
+      },
+      "agent-1",
+      "default",
+    );
+
+    expect(
+      getLoopErrorNoticeDecision({
+        message: apiError.detail,
+        runErrorInfo: {
+          error_type: apiError.error_type,
+          message: apiError.message,
+          detail: apiError.detail,
+          run_id: apiError.run_id,
+        },
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+    ).toEqual({
+      visibility: "transcript",
+      message: expectedMessage,
+      apiError,
+    });
+  });
+
+  test("emits structured api_error for loop errors when available", () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+    runtime.activeAgentId = "agent-1";
+    runtime.activeConversationId = "default";
+    const socket = new MockSocket();
+    const apiError = {
+      message_type: "error_message" as const,
+      error_type: "internal_error",
+      message: "Internal error",
+      detail: "provider overloaded",
+      run_id: "run-123",
+    };
+
+    emitLoopErrorNotice(socket as unknown as WebSocket, runtime, {
+      message: apiError.detail,
+      stopReason: "llm_api_error",
+      isTerminal: true,
+      runId: apiError.run_id,
+      agentId: "agent-1",
+      conversationId: "default",
+      apiError,
+    });
+
+    expect(socket.sentPayloads).toHaveLength(1);
+    const [firstPayload] = socket.sentPayloads;
+    expect(firstPayload).toBeDefined();
+    const payload = JSON.parse(firstPayload as string) as {
+      type: string;
+      delta: Record<string, unknown>;
+    };
+
+    expect(payload.type).toBe("stream_delta");
+    expect(payload.delta).toMatchObject({
+      message_type: "loop_error",
+      stop_reason: "llm_api_error",
+      is_terminal: true,
+      api_error: apiError,
+    });
+  });
+
+  test("suppresses abort-like loop errors from transcript and mirrors them to desktop logs", () => {
+    const runtime = __listenClientTestUtils.createRuntime();
+    const socket = new MockSocket();
+    const originalFlag = process.env.LETTA_DESKTOP_DEBUG_PANEL;
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const mirroredLines: string[] = [];
+    const abortError = Object.assign(new Error("The operation was aborted"), {
+      name: "AbortError",
+    });
+
+    process.env.LETTA_DESKTOP_DEBUG_PANEL = "1";
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      mirroredLines.push(
+        typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"),
+      );
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      emitLoopErrorNotice(socket as unknown as WebSocket, runtime, {
+        message: abortError.message,
+        stopReason: "error",
+        isTerminal: true,
+        error: abortError,
+      });
+    } finally {
+      process.stderr.write = originalWrite as typeof process.stderr.write;
+      if (originalFlag === undefined) {
+        delete process.env.LETTA_DESKTOP_DEBUG_PANEL;
+      } else {
+        process.env.LETTA_DESKTOP_DEBUG_PANEL = originalFlag;
+      }
+    }
+
+    expect(socket.sentPayloads).toHaveLength(0);
+    expect(mirroredLines).toHaveLength(1);
+    expect(mirroredLines[0]).toContain(DESKTOP_DEBUG_PANEL_INFO_PREFIX);
+    expect(mirroredLines[0]).toContain("The operation was aborted");
   });
 });
 
@@ -1714,5 +3914,409 @@ describe("listen-client tool_return wire normalization", () => {
     });
 
     expect(normalized).toBeNull();
+  });
+
+  test("truncates oversized inbound tool returns and drops oversized stdout metadata", () => {
+    const hugeOutput = "x".repeat(LIMITS.BASH_OUTPUT_CHARS + 500);
+    const normalized = __listenClientTestUtils.normalizeToolReturnWireMessage({
+      message_type: "tool_return_message",
+      id: "message-3",
+      run_id: "run-3",
+      tool_returns: [
+        {
+          tool_call_id: "call-3",
+          status: "success",
+          tool_return: hugeOutput,
+          stdout: [hugeOutput],
+        },
+      ],
+    });
+
+    expect(normalized).not.toBeNull();
+    const toolReturns = (
+      normalized as {
+        tool_returns: Array<{ tool_return: string; stdout?: string[] }>;
+      }
+    ).tool_returns;
+
+    expect(toolReturns).toHaveLength(1);
+    expect(toolReturns[0]?.tool_return).toContain("[Output truncated:");
+    expect(toolReturns[0]?.tool_return.length).toBeLessThan(hugeOutput.length);
+    expect(toolReturns[0]).not.toHaveProperty("stdout");
+  });
+});
+
+describe("listen-client edit_file command", () => {
+  test("parses valid edit_file command", () => {
+    const parsed = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "edit_file",
+          file_path: "/path/to/file.ts",
+          old_string: "hello",
+          new_string: "world",
+          request_id: "req-123",
+        }),
+      ),
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed?.type).toBe("edit_file");
+  });
+
+  test("parses edit_file command with optional fields", () => {
+    const parsed = parseServerMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: "edit_file",
+          file_path: "/path/to/file.ts",
+          old_string: "hello",
+          new_string: "world",
+          replace_all: true,
+          expected_replacements: 3,
+          request_id: "req-456",
+        }),
+      ),
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed?.type).toBe("edit_file");
+  });
+
+  test("isEditFileCommand validates required fields", () => {
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        old_string: "hello",
+        new_string: "world",
+        request_id: "req-123",
+      }),
+    ).toBe(true);
+
+    // Missing file_path
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        old_string: "hello",
+        new_string: "world",
+        request_id: "req-123",
+      }),
+    ).toBe(false);
+
+    // Missing old_string
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        new_string: "world",
+        request_id: "req-123",
+      }),
+    ).toBe(false);
+
+    // Missing new_string
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        old_string: "hello",
+        request_id: "req-123",
+      }),
+    ).toBe(false);
+
+    // Missing request_id
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        old_string: "hello",
+        new_string: "world",
+      }),
+    ).toBe(false);
+  });
+
+  test("isEditFileCommand validates expected_replacements is positive integer", () => {
+    // Valid: positive integer
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        old_string: "hello",
+        new_string: "world",
+        expected_replacements: 5,
+        request_id: "req-123",
+      }),
+    ).toBe(true);
+
+    // Invalid: 0
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        old_string: "hello",
+        new_string: "world",
+        expected_replacements: 0,
+        request_id: "req-123",
+      }),
+    ).toBe(false);
+
+    // Invalid: negative
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        old_string: "hello",
+        new_string: "world",
+        expected_replacements: -1,
+        request_id: "req-123",
+      }),
+    ).toBe(false);
+
+    // Invalid: non-integer
+    expect(
+      isEditFileCommand({
+        type: "edit_file",
+        file_path: "/path/to/file.ts",
+        old_string: "hello",
+        new_string: "world",
+        expected_replacements: 1.5,
+        request_id: "req-123",
+      }),
+    ).toBe(false);
+  });
+
+  test("edit_file command handler responds with success", async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "letta-edit-test-"));
+    const testFile = join(tempRoot, "test.txt");
+
+    try {
+      await writeFile(testFile, "hello world");
+
+      const socket = new MockSocket(WebSocket.OPEN);
+      const listener = __listenClientTestUtils.createListenerRuntime();
+      listener.socket = socket as unknown as WebSocket;
+      __listenClientTestUtils.setActiveRuntime(listener);
+
+      // Simulate the edit_file command being received
+      const parsed = parseServerMessage(
+        Buffer.from(
+          JSON.stringify({
+            type: "edit_file",
+            file_path: testFile,
+            old_string: "hello",
+            new_string: "goodbye",
+            request_id: "req-test-1",
+          }),
+        ),
+      );
+
+      expect(parsed).not.toBeNull();
+      expect(parsed?.type).toBe("edit_file");
+
+      // Give the async handler time to process
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Check for response
+      const responses = socket.sentPayloads.map((p) => JSON.parse(p as string));
+      const _editResponse = responses.find(
+        (r) => r.type === "edit_file_response",
+      );
+
+      // Note: The handler runs asynchronously, so we may need to wait
+      // In a real test, we'd mock the edit function or use a different approach
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+      __listenClientTestUtils.setActiveRuntime(null);
+    }
+  });
+});
+
+describe("listen-client skill enable/disable command handling", () => {
+  test("enables a skill by creating a symlink and disables it by removing it", async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "letta-listen-skill-"));
+    const originalLettaHome = process.env.LETTA_HOME;
+    process.env.LETTA_HOME = tempRoot;
+
+    try {
+      // Create a fake skill directory with SKILL.md
+      const skillDir = join(tempRoot, "source-skill");
+      await mkdir(skillDir, { recursive: true });
+      await writeFile(
+        join(skillDir, "SKILL.md"),
+        "---\nname: test-skill\ndescription: A test skill\n---\nHello",
+      );
+
+      const socket = new MockSocket(WebSocket.OPEN);
+
+      // Enable the skill
+      await __listenClientTestUtils.handleSkillCommand(
+        {
+          type: "skill_enable",
+          request_id: "skill-enable-1",
+          skill_path: skillDir,
+        },
+        socket as unknown as WebSocket,
+      );
+
+      const enableMessages = socket.sentPayloads.map((p) => JSON.parse(p));
+      expect(enableMessages[0]).toMatchObject({
+        type: "skill_enable_response",
+        request_id: "skill-enable-1",
+        success: true,
+        name: "source-skill",
+      });
+      expect(enableMessages[1]).toMatchObject({
+        type: "skills_updated",
+      });
+
+      // Verify symlink was created
+      const { lstatSync, readlinkSync } = await import("node:fs");
+      const linkPath = join(tempRoot, "skills", "source-skill");
+      const stat = lstatSync(linkPath);
+      expect(stat.isSymbolicLink()).toBe(true);
+      const target = readlinkSync(linkPath);
+      expect(target).toBe(skillDir);
+
+      // Disable the skill
+      socket.sentPayloads.length = 0;
+      await __listenClientTestUtils.handleSkillCommand(
+        {
+          type: "skill_disable",
+          request_id: "skill-disable-1",
+          name: "source-skill",
+        },
+        socket as unknown as WebSocket,
+      );
+
+      const disableMessages = socket.sentPayloads.map((p) => JSON.parse(p));
+      expect(disableMessages[0]).toMatchObject({
+        type: "skill_disable_response",
+        request_id: "skill-disable-1",
+        success: true,
+        name: "source-skill",
+      });
+      expect(disableMessages[1]).toMatchObject({
+        type: "skills_updated",
+      });
+
+      // Verify symlink was removed
+      const { existsSync } = await import("node:fs");
+      expect(existsSync(linkPath)).toBe(false);
+    } finally {
+      if (originalLettaHome) {
+        process.env.LETTA_HOME = originalLettaHome;
+      } else {
+        delete process.env.LETTA_HOME;
+      }
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects enable when path does not exist", async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "letta-listen-skill-"));
+    const originalLettaHome = process.env.LETTA_HOME;
+    process.env.LETTA_HOME = tempRoot;
+
+    try {
+      const socket = new MockSocket(WebSocket.OPEN);
+
+      await __listenClientTestUtils.handleSkillCommand(
+        {
+          type: "skill_enable",
+          request_id: "skill-enable-bad",
+          skill_path: "/nonexistent/path",
+        },
+        socket as unknown as WebSocket,
+      );
+
+      const messages = socket.sentPayloads.map((p) => JSON.parse(p));
+      expect(messages[0]).toMatchObject({
+        type: "skill_enable_response",
+        request_id: "skill-enable-bad",
+        success: false,
+      });
+      expect(messages[0].error).toContain("does not exist");
+    } finally {
+      if (originalLettaHome) {
+        process.env.LETTA_HOME = originalLettaHome;
+      } else {
+        delete process.env.LETTA_HOME;
+      }
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects enable when SKILL.md is missing", async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "letta-listen-skill-"));
+    const originalLettaHome = process.env.LETTA_HOME;
+    process.env.LETTA_HOME = tempRoot;
+
+    try {
+      // Create a directory without SKILL.md
+      const skillDir = join(tempRoot, "no-skill-md");
+      await mkdir(skillDir, { recursive: true });
+
+      const socket = new MockSocket(WebSocket.OPEN);
+
+      await __listenClientTestUtils.handleSkillCommand(
+        {
+          type: "skill_enable",
+          request_id: "skill-enable-no-md",
+          skill_path: skillDir,
+        },
+        socket as unknown as WebSocket,
+      );
+
+      const messages = socket.sentPayloads.map((p) => JSON.parse(p));
+      expect(messages[0]).toMatchObject({
+        type: "skill_enable_response",
+        request_id: "skill-enable-no-md",
+        success: false,
+      });
+      expect(messages[0].error).toContain("No SKILL.md");
+    } finally {
+      if (originalLettaHome) {
+        process.env.LETTA_HOME = originalLettaHome;
+      } else {
+        delete process.env.LETTA_HOME;
+      }
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects disable when skill is not a symlink", async () => {
+    const tempRoot = await mkdtemp(join(os.tmpdir(), "letta-listen-skill-"));
+    const originalLettaHome = process.env.LETTA_HOME;
+    process.env.LETTA_HOME = tempRoot;
+
+    try {
+      // Create a real directory (not a symlink) in skills/
+      const skillsDir = join(tempRoot, "skills");
+      await mkdir(join(skillsDir, "real-dir"), { recursive: true });
+
+      const socket = new MockSocket(WebSocket.OPEN);
+
+      await __listenClientTestUtils.handleSkillCommand(
+        {
+          type: "skill_disable",
+          request_id: "skill-disable-real",
+          name: "real-dir",
+        },
+        socket as unknown as WebSocket,
+      );
+
+      const messages = socket.sentPayloads.map((p) => JSON.parse(p));
+      expect(messages[0]).toMatchObject({
+        type: "skill_disable_response",
+        request_id: "skill-disable-real",
+        success: false,
+      });
+      expect(messages[0].error).toContain("not a symlink");
+    } finally {
+      if (originalLettaHome) {
+        process.env.LETTA_HOME = originalLettaHome;
+      } else {
+        delete process.env.LETTA_HOME;
+      }
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 });

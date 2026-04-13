@@ -30,7 +30,7 @@ import { OPENAI_CODEX_PROVIDER_NAME } from "../../providers/openai-codex-provide
 import { ralphMode } from "../../ralph/mode";
 import { settingsManager } from "../../settings-manager";
 import { buildChatUrl } from "../helpers/appUrls.js";
-import { charsToTokens, formatCompact } from "../helpers/format";
+import { bytesToTokens, formatCompact } from "../helpers/format";
 import type { QueuedMessage } from "../helpers/messageQueueBridge";
 import {
   getActiveBackgroundAgents,
@@ -238,6 +238,7 @@ const InputFooter = memo(function InputFooter({
   currentReasoningEffort,
   isOpenAICodexProvider,
   isByokProvider,
+  hasTemporaryModelOverride,
   hideFooter,
   rightColumnWidth,
   statusLineText,
@@ -257,6 +258,7 @@ const InputFooter = memo(function InputFooter({
   currentReasoningEffort?: ModelReasoningEffort | null;
   isOpenAICodexProvider: boolean;
   isByokProvider: boolean;
+  hasTemporaryModelOverride?: boolean;
   hideFooter: boolean;
   rightColumnWidth: number;
   statusLineText?: string;
@@ -314,15 +316,21 @@ const InputFooter = memo(function InputFooter({
   const displayAgentName = truncateEnd(agentName || "Unnamed", maxAgentChars);
   const reasoningTag = getReasoningEffortTag(currentReasoningEffort);
   const byokExtraChars = isByokProvider ? 2 : 0; // " ▲"
+  const tempOverrideExtraChars = hasTemporaryModelOverride ? 2 : 0; // " ▲"
 
-  const baseReservedChars = displayAgentName.length + byokExtraChars + 4;
+  const baseReservedChars =
+    displayAgentName.length + byokExtraChars + tempOverrideExtraChars + 4;
   const modelWithReasoning =
     (currentModel ?? "unknown") + (reasoningTag ? ` (${reasoningTag})` : "");
 
   const maxModelChars = Math.max(8, rightColumnWidth - baseReservedChars);
   const displayModel = truncateEnd(modelWithReasoning, maxModelChars);
   const rightTextLength =
-    displayAgentName.length + displayModel.length + byokExtraChars + 3;
+    displayAgentName.length +
+    displayModel.length +
+    byokExtraChars +
+    tempOverrideExtraChars +
+    3;
   const rightPrefixSpaces = Math.max(0, rightColumnWidth - rightTextLength);
 
   // When bg agents are active, widen the right column to fit the indicator + label
@@ -359,9 +367,19 @@ const InputFooter = memo(function InputFooter({
         isOpenAICodexProvider ? chalk.hex("#74AA9C")("▲") : chalk.yellow("▲"),
       );
     }
+    if (hasTemporaryModelOverride) {
+      parts.push(chalk.dim(" "));
+      parts.push(chalk.yellow("▲"));
+    }
     parts.push(chalk.dim("]"));
     return parts.join("");
-  }, [displayAgentName, displayModel, isByokProvider, isOpenAICodexProvider]);
+  }, [
+    displayAgentName,
+    displayModel,
+    isByokProvider,
+    isOpenAICodexProvider,
+    hasTemporaryModelOverride,
+  ]);
 
   const rightLabel = useMemo(
     () => " ".repeat(rightPrefixSpaces) + rightLabelCore,
@@ -439,7 +457,7 @@ const InputFooter = memo(function InputFooter({
               pulseIntervalMs={400}
             />
             {bgAgentParts.map((part, i) => (
-              <Text key={`bg-agent-${part}`}>
+              <Text key={`bg-agent-${part.id}`}>
                 {i > 0 && (
                   <Text
                     key={`bg-agent-indicator-${part}`}
@@ -588,7 +606,7 @@ const StreamingStatus = memo(function StreamingStatus({
     }
   }, [streaming, visible, includeSystemPromptUpgradeTip]);
 
-  const estimatedTokens = charsToTokens(tokenCount);
+  const estimatedTokens = bytesToTokens(tokenCount);
   const totalElapsedMs = elapsedBaseMs + elapsedMs;
   const shouldShowTokenCount =
     streaming && estimatedTokens > TOKEN_DISPLAY_THRESHOLD;
@@ -735,10 +753,12 @@ export function Input({
   agentName,
   currentModel,
   currentModelProvider,
+  hasTemporaryModelOverride = false,
   currentReasoningEffort,
   messageQueue,
   onEnterQueueEditMode,
   onEscapeCancel,
+  inputDisabled = false,
   ralphActive = false,
   ralphPending = false,
   ralphPendingYolo = false,
@@ -755,6 +775,7 @@ export function Input({
   statusLinePadding = 0,
   statusLinePrompt,
   onCycleReasoningEffort,
+  onDraftChange,
   footerNotification,
 }: {
   visible?: boolean;
@@ -778,10 +799,12 @@ export function Input({
   agentName?: string | null;
   currentModel?: string | null;
   currentModelProvider?: string | null;
+  hasTemporaryModelOverride?: boolean;
   currentReasoningEffort?: ModelReasoningEffort | null;
   messageQueue?: QueuedMessage[];
   onEnterQueueEditMode?: () => void;
   onEscapeCancel?: () => void;
+  inputDisabled?: boolean;
   ralphActive?: boolean;
   ralphPending?: boolean;
   ralphPendingYolo?: boolean;
@@ -798,6 +821,7 @@ export function Input({
   statusLinePadding?: number;
   statusLinePrompt?: string;
   onCycleReasoningEffort?: () => void;
+  onDraftChange?: (draft: string) => void;
   footerNotification?: string | null;
 }) {
   const [value, setValue] = useState("");
@@ -864,7 +888,7 @@ export function Input({
   const promptVisualWidth = stringWidth(promptChar) + 1; // +1 for trailing space
   const contentWidth = Math.max(0, columns - promptVisualWidth);
 
-  const interactionEnabled = visible && inputEnabled;
+  const interactionEnabled = visible && inputEnabled && !inputDisabled;
   const reserveInputSpace = !collapseInputWhenDisabled;
   const hideFooter = !interactionEnabled || value.startsWith("/");
   const inputRowLines = useMemo(() => {
@@ -940,10 +964,19 @@ export function Input({
 
   // Restore input from error (only if current value is empty)
   useEffect(() => {
-    if (restoredInput && value === "") {
+    if (restoredInput === null || restoredInput === undefined) return;
+
+    // Empty string is a deliberate external clear request (e.g. draft consumed).
+    if (restoredInput === "") {
+      setValue("");
+      onRestoredInputConsumed?.();
+      return;
+    }
+
+    if (value === "") {
       setValue(restoredInput);
       onRestoredInputConsumed?.();
-    } else if (restoredInput && value !== "") {
+    } else {
       // Input has content, don't clobber - just consume the restored value
       onRestoredInputConsumed?.();
     }
@@ -1329,7 +1362,8 @@ export function Input({
       setAtEndBoundary(false);
     }
     previousValueRef.current = value;
-  }, [value]);
+    onDraftChange?.(value);
+  }, [value, onDraftChange]);
 
   // Exit history mode when user starts typing
   useEffect(() => {
@@ -1639,6 +1673,7 @@ export function Input({
                   currentModelProvider?.startsWith("lc-") ||
                   currentModelProvider === OPENAI_CODEX_PROVIDER_NAME
                 }
+                hasTemporaryModelOverride={hasTemporaryModelOverride}
                 hideFooter={hideFooter}
                 rightColumnWidth={footerRightColumnWidth}
                 statusLineText={statusLineText}
@@ -1684,6 +1719,7 @@ export function Input({
     currentModel,
     currentReasoningEffort,
     currentModelProvider,
+    hasTemporaryModelOverride,
     hideFooter,
     footerRightColumnWidth,
     reserveInputSpace,

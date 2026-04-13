@@ -46,20 +46,23 @@ describe("QueueItemEnqueuedEvent wire shape", () => {
     const sources: Record<QueueItemSource, true> = {
       user: true,
       task_notification: true,
+      cron: true,
       subagent: true,
       system: true,
+      channel: true,
     } satisfies Record<QueueItemSource, true>;
-    expect(Object.keys(sources)).toHaveLength(4);
+    expect(Object.keys(sources)).toHaveLength(6);
   });
 
   test("kind covers all content types", () => {
     const kinds: Record<QueueItemKind, true> = {
       message: true,
       task_notification: true,
+      cron_prompt: true,
       approval_result: true,
       overlay_action: true,
     } satisfies Record<QueueItemKind, true>;
-    expect(Object.keys(kinds)).toHaveLength(4);
+    expect(Object.keys(kinds)).toHaveLength(5);
   });
 });
 

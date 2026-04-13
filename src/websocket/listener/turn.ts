@@ -6,10 +6,11 @@ import type {
 } from "@letta-ai/letta-client/resources/agents/messages";
 import type WebSocket from "ws";
 import type { ApprovalResult } from "../../agent/approval-execution";
-import { fetchRunErrorDetail } from "../../agent/approval-recovery";
+import { fetchRunErrorInfo } from "../../agent/approval-recovery";
 import { getResumeData } from "../../agent/check-approval";
 import { getClient } from "../../agent/client";
 import { setConversationId, setCurrentAgentId } from "../../agent/context";
+import { getMemoryFilesystemRoot } from "../../agent/memoryFilesystem";
 import {
   getStreamToolContextId,
   type sendMessageStream,
@@ -19,17 +20,36 @@ import {
   isEmptyResponseRetryable,
   rebuildInputWithFreshDenials,
 } from "../../agent/turn-recovery-policy";
-import { createBuffers } from "../../cli/helpers/accumulator";
+import { createBuffers, toLines } from "../../cli/helpers/accumulator";
 import { getRetryStatusMessage } from "../../cli/helpers/errorFormatter";
+import {
+  getReflectionSettings,
+  type ReflectionTrigger,
+} from "../../cli/helpers/memoryReminder";
+import { handleMemorySubagentCompletion } from "../../cli/helpers/memorySubagentCompletion";
+import {
+  appendTranscriptDeltaJsonl,
+  buildAutoReflectionPayload,
+  buildParentMemorySnapshot,
+  buildReflectionSubagentPrompt,
+  finalizeAutoReflectionPayload,
+} from "../../cli/helpers/reflectionTranscript";
 import { drainStreamWithResume } from "../../cli/helpers/stream";
+import { getSubagents } from "../../cli/helpers/subagentState";
 import {
   buildSharedReminderParts,
   prependReminderPartsToContent,
 } from "../../reminders/engine";
 import { buildListenReminderContext } from "../../reminders/listenContext";
 import { getPlanModeReminder } from "../../reminders/planModeReminder";
+import { syncReminderStateFromContextTracker } from "../../reminders/state";
+import { settingsManager } from "../../settings-manager";
+import { telemetry } from "../../telemetry";
+import { trackBoundaryError } from "../../telemetry/errorReporting";
+import { extractTelemetryInputText } from "../../telemetry/input";
+import { prepareToolExecutionContextForScope } from "../../tools/toolset";
 import type { StopReasonType, StreamDelta } from "../../types/protocol_v2";
-import { isDebugEnabled } from "../../utils/debug";
+import { debugLog, debugWarn, isDebugEnabled } from "../../utils/debug";
 import {
   EMPTY_RESPONSE_MAX_RETRIES,
   LLM_API_ERROR_MAX_RETRIES,
@@ -44,20 +64,24 @@ import {
   populateInterruptQueue,
 } from "./interrupts";
 import {
-  getConversationPermissionModeState,
-  setConversationPermissionModeState,
+  getOrCreateConversationPermissionModeStateRef,
+  persistPermissionModeMapForRuntime,
+  pruneConversationPermissionModeStateIfDefault,
 } from "./permissionMode";
 import {
   emitCanonicalMessageDelta,
   emitDeviceStatusIfOpen,
   emitInterruptedStatusDelta,
-  emitLoopErrorDelta,
   emitLoopStatusUpdate,
   emitRetryDelta,
   emitRuntimeStateUpdates,
-  emitStatusDelta,
   setLoopStatus,
 } from "./protocol-outbound";
+import {
+  emitLoopErrorNotice,
+  emitRecoverableRetryNotice,
+  emitRecoverableStatusNotice,
+} from "./recoverable-notices";
 import {
   isRetriablePostStopError,
   shouldAttemptPostStopApprovalRecovery,
@@ -74,8 +98,228 @@ import {
   sendApprovalContinuationWithRetry,
   sendMessageStreamWithRetry,
 } from "./send";
+import { injectQueuedSkillContent } from "./skill-injection";
 import { handleApprovalStop } from "./turn-approval";
-import type { ConversationRuntime, IncomingMessage } from "./types";
+import type {
+  ConversationRuntime,
+  InboundMessagePayload,
+  IncomingMessage,
+} from "./types";
+
+const AUTO_REFLECTION_DESCRIPTION = "Reflect on recent conversations";
+
+function trackListenerUserInput(
+  messages: InboundMessagePayload[],
+  modelId: string,
+): void {
+  for (const message of messages) {
+    if (!("role" in message) || message.role !== "user") {
+      continue;
+    }
+
+    const inputText = extractTelemetryInputText(message.content);
+    if (inputText.length === 0) {
+      continue;
+    }
+
+    telemetry.trackUserInput(inputText, "user", modelId);
+  }
+}
+
+export const __listenerTurnTestUtils = {
+  trackListenerUserInput,
+};
+
+function hasActiveReflectionSubagent(
+  agentId: string,
+  conversationId: string,
+): boolean {
+  return getSubagents().some((agent) => {
+    if (agent.type.toLowerCase() !== "reflection") {
+      return false;
+    }
+    if (agent.status !== "pending" && agent.status !== "running") {
+      return false;
+    }
+    if (!agent.parentAgentId) {
+      return false;
+    }
+    const parentConversationId = agent.parentConversationId ?? "default";
+    return (
+      agent.parentAgentId === agentId && parentConversationId === conversationId
+    );
+  });
+}
+
+function escapeTaskNotificationSummary(summary: string): string {
+  return summary
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function buildMaybeLaunchReflectionSubagent(params: {
+  runtime: ConversationRuntime;
+  socket: WebSocket;
+  agentId: string;
+  conversationId: string;
+  workingDirectory: string;
+}): (triggerSource: Exclude<ReflectionTrigger, "off">) => Promise<boolean> {
+  return async (triggerSource) => {
+    const { runtime, socket, agentId, conversationId, workingDirectory } =
+      params;
+
+    if (!agentId || !settingsManager.isMemfsEnabled(agentId)) {
+      return false;
+    }
+
+    if (hasActiveReflectionSubagent(agentId, conversationId)) {
+      debugLog(
+        "memory",
+        `Skipping auto reflection launch (${triggerSource}) because one is already active`,
+      );
+      return false;
+    }
+
+    try {
+      const autoPayload = await buildAutoReflectionPayload(
+        agentId,
+        conversationId,
+      );
+      if (!autoPayload) {
+        debugLog(
+          "memory",
+          `Skipping auto reflection launch (${triggerSource}) because transcript has no new content`,
+        );
+        return false;
+      }
+
+      const memoryDir = getMemoryFilesystemRoot(agentId);
+      const parentMemory = await buildParentMemorySnapshot(memoryDir);
+      const reflectionPrompt = buildReflectionSubagentPrompt({
+        transcriptPath: autoPayload.payloadPath,
+        memoryDir,
+        cwd: workingDirectory,
+        parentMemory,
+      });
+
+      const { spawnBackgroundSubagentTask } = await import(
+        "../../tools/impl/Task"
+      );
+      const { subagentId } = spawnBackgroundSubagentTask({
+        subagentType: "reflection",
+        prompt: reflectionPrompt,
+        description: AUTO_REFLECTION_DESCRIPTION,
+        silentCompletion: true,
+        parentScope: { agentId, conversationId },
+        onComplete: async ({ success, error }) => {
+          telemetry.trackReflectionEnd(triggerSource, success, {
+            subagentId,
+            conversationId,
+            error,
+          });
+          await finalizeAutoReflectionPayload(
+            agentId,
+            conversationId,
+            autoPayload.payloadPath,
+            autoPayload.endSnapshotLine,
+            success,
+          );
+
+          const completionMessage = await handleMemorySubagentCompletion(
+            {
+              agentId,
+              conversationId,
+              subagentType: "reflection",
+              success,
+              error,
+            },
+            {
+              recompileByConversation:
+                runtime.listener.systemPromptRecompileByConversation,
+              recompileQueuedByConversation:
+                runtime.listener.queuedSystemPromptRecompileByConversation,
+              logRecompileFailure: (message) => debugWarn("memory", message),
+            },
+          );
+          const notificationXml = `<task-notification><summary>${escapeTaskNotificationSummary(
+            completionMessage,
+          )}</summary></task-notification>`;
+          emitCanonicalMessageDelta(
+            socket,
+            runtime,
+            {
+              type: "message",
+              id: `user-msg-${crypto.randomUUID()}`,
+              date: new Date().toISOString(),
+              message_type: "user_message",
+              content: [{ type: "text", text: notificationXml }],
+            } as StreamDelta,
+            {
+              agent_id: agentId,
+              conversation_id: conversationId,
+            },
+          );
+        },
+      });
+      telemetry.trackReflectionStart(triggerSource, {
+        subagentId,
+        conversationId,
+        startMessageId: autoPayload.startMessageId,
+        endMessageId: autoPayload.endMessageId,
+      });
+
+      debugLog(
+        "memory",
+        `Auto-launched reflection subagent (${triggerSource})`,
+      );
+      return true;
+    } catch (error) {
+      debugWarn(
+        "memory",
+        `Failed to auto-launch reflection subagent (${triggerSource}): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return false;
+    }
+  };
+}
+
+function finalizeInterruptedTurn(
+  socket: WebSocket,
+  runtime: ConversationRuntime,
+  params: {
+    runId?: string | null;
+    agentId?: string | null;
+    conversationId: string;
+  },
+): void {
+  const scope = {
+    agent_id: params.agentId ?? null,
+    conversation_id: params.conversationId,
+  };
+  const alreadyProjected =
+    runtime.cancelRequested &&
+    !runtime.isProcessing &&
+    runtime.loopStatus === "WAITING_ON_INPUT" &&
+    runtime.activeRunId === null &&
+    runtime.activeAbortController === null;
+
+  runtime.lastStopReason = "cancelled";
+  runtime.isProcessing = false;
+
+  if (!alreadyProjected) {
+    emitInterruptedStatusDelta(socket, runtime, {
+      runId: params.runId,
+      agentId: params.agentId,
+      conversationId: params.conversationId,
+    });
+    clearActiveRunState(runtime);
+    setLoopStatus(runtime, "WAITING_ON_INPUT", scope);
+    emitRuntimeStateUpdates(runtime, scope);
+  }
+}
 
 export async function handleIncomingMessage(
   msg: IncomingMessage,
@@ -98,16 +342,14 @@ export async function handleIncomingMessage(
     conversationId,
   );
 
-  // Build a mutable permission mode state object for this turn, seeded from the
-  // persistent ListenerRuntime map. Tool implementations (EnterPlanMode, ExitPlanMode)
-  // mutate it in place; we sync the final value back to the map after the turn.
-  const turnPermissionModeState = {
-    ...getConversationPermissionModeState(
-      runtime.listener,
-      normalizedAgentId,
-      conversationId,
-    ),
-  };
+  // Get the canonical mutable permission mode state ref for this turn.
+  // Websocket mode changes and tool implementations (EnterPlanMode/ExitPlanMode)
+  // all mutate this same object in place.
+  const turnPermissionModeState = getOrCreateConversationPermissionModeStateRef(
+    runtime.listener,
+    normalizedAgentId,
+    conversationId,
+  );
 
   const msgRunIds: string[] = [];
   let postStopApprovalRecoveryRetries = 0;
@@ -122,7 +364,9 @@ export async function handleIncomingMessage(
 
   runtime.isProcessing = true;
   runtime.cancelRequested = false;
-  runtime.activeAbortController = new AbortController();
+  const turnAbortController = new AbortController();
+  runtime.activeAbortController = turnAbortController;
+  const turnAbortSignal = turnAbortController.signal;
   runtime.activeWorkingDirectory = turnWorkingDirectory;
   runtime.activeRunId = null;
   runtime.activeRunStartedAt = new Date().toISOString();
@@ -141,17 +385,23 @@ export async function handleIncomingMessage(
   });
 
   try {
+    telemetry.setCurrentAgentId(agentId ?? null);
+
     if (!agentId) {
       runtime.isProcessing = false;
+      clearActiveRunState(runtime);
       setLoopStatus(runtime, "WAITING_ON_INPUT", {
         conversation_id: conversationId,
       });
-      clearActiveRunState(runtime);
       emitRuntimeStateUpdates(runtime, {
         conversation_id: conversationId,
       });
       return;
     }
+
+    // Ensure memfs repo is cloned/pulled for this agent (lazy, once per session).
+    const { ensureMemfsSyncedForAgent } = await import("./memfs-sync");
+    await ensureMemfsSyncedForAgent(runtime.listener, agentId);
 
     // Set agent context for tools that need it (e.g., Skill tool)
     setCurrentAgentId(agentId);
@@ -169,6 +419,7 @@ export async function handleIncomingMessage(
 
     const { normalizeInboundMessages } = await import("./queue");
     const normalizedMessages = await normalizeInboundMessages(msg.messages);
+    trackListenerUserInput(normalizedMessages, "unknown");
     const messagesToSend: Array<MessageCreate | ApprovalCreate> = [];
     let turnToolContextId: string | null = null;
     let queuedInterruptedToolCallIds: string[] = [];
@@ -183,7 +434,11 @@ export async function handleIncomingMessage(
       queuedInterruptedToolCallIds = consumed.interruptedToolCallIds;
     }
 
-    messagesToSend.push(...normalizedMessages);
+    messagesToSend.push(
+      ...normalizedMessages.map((m) =>
+        "content" in m && !m.otid ? { ...m, otid: crypto.randomUUID() } : m,
+      ),
+    );
 
     const firstMessage = normalizedMessages[0];
     const isApprovalMessage =
@@ -193,20 +448,80 @@ export async function handleIncomingMessage(
       "approvals" in firstMessage;
 
     if (!isApprovalMessage) {
-      const { parts: reminderParts } = await buildSharedReminderParts(
-        buildListenReminderContext({
-          agentId: agentId || "",
-          state: runtime.listener.reminderState,
-          resolvePlanModeReminder: getPlanModeReminder,
-        }),
-      );
-
-      if (reminderParts.length > 0) {
-        for (const m of messagesToSend) {
-          if ("role" in m && m.role === "user" && "content" in m) {
-            m.content = prependReminderPartsToContent(m.content, reminderParts);
-            break;
+      try {
+        syncReminderStateFromContextTracker(
+          runtime.reminderState,
+          runtime.contextTracker,
+        );
+        let listenAgentMetadata: {
+          name: string | null;
+          description: string | null;
+          lastRunAt: string | null;
+        } | null = null;
+        if (!runtime.reminderState.hasSentAgentInfo && agentId) {
+          try {
+            const client = await getClient();
+            const agent = await client.agents.retrieve(agentId);
+            listenAgentMetadata = {
+              name: agent.name ?? null,
+              description: agent.description ?? null,
+              lastRunAt:
+                (agent as { last_run_completion?: string | null })
+                  .last_run_completion ?? null,
+            };
+          } catch {
+            // Best-effort only. If the fetch fails, reminder building will
+            // fall back to the existing null/placeholder behavior.
           }
+        }
+        const reflectionSettings = getReflectionSettings(
+          agentId || undefined,
+          turnWorkingDirectory,
+        );
+        const { parts: reminderParts } = await buildSharedReminderParts(
+          buildListenReminderContext({
+            agentId: agentId || "",
+            conversationId,
+            agentName: listenAgentMetadata?.name ?? null,
+            agentDescription: listenAgentMetadata?.description ?? null,
+            agentLastRunAt: listenAgentMetadata?.lastRunAt ?? null,
+            state: runtime.reminderState,
+            reflectionSettings,
+            maybeLaunchReflectionSubagent: agentId
+              ? buildMaybeLaunchReflectionSubagent({
+                  runtime,
+                  socket,
+                  agentId,
+                  conversationId,
+                  workingDirectory: turnWorkingDirectory,
+                })
+              : undefined,
+            resolvePlanModeReminder: getPlanModeReminder,
+            workingDirectory: turnWorkingDirectory,
+          }),
+        );
+
+        if (reminderParts.length > 0) {
+          for (const m of messagesToSend) {
+            if ("role" in m && m.role === "user" && "content" in m) {
+              m.content = prependReminderPartsToContent(
+                m.content,
+                reminderParts,
+              );
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        // Reminder injection is best-effort — failures must not prevent
+        // the user message from being sent to the agent.
+        trackBoundaryError({
+          errorType: "listener_reminder_build_failed",
+          error: err,
+          context: "listener_turn_reminders",
+        });
+        if (isDebugEnabled()) {
+          console.error("[Listen] Failed to build reminder parts:", err);
         }
       }
     }
@@ -215,12 +530,23 @@ export async function handleIncomingMessage(
     let pendingNormalizationInterruptedToolCallIds = [
       ...queuedInterruptedToolCallIds,
     ];
+    const preparedToolContext = await prepareToolExecutionContextForScope({
+      agentId,
+      conversationId,
+      workingDirectory: turnWorkingDirectory,
+      permissionModeState: turnPermissionModeState,
+    });
+    runtime.currentToolset = preparedToolContext.toolset;
+    runtime.currentToolsetPreference = preparedToolContext.toolsetPreference;
+    runtime.currentLoadedTools =
+      preparedToolContext.preparedToolContext.loadedToolNames;
     const buildSendOptions = (): Parameters<typeof sendMessageStream>[2] => ({
       agentId,
       streamTokens: true,
       background: true,
       workingDirectory: turnWorkingDirectory,
       permissionModeState: turnPermissionModeState,
+      preparedToolContext: preparedToolContext.preparedToolContext,
       ...(pendingNormalizationInterruptedToolCallIds.length > 0
         ? {
             approvalNormalization: {
@@ -232,24 +558,26 @@ export async function handleIncomingMessage(
     });
 
     const isPureApprovalContinuation = isApprovalOnlyInput(currentInput);
+    const currentInputWithSkillContent = injectQueuedSkillContent(currentInput);
 
     let stream = isPureApprovalContinuation
       ? await sendApprovalContinuationWithRetry(
           conversationId,
-          currentInput,
+          currentInputWithSkillContent,
           buildSendOptions(),
           socket,
           runtime,
-          runtime.activeAbortController.signal,
+          turnAbortSignal,
         )
       : await sendMessageStreamWithRetry(
           conversationId,
-          currentInput,
+          currentInputWithSkillContent,
           buildSendOptions(),
           socket,
           runtime,
-          runtime.activeAbortController.signal,
+          turnAbortSignal,
         );
+    currentInput = currentInputWithSkillContent;
     if (!stream) {
       return;
     }
@@ -275,9 +603,12 @@ export async function handleIncomingMessage(
         stream as Stream<LettaStreamingResponse>,
         buffers,
         () => {},
-        runtime.activeAbortController.signal,
+        turnAbortSignal,
         undefined,
         ({ chunk, shouldOutput, errorInfo }) => {
+          if (runtime.cancelRequested) {
+            return undefined;
+          }
           const maybeRunId = (chunk as { run_id?: unknown }).run_id;
           if (typeof maybeRunId === "string") {
             runId = maybeRunId;
@@ -296,13 +627,16 @@ export async function handleIncomingMessage(
 
           if (errorInfo) {
             latestErrorText = errorInfo.message || latestErrorText;
-            emitLoopErrorDelta(socket, runtime, {
+            emitLoopErrorNotice(socket, runtime, {
               message: errorInfo.message || "Stream error",
               stopReason: (errorInfo.error_type as StopReasonType) || "error",
               isTerminal: false,
               runId: runId || errorInfo.run_id,
               agentId,
               conversationId,
+              errorInfo,
+              cancelRequested: runtime.cancelRequested,
+              abortSignal: turnAbortSignal,
             });
           }
 
@@ -328,20 +662,49 @@ export async function handleIncomingMessage(
 
           return undefined;
         },
+        runtime.contextTracker,
       );
 
       const stopReason = result.stopReason;
       const approvals = result.approvals || [];
       lastApprovalContinuationAccepted = false;
 
+      if (stopReason === "end_turn" && runtime.cancelRequested) {
+        finalizeInterruptedTurn(socket, runtime, {
+          runId: runId || runtime.activeRunId,
+          agentId: agentId ?? null,
+          conversationId,
+        });
+        break;
+      }
+
       if (stopReason === "end_turn") {
+        try {
+          const transcriptLines = toLines(buffers);
+          if (transcriptLines.length > 0) {
+            await appendTranscriptDeltaJsonl(
+              agentId || "",
+              conversationId,
+              transcriptLines,
+            );
+          }
+        } catch (transcriptError) {
+          debugWarn(
+            "memory",
+            `Failed to append transcript delta: ${
+              transcriptError instanceof Error
+                ? transcriptError.message
+                : String(transcriptError)
+            }`,
+          );
+        }
         runtime.lastStopReason = "end_turn";
         runtime.isProcessing = false;
+        clearActiveRunState(runtime);
         setLoopStatus(runtime, "WAITING_ON_INPUT", {
           agent_id: agentId,
           conversation_id: conversationId,
         });
-        clearActiveRunState(runtime);
         emitRuntimeStateUpdates(runtime, {
           agent_id: agentId,
           conversation_id: conversationId,
@@ -351,31 +714,24 @@ export async function handleIncomingMessage(
       }
 
       if (stopReason === "cancelled") {
-        runtime.lastStopReason = "cancelled";
-        runtime.isProcessing = false;
-        emitInterruptedStatusDelta(socket, runtime, {
+        finalizeInterruptedTurn(socket, runtime, {
           runId: runId || runtime.activeRunId,
-          agentId,
+          agentId: agentId ?? null,
           conversationId,
         });
-        setLoopStatus(runtime, "WAITING_ON_INPUT", {
-          agent_id: agentId,
-          conversation_id: conversationId,
-        });
-        clearActiveRunState(runtime);
-        emitRuntimeStateUpdates(runtime, {
-          agent_id: agentId,
-          conversation_id: conversationId,
-        });
-
         break;
       }
 
       if (stopReason !== "requires_approval") {
         const lastRunId = runId || msgRunIds[msgRunIds.length - 1] || null;
+        const runErrorInfo = lastRunId
+          ? await fetchRunErrorInfo(lastRunId)
+          : null;
         const errorDetail =
           latestErrorText ||
-          (lastRunId ? await fetchRunErrorDetail(lastRunId) : null);
+          runErrorInfo?.detail ||
+          runErrorInfo?.message ||
+          null;
 
         if (
           shouldAttemptPostStopApprovalRecovery({
@@ -387,7 +743,8 @@ export async function handleIncomingMessage(
           })
         ) {
           postStopApprovalRecoveryRetries += 1;
-          emitStatusDelta(socket, runtime, {
+          emitRecoverableStatusNotice(socket, runtime, {
+            kind: "stale_approval_conflict_recovery",
             message:
               "Recovering from stale approval conflict after interrupted/reconnected turn",
             level: "warning",
@@ -417,27 +774,28 @@ export async function handleIncomingMessage(
             agent_id: agentId,
             conversation_id: conversationId,
           });
-          stream =
-            currentInput.length === 1 &&
-            currentInput[0] !== undefined &&
-            "type" in currentInput[0] &&
-            currentInput[0].type === "approval"
-              ? await sendApprovalContinuationWithRetry(
-                  conversationId,
-                  currentInput,
-                  buildSendOptions(),
-                  socket,
-                  runtime,
-                  runtime.activeAbortController.signal,
-                )
-              : await sendMessageStreamWithRetry(
-                  conversationId,
-                  currentInput,
-                  buildSendOptions(),
-                  socket,
-                  runtime,
-                  runtime.activeAbortController.signal,
-                );
+          const isPureApprovalContinuationRetry =
+            isApprovalOnlyInput(currentInput);
+          const retryInputWithSkillContent =
+            injectQueuedSkillContent(currentInput);
+          stream = isPureApprovalContinuationRetry
+            ? await sendApprovalContinuationWithRetry(
+                conversationId,
+                retryInputWithSkillContent,
+                buildSendOptions(),
+                socket,
+                runtime,
+                turnAbortSignal,
+              )
+            : await sendMessageStreamWithRetry(
+                conversationId,
+                retryInputWithSkillContent,
+                buildSendOptions(),
+                socket,
+                runtime,
+                turnAbortSignal,
+              );
+          currentInput = retryInputWithSkillContent;
           if (!stream) {
             return;
           }
@@ -492,7 +850,7 @@ export async function handleIncomingMessage(
           });
 
           await new Promise((resolve) => setTimeout(resolve, delayMs));
-          if (runtime.activeAbortController.signal.aborted) {
+          if (turnAbortSignal.aborted) {
             throw new Error("Cancelled by user");
           }
 
@@ -500,27 +858,28 @@ export async function handleIncomingMessage(
             agent_id: agentId,
             conversation_id: conversationId,
           });
-          stream =
-            currentInput.length === 1 &&
-            currentInput[0] !== undefined &&
-            "type" in currentInput[0] &&
-            currentInput[0].type === "approval"
-              ? await sendApprovalContinuationWithRetry(
-                  conversationId,
-                  currentInput,
-                  buildSendOptions(),
-                  socket,
-                  runtime,
-                  runtime.activeAbortController.signal,
-                )
-              : await sendMessageStreamWithRetry(
-                  conversationId,
-                  currentInput,
-                  buildSendOptions(),
-                  socket,
-                  runtime,
-                  runtime.activeAbortController.signal,
-                );
+          const isPureApprovalContinuationRetry =
+            isApprovalOnlyInput(currentInput);
+          const retryInputWithSkillContent =
+            injectQueuedSkillContent(currentInput);
+          stream = isPureApprovalContinuationRetry
+            ? await sendApprovalContinuationWithRetry(
+                conversationId,
+                retryInputWithSkillContent,
+                buildSendOptions(),
+                socket,
+                runtime,
+                turnAbortSignal,
+              )
+            : await sendMessageStreamWithRetry(
+                conversationId,
+                retryInputWithSkillContent,
+                buildSendOptions(),
+                socket,
+                runtime,
+                turnAbortSignal,
+              );
+          currentInput = retryInputWithSkillContent;
           if (!stream) {
             return;
           }
@@ -539,6 +898,7 @@ export async function handleIncomingMessage(
         const retriable = await isRetriablePostStopError(
           (stopReason as StopReasonType) || "error",
           lastRunId,
+          errorDetail,
         );
         if (retriable && llmApiErrorRetries < LLM_API_ERROR_MAX_RETRIES) {
           llmApiErrorRetries += 1;
@@ -551,7 +911,8 @@ export async function handleIncomingMessage(
           const retryMessage =
             getRetryStatusMessage(errorDetail) ||
             `LLM API error encountered, retrying (attempt ${attempt}/${LLM_API_ERROR_MAX_RETRIES})...`;
-          emitRetryDelta(socket, runtime, {
+          emitRecoverableRetryNotice(socket, runtime, {
+            kind: "transient_provider_retry",
             message: retryMessage,
             reason: "llm_api_error",
             attempt,
@@ -563,7 +924,7 @@ export async function handleIncomingMessage(
           });
 
           await new Promise((resolve) => setTimeout(resolve, delayMs));
-          if (runtime.activeAbortController.signal.aborted) {
+          if (turnAbortSignal.aborted) {
             throw new Error("Cancelled by user");
           }
 
@@ -571,27 +932,28 @@ export async function handleIncomingMessage(
             agent_id: agentId,
             conversation_id: conversationId,
           });
-          stream =
-            currentInput.length === 1 &&
-            currentInput[0] !== undefined &&
-            "type" in currentInput[0] &&
-            currentInput[0].type === "approval"
-              ? await sendApprovalContinuationWithRetry(
-                  conversationId,
-                  currentInput,
-                  buildSendOptions(),
-                  socket,
-                  runtime,
-                  runtime.activeAbortController.signal,
-                )
-              : await sendMessageStreamWithRetry(
-                  conversationId,
-                  currentInput,
-                  buildSendOptions(),
-                  socket,
-                  runtime,
-                  runtime.activeAbortController.signal,
-                );
+          const isPureApprovalContinuationRetry =
+            isApprovalOnlyInput(currentInput);
+          const retryInputWithSkillContent =
+            injectQueuedSkillContent(currentInput);
+          stream = isPureApprovalContinuationRetry
+            ? await sendApprovalContinuationWithRetry(
+                conversationId,
+                retryInputWithSkillContent,
+                buildSendOptions(),
+                socket,
+                runtime,
+                turnAbortSignal,
+              )
+            : await sendMessageStreamWithRetry(
+                conversationId,
+                retryInputWithSkillContent,
+                buildSendOptions(),
+                socket,
+                runtime,
+                turnAbortSignal,
+              );
+          currentInput = retryInputWithSkillContent;
           if (!stream) {
             return;
           }
@@ -612,33 +974,21 @@ export async function handleIncomingMessage(
           : (stopReason as StopReasonType) || "error";
 
         if (effectiveStopReason === "cancelled") {
-          runtime.lastStopReason = "cancelled";
-          runtime.isProcessing = false;
-          emitInterruptedStatusDelta(socket, runtime, {
+          finalizeInterruptedTurn(socket, runtime, {
             runId: runId || runtime.activeRunId,
-            agentId,
+            agentId: agentId ?? null,
             conversationId,
           });
-          setLoopStatus(runtime, "WAITING_ON_INPUT", {
-            agent_id: agentId,
-            conversation_id: conversationId,
-          });
-          clearActiveRunState(runtime);
-          emitRuntimeStateUpdates(runtime, {
-            agent_id: agentId,
-            conversation_id: conversationId,
-          });
-
           break;
         }
 
         runtime.lastStopReason = effectiveStopReason;
         runtime.isProcessing = false;
+        clearActiveRunState(runtime);
         setLoopStatus(runtime, "WAITING_ON_INPUT", {
           agent_id: agentId,
           conversation_id: conversationId,
         });
-        clearActiveRunState(runtime);
         emitRuntimeStateUpdates(runtime, {
           agent_id: agentId,
           conversation_id: conversationId,
@@ -647,13 +997,16 @@ export async function handleIncomingMessage(
         const errorMessage =
           errorDetail || `Unexpected stop reason: ${stopReason}`;
 
-        emitLoopErrorDelta(socket, runtime, {
+        emitLoopErrorNotice(socket, runtime, {
           message: errorMessage,
           stopReason: effectiveStopReason,
           isTerminal: true,
           runId: runId,
           agentId,
           conversationId,
+          runErrorInfo: runErrorInfo ?? undefined,
+          cancelRequested: runtime.cancelRequested,
+          abortSignal: turnAbortSignal,
         });
         break;
       }
@@ -694,6 +1047,12 @@ export async function handleIncomingMessage(
       );
     }
   } catch (error) {
+    trackBoundaryError({
+      errorType: "listener_turn_processing_failed",
+      error,
+      context: "listener_turn_processing",
+      runId: runtime.activeRunId || msgRunIds[msgRunIds.length - 1],
+    });
     if (runtime.cancelRequested) {
       if (!lastApprovalContinuationAccepted) {
         populateInterruptQueue(runtime, {
@@ -724,21 +1083,10 @@ export async function handleIncomingMessage(
         }
       }
 
-      runtime.lastStopReason = "cancelled";
-      runtime.isProcessing = false;
-      emitInterruptedStatusDelta(socket, runtime, {
+      finalizeInterruptedTurn(socket, runtime, {
         runId: runtime.activeRunId || msgRunIds[msgRunIds.length - 1],
         agentId: agentId || null,
         conversationId,
-      });
-      setLoopStatus(runtime, "WAITING_ON_INPUT", {
-        agent_id: agentId || null,
-        conversation_id: conversationId,
-      });
-      clearActiveRunState(runtime);
-      emitRuntimeStateUpdates(runtime, {
-        agent_id: agentId || null,
-        conversation_id: conversationId,
       });
 
       return;
@@ -746,44 +1094,42 @@ export async function handleIncomingMessage(
 
     runtime.lastStopReason = "error";
     runtime.isProcessing = false;
+    clearActiveRunState(runtime);
     setLoopStatus(runtime, "WAITING_ON_INPUT", {
       agent_id: agentId || null,
       conversation_id: conversationId,
     });
-    clearActiveRunState(runtime);
     emitRuntimeStateUpdates(runtime, {
       agent_id: agentId || null,
       conversation_id: conversationId,
     });
 
     const errorMessage = error instanceof Error ? error.message : String(error);
-    emitLoopErrorDelta(socket, runtime, {
+    emitLoopErrorNotice(socket, runtime, {
       message: errorMessage,
       stopReason: "error",
       isTerminal: true,
       agentId: agentId || undefined,
       conversationId,
+      error,
+      cancelRequested: runtime.cancelRequested,
+      abortSignal: turnAbortSignal,
     });
     if (isDebugEnabled()) {
       console.error("[Listen] Error handling message:", error);
     }
   } finally {
-    // Sync any permission mode changes made by tools (EnterPlanMode/ExitPlanMode)
-    // back to the persistent ListenerRuntime map so the state survives eviction.
-    setConversationPermissionModeState(
+    // Prune lean defaults only at turn-finalization boundaries (never during
+    // mid-turn mode changes), then persist the canonical map.
+    pruneConversationPermissionModeStateIfDefault(
       runtime.listener,
       normalizedAgentId,
       conversationId,
-      turnPermissionModeState,
     );
+    persistPermissionModeMapForRuntime(runtime.listener);
 
-    // Emit a corrected device status now that the permission mode is synced.
-    // The emitRuntimeStateUpdates() calls earlier in the turn read from the map
-    // before setConversationPermissionModeState() ran, so they emitted a stale
-    // current_permission_mode. This final emission sends the correct value,
-    // ensuring the web UI (and desktop) always reflect mode changes from
-    // EnterPlanMode/ExitPlanMode and that mid-turn web permission changes
-    // are not reverted by a stale emission at turn end.
+    // Emit device status after persistence/pruning so UI reflects the final
+    // canonical state for this scope.
     emitDeviceStatusIfOpen(runtime, {
       agent_id: agentId || null,
       conversation_id: conversationId,

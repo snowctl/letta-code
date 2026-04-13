@@ -1,5 +1,8 @@
 import type { Letta } from "@letta-ai/letta-client";
-import type { Message } from "@letta-ai/letta-client/resources/agents/messages";
+import type {
+  Message,
+  MessageType,
+} from "@letta-ai/letta-client/resources/agents/messages";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import { Box, useInput } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -46,6 +49,11 @@ interface EnrichedConversation {
 const DISPLAY_PAGE_SIZE = 3;
 const FETCH_PAGE_SIZE = 20;
 const ENRICH_MESSAGE_LIMIT = 20; // Same as original fetch limit
+
+const RESUME_PREVIEW_MESSAGE_TYPES: MessageType[] = [
+  "user_message",
+  "assistant_message",
+];
 
 /**
  * Format a relative time string from a date
@@ -232,7 +240,10 @@ export function ConversationSelector({
         const messages = await client.conversations.messages.list(convId, {
           limit: ENRICH_MESSAGE_LIMIT,
           order: "desc",
-        });
+          include_return_message_types: RESUME_PREVIEW_MESSAGE_TYPES,
+        } as unknown as Parameters<
+          typeof client.conversations.messages.list
+        >[1]);
         const chronological = [...messages.getPaginatedItems()].reverse();
         const stats = getMessageStats(chronological);
         setConversations((prev) =>
@@ -296,7 +307,10 @@ export function ConversationSelector({
                   conversation_id: "default",
                   limit: ENRICH_MESSAGE_LIMIT,
                   order: "desc",
-                })
+                  include_return_message_types: RESUME_PREVIEW_MESSAGE_TYPES,
+                } as unknown as Parameters<
+                  typeof client.agents.messages.list
+                >[1])
                 .then((msgs) => {
                   const items = msgs.getPaginatedItems();
                   if (items.length === 0) return null;

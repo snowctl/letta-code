@@ -298,6 +298,11 @@ export async function applyMemfsFlags(
       if (!promptUpdate.success) {
         throw new Error(promptUpdate.message);
       }
+      // Force recompile of the system message so the updated template
+      // (with/without memfs addon) is reflected in the compiled prompt.
+      const { getClient } = await import("./client");
+      const client = await getClient();
+      await client.agents.recompile(agentId, { update_timestamp: false });
     }
     settingsManager.setMemfsEnabled(agentId, targetEnabled);
   }
@@ -354,6 +359,14 @@ export async function applyMemfsFlags(
       const result = await pullMemory(agentId);
       pullSummary = result.summary;
     }
+
+    // Fetch secrets from the server so they're available for $SECRET_NAME substitution.
+    const { initSecretsFromServer } = await import("../utils/secretsStore");
+    try {
+      await initSecretsFromServer(agentId);
+    } catch {
+      // Non-fatal: secrets substitution won't work but agent can still run.
+    }
   }
 
   const action =
@@ -375,8 +388,11 @@ export async function applyMemfsFlags(
 export async function isLettaCloud(): Promise<boolean> {
   const { getServerUrl } = await import("./client");
   const serverUrl = getServerUrl();
+
   return (
-    serverUrl.includes("api.letta.com") || process.env.LETTA_MEMFS_LOCAL === "1"
+    serverUrl.includes("api.letta.com") ||
+    process.env.LETTA_MEMFS_LOCAL === "1" ||
+    process.env.LETTA_API_KEY === "local-desktop"
   );
 }
 

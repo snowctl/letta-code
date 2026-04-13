@@ -12,6 +12,7 @@ import { createInterface } from "node:readline";
 import { buildChatUrl } from "../../cli/helpers/appUrls";
 import {
   addToolCall,
+  emitStreamEvent,
   updateSubagent,
 } from "../../cli/helpers/subagentState.js";
 import {
@@ -20,6 +21,7 @@ import {
   SYSTEM_REMINDER_OPEN,
 } from "../../constants";
 import { cliPermissions } from "../../permissions/cli";
+import { resolveAllowedMemoryRoots } from "../../permissions/memoryScope";
 import { permissionMode } from "../../permissions/mode";
 import { sessionPermissions } from "../../permissions/session";
 import { settingsManager } from "../../settings-manager";
@@ -273,7 +275,9 @@ function handleInitEvent(
 ): void {
   if (event.agent_id) {
     state.agentId = event.agent_id;
-    const agentURL = buildChatUrl(event.agent_id);
+    const agentURL = buildChatUrl(event.agent_id, {
+      conversationId: event.conversation_id,
+    });
     updateSubagent(subagentId, { agentURL });
   }
   if (event.conversation_id) {
@@ -400,6 +404,10 @@ function processStreamEvent(
       case "message":
         if (event.message_type === "approval_request_message") {
           handleApprovalRequestEvent(event, state);
+        } else {
+          // Forward non-approval message events for WS streaming to the web UI.
+          // Approval requests are internal to the subagent's permission flow.
+          emitStreamEvent(subagentId, event);
         }
         break;
 
@@ -468,6 +476,13 @@ interface ResolveSubagentLauncherOptions {
 interface SubagentLauncher {
   command: string;
   args: string[];
+}
+
+export function resolveSubagentWorkingDirectory(
+  env: NodeJS.ProcessEnv = process.env,
+  fallbackCwd: string = process.cwd(),
+): string {
+  return env.USER_CWD || fallbackCwd;
 }
 
 export function resolveSubagentLauncher(
@@ -687,18 +702,37 @@ async function executeSubagent(
       process.env.LETTA_API_KEY || settings.env?.LETTA_API_KEY;
     const inheritedBaseUrl =
       process.env.LETTA_BASE_URL || settings.env?.LETTA_BASE_URL;
+    const subagentWorkingDirectory = resolveSubagentWorkingDirectory();
+    const inheritedMemoryRoots = resolveAllowedMemoryRoots();
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(inheritedApiKey && { LETTA_API_KEY: inheritedApiKey }),
+      ...(inheritedBaseUrl && { LETTA_BASE_URL: inheritedBaseUrl }),
+      LETTA_CODE_AGENT_ROLE: "subagent",
+      ...(parentAgentId && { LETTA_PARENT_AGENT_ID: parentAgentId }),
+    };
+
+    if (config.permissionMode === "memory") {
+      if (inheritedMemoryRoots.primaryRoot) {
+        childEnv.MEMORY_DIR = inheritedMemoryRoots.primaryRoot;
+        childEnv.LETTA_MEMORY_DIR = inheritedMemoryRoots.primaryRoot;
+      } else {
+        delete childEnv.MEMORY_DIR;
+        delete childEnv.LETTA_MEMORY_DIR;
+      }
+
+      const parentMemoryDir =
+        process.env.MEMORY_DIR || process.env.LETTA_MEMORY_DIR;
+      if (parentMemoryDir && parentMemoryDir.trim().length > 0) {
+        childEnv.PARENT_MEMORY_DIR = parentMemoryDir;
+      } else {
+        delete childEnv.PARENT_MEMORY_DIR;
+      }
+    }
 
     const proc = spawn(launcher.command, launcher.args, {
-      cwd: process.cwd(),
-      env: {
-        ...process.env,
-        ...(inheritedApiKey && { LETTA_API_KEY: inheritedApiKey }),
-        ...(inheritedBaseUrl && { LETTA_BASE_URL: inheritedBaseUrl }),
-        // Tag Task-spawned agents for easy filtering.
-        LETTA_CODE_AGENT_ROLE: "subagent",
-        // Pass parent agent ID for subagents that need to access parent's context
-        ...(parentAgentId && { LETTA_PARENT_AGENT_ID: parentAgentId }),
-      },
+      cwd: subagentWorkingDirectory,
+      env: childEnv,
     });
 
     // Consider execution "running" once the child process has successfully spawned.
@@ -894,6 +928,16 @@ ${SYSTEM_REMINDER_CLOSE}
 `;
 }
 
+function buildForkSystemReminder(): string {
+  return `${SYSTEM_REMINDER_OPEN}
+You have been forked from the primary conversational thread to run as an independent subagent.
+You CANNOT ask questions mid-execution - all instructions are provided upfront.
+Your final message will be returned to the caller.
+${SYSTEM_REMINDER_CLOSE}
+
+`;
+}
+
 /**
  * Spawn a subagent and execute it autonomously
  *
@@ -914,6 +958,7 @@ export async function spawnSubagent(
   existingAgentId?: string,
   existingConversationId?: string,
   maxTurns?: number,
+  forkedContext?: boolean,
 ): Promise<SubagentResult> {
   const allConfigs = await getAllSubagentConfigs();
   const config = allConfigs[type];
@@ -952,12 +997,17 @@ export async function spawnSubagent(
       const parentAgentId = getCurrentAgentId();
       const client = await getClient();
       const parentAgent = await client.agents.retrieve(parentAgentId);
-      const systemReminder = buildDeploySystemReminder(
-        parentAgent.name,
-        parentAgentId,
-        type,
-      );
-      finalPrompt = systemReminder + prompt;
+      if (forkedContext) {
+        const systemReminder = buildForkSystemReminder();
+        finalPrompt = systemReminder + prompt;
+      } else {
+        const systemReminder = buildDeploySystemReminder(
+          parentAgent.name,
+          parentAgentId,
+          type,
+        );
+        finalPrompt = systemReminder + prompt;
+      }
     } catch {
       // If we can't get parent agent info, proceed without the reminder
     }

@@ -44,9 +44,10 @@ import {
 } from "./cli/startupFlagValidation";
 import { runSubcommand } from "./cli/subcommands/router";
 import { permissionMode } from "./permissions/mode";
-import { settingsManager } from "./settings-manager";
+import { settingsManager, shouldPersistSessionState } from "./settings-manager";
 import { startStartupAutoUpdateCheck } from "./startup-auto-update";
 import { telemetry } from "./telemetry";
+import { trackBoundaryError } from "./telemetry/errorReporting";
 import { loadTools } from "./tools/manager";
 import { clearPersistedClientToolRules } from "./tools/toolset";
 import { debugLog, debugWarn, isDebugEnabled } from "./utils/debug";
@@ -57,6 +58,19 @@ import { markMilestone } from "./utils/timing";
 // anti-pattern of creating new [] on every render which triggers useEffect re-runs
 const EMPTY_APPROVAL_ARRAY: ApprovalRequest[] = [];
 const EMPTY_MESSAGE_ARRAY: Message[] = [];
+
+function trackCliBoundaryError(
+  errorType: string,
+  error: unknown,
+  context: string,
+): void {
+  trackBoundaryError({
+    errorType,
+    error,
+    context,
+  });
+}
+
 void ensureFileIndex();
 
 function printHelp() {
@@ -97,6 +111,7 @@ SUBCOMMANDS (JSON-only)
   letta agents list [--query <text> | --name <name> | --tags <tags>]
   letta messages search --query <text> [--all-agents]
   letta messages list [--agent <id>]
+  letta messages transcript --conversation <id> [--out <path>]
   letta blocks list --agent <id>
   letta blocks copy --block-id <id> [--label <label>] [--agent <id>] [--override]
   letta blocks attach --block-id <id> [--agent <id>] [--read-only] [--override]
@@ -340,19 +355,28 @@ async function getPinnedAgentNames(): Promise<{ id: string; name: string }[]> {
 async function main(): Promise<void> {
   markMilestone("CLI_START");
 
-  // Initialize terminal theme detection (OSC 11 query with fallback)
-  const { initTerminalTheme } = await import("./cli/helpers/terminalTheme");
-  await initTerminalTheme();
-
-  // Initialize settings manager (loads settings once into memory)
-  await settingsManager.initialize();
-  const settings = await settingsManager.getSettingsWithSecureTokens();
-  markMilestone("SETTINGS_LOADED");
-
-  // Handle CLI subcommands (e.g., `letta memfs ...`) before parsing global flags
+  // Early exit for CLI subcommands (e.g., `letta server`, `letta memfs`).
+  // Subcommands handle their own setup and don't need TUI init, theme
+  // detection, or base tool bootstrapping.
   const subcommandResult = await runSubcommand(process.argv.slice(2));
   if (subcommandResult !== null) {
     process.exit(subcommandResult);
+  }
+
+  // Everything below only runs for interactive TUI mode
+  await settingsManager.initialize();
+  const { initTerminalTheme } = await import("./cli/helpers/terminalTheme");
+  await initTerminalTheme();
+
+  const settings = await settingsManager.getSettingsWithSecureTokens();
+  markMilestone("SETTINGS_LOADED");
+
+  // Bootstrap base tools for subcommands that have LETTA_API_KEY set (e.g., remote via code-desktop)
+  if (process.env.LETTA_API_KEY) {
+    const { bootstrapBaseToolsIfNeeded } = await import(
+      "./agent/bootstrap-tools"
+    );
+    await bootstrapBaseToolsIfNeeded();
   }
 
   // Initialize LSP infrastructure for type checking
@@ -361,30 +385,14 @@ async function main(): Promise<void> {
       const { lspManager } = await import("./lsp/manager.js");
       await lspManager.initialize(process.cwd());
     } catch (error) {
+      trackCliBoundaryError("lsp_init_failed", error, "tui_startup_lsp_init");
       console.error("[LSP] Failed to initialize:", error);
     }
   }
 
-  // Initialize telemetry (enabled by default, opt-out via LETTA_CODE_TELEM=0)
-  telemetry.init();
-
   // Check for updates on startup (non-blocking)
   const { checkAndAutoUpdate } = await import("./updater/auto-update");
   const autoUpdatePromise = startStartupAutoUpdateCheck(checkAndAutoUpdate);
-
-  // Check Docker version for self-hosted users (non-blocking)
-  const { startDockerVersionCheck } = await import("./startup-docker-check");
-  startDockerVersionCheck().catch(() => {});
-
-  // Clean up old overflow files (non-blocking, 24h retention)
-  const { cleanupOldOverflowFiles } = await import("./tools/impl/overflow");
-  Promise.resolve().then(() => {
-    try {
-      cleanupOldOverflowFiles(process.cwd());
-    } catch {
-      // Silently ignore cleanup failures
-    }
-  });
 
   // Parse command-line arguments from a shared schema used by both TUI and headless flows.
   // Preprocess args to support --conv as an alias for --conversation.
@@ -397,6 +405,11 @@ async function main(): Promise<void> {
     values = parsed.values;
     positionals = parsed.positionals;
   } catch (error) {
+    trackCliBoundaryError(
+      "cli_args_parse_failed",
+      error,
+      "tui_startup_parse_args",
+    );
     const errorMsg = error instanceof Error ? error.message : String(error);
     // Improve error message for common mistakes
     if (errorMsg.includes("Unknown option")) {
@@ -470,6 +483,11 @@ async function main(): Promise<void> {
     specifiedConversationId = normalized.specifiedConversationId ?? null;
     specifiedAgentId = normalized.specifiedAgentId ?? null;
   } catch (error) {
+    trackCliBoundaryError(
+      "conversation_shorthand_normalization_failed",
+      error,
+      "tui_startup_conversation_shorthand",
+    );
     console.error(
       error instanceof Error ? `Error: ${error.message}` : String(error),
     );
@@ -484,6 +502,11 @@ async function main(): Promise<void> {
       forceNew,
     });
   } catch (error) {
+    trackCliBoundaryError(
+      "conversation_flag_validation_failed",
+      error,
+      "tui_startup_conversation_flag_validation",
+    );
     console.error(
       error instanceof Error ? `Error: ${error.message}` : String(error),
     );
@@ -530,6 +553,26 @@ async function main(): Promise<void> {
     fromAfFlagValue: values["from-af"],
   });
   const isHeadless = values.prompt || values.run || !process.stdin.isTTY;
+
+  // Initialize telemetry (enabled by default, opt-out via LETTA_CODE_TELEM=0)
+  // Surface is set here so session_start captures the correct mode.
+  telemetry.setSurface(isHeadless ? "headless" : "tui");
+  telemetry.init();
+
+  if (!isHeadless) {
+    // TUI-only startup tasks: keep headless runs free of extra background work.
+    const { startDockerVersionCheck } = await import("./startup-docker-check");
+    startDockerVersionCheck().catch(() => {});
+
+    const { cleanupOldOverflowFiles } = await import("./tools/impl/overflow");
+    Promise.resolve().then(() => {
+      try {
+        cleanupOldOverflowFiles(process.cwd());
+      } catch {
+        // Silently ignore cleanup failures
+      }
+    });
+  }
 
   // Fail if an unknown command/argument is passed (and we're not in headless mode where it might be a prompt)
   if (command && !isHeadless) {
@@ -591,6 +634,11 @@ async function main(): Promise<void> {
         allowSubagentNames,
       });
     } catch (err) {
+      trackCliBoundaryError(
+        "system_prompt_preset_validation_failed",
+        err,
+        "tui_startup_system_prompt_preset",
+      );
       console.error(
         `Error: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -764,6 +812,7 @@ async function main(): Promise<void> {
     // After setup, restart main flow
     return main().catch((err: unknown) => {
       // Handle top-level errors gracefully without raw stack traces
+      trackCliBoundaryError("setup_restart_failed", err, "tui_setup_restart");
       const message =
         err instanceof Error ? err.message : "An unexpected error occurred";
       console.error(`\nError: ${message}`);
@@ -796,6 +845,15 @@ async function main(): Promise<void> {
   const { validateCredentials } = await import("./auth/oauth");
   const isValid = await validateCredentials(baseURL, apiKey ?? "");
   markMilestone("CREDENTIALS_VALIDATED");
+
+  // Ensure base tools exist on the server (first-run-per-machine, non-blocking).
+  // Must run after credentials are validated so OAuth tokens are available.
+  if (isValid) {
+    const { bootstrapBaseToolsIfNeeded } = await import(
+      "./agent/bootstrap-tools"
+    );
+    await bootstrapBaseToolsIfNeeded();
+  }
 
   if (!isValid) {
     // For headless mode, error out with helpful message
@@ -883,6 +941,7 @@ async function main(): Promise<void> {
         "default",
         "acceptEdits",
         "plan",
+        "memory",
         "bypassPermissions",
       ] as const;
 
@@ -1271,6 +1330,22 @@ async function main(): Promise<void> {
 
         // Short-circuit: flags handled by init() skip resolution entirely
         if (forceNew || agentIdArg || fromAfFile) {
+          // For --agent/--name: restore conversation from local session if the
+          // agent matches, so we don't clobber a real conv ID with "default".
+          if (agentIdArg && !forceNew && !fromAfFile && !forceNewConversation) {
+            // loadLocalProjectSettings is cached if already loaded (e.g. --name)
+            await settingsManager.loadLocalProjectSettings(process.cwd());
+            const localSession = settingsManager.getLocalLastSession(
+              process.cwd(),
+            );
+            if (
+              localSession?.agentId === agentIdArg &&
+              localSession.conversationId &&
+              localSession.conversationId !== "default"
+            ) {
+              setSelectedConversationId(localSession.conversationId);
+            }
+          }
           setLoadingState("assembling");
           return;
         }
@@ -1473,6 +1548,7 @@ async function main(): Promise<void> {
         const { createAgent } = await import("./agent/create");
 
         let agent: AgentState | null = null;
+        let autoEnableMemfsForFreshAgent = false;
 
         // Priority 1: Import from AgentFile template (local file or registry)
         if (fromAfFile) {
@@ -1597,14 +1673,7 @@ async function main(): Promise<void> {
           });
           agent = result.agent;
           setAgentProvenance(result.provenance);
-
-          // Enable memfs on Letta Cloud (tags, repo clone, tool detach).
-          if (willAutoEnableMemfs) {
-            const { enableMemfsIfCloud } = await import(
-              "./agent/memoryFilesystem"
-            );
-            await enableMemfsIfCloud(agent.id);
-          }
+          autoEnableMemfsForFreshAgent = willAutoEnableMemfs;
         }
 
         // Priority 4: Try to resume from project settings LRU (.letta/settings.local.json)
@@ -1651,14 +1720,22 @@ async function main(): Promise<void> {
         setAgentContext(agent.id, skillsDirectory, resolvedSkillSources);
 
         // Start memfs sync early — awaited in parallel with getResumeData below
-        const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
         const agentId = agent.id;
         const agentTags = agent.tags ?? undefined;
+        const startupMemfsFlag = autoEnableMemfsForFreshAgent
+          ? true
+          : memfsFlag;
         const memfsSyncPromise = import("./agent/memoryFilesystem").then(
           ({ applyMemfsFlags }) =>
-            applyMemfsFlags(agentId, memfsFlag, noMemfsFlag, {
+            applyMemfsFlags(agentId, startupMemfsFlag, noMemfsFlag, {
               agentTags,
+              skipPromptUpdate: shouldCreateNew,
             }),
+        );
+
+        // Init secrets cache — runs in parallel with memfs sync below.
+        const secretsInitPromise = import("./utils/secretsStore").then(
+          ({ initSecretsFromServer }) => initSecretsFromServer(agentId),
         );
 
         // Check if we're resuming an existing agent
@@ -1866,6 +1943,18 @@ async function main(): Promise<void> {
           process.exit(1);
         }
 
+        // Ensure secrets cache is populated (non-fatal).
+        try {
+          await secretsInitPromise;
+        } catch (error) {
+          import("./utils/debug").then(({ debugLog }) =>
+            debugLog(
+              "secrets",
+              `Failed to init secrets: ${error instanceof Error ? error.message : String(error)}`,
+            ),
+          );
+        }
+
         // Auto-heal system prompt drift (rebuild from stored recipe).
         // Runs after memfs sync so isMemfsEnabled() reflects the final state.
         if (resuming && !systemPromptPreset) {
@@ -1903,15 +1992,8 @@ async function main(): Promise<void> {
 
         // Save the session (agent + conversation) to settings
         // Skip for subagents - they shouldn't pollute the LRU settings
-        if (!isSubagent) {
-          settingsManager.setLocalLastSession(
-            { agentId: agent.id, conversationId: conversationIdToUse },
-            process.cwd(),
-          );
-          settingsManager.setGlobalLastSession({
-            agentId: agent.id,
-            conversationId: conversationIdToUse,
-          });
+        if (shouldPersistSessionState()) {
+          settingsManager.persistSession(agent.id, conversationIdToUse);
         }
 
         setAgentId(agent.id);
@@ -1924,6 +2006,11 @@ async function main(): Promise<void> {
 
       init().catch((err) => {
         // Handle errors gracefully without showing raw stack traces
+        trackCliBoundaryError(
+          "tui_initialization_failed",
+          err,
+          "tui_app_initialization",
+        );
         const message = formatErrorDetails(err);
         console.error(`\nError during initialization: ${message}`);
         if (isDebugEnabled()) {

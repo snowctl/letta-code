@@ -31,6 +31,7 @@ import { handleListMessages } from "./agent/listMessagesHandler";
 import { ISOLATED_BLOCK_LABELS } from "./agent/memory";
 import { getStreamToolContextId, sendMessageStream } from "./agent/message";
 import {
+  getModelInfo,
   getModelPresetUpdateForAgent,
   getModelUpdateArgs,
   getResumeRefreshArgs,
@@ -59,9 +60,9 @@ import { createContextTracker } from "./cli/helpers/contextTracker";
 import { formatErrorDetails } from "./cli/helpers/errorFormatter";
 import {
   getReflectionSettings,
+  persistReflectionSettingsForAgent,
   type ReflectionSettings,
   type ReflectionTrigger,
-  reflectionSettingsToLegacyMode,
 } from "./cli/helpers/memoryReminder";
 import {
   type QueuedMessage,
@@ -91,7 +92,11 @@ import {
   createSharedReminderState,
   syncReminderStateFromContextTracker,
 } from "./reminders/state";
-import { settingsManager } from "./settings-manager";
+import { getCurrentWorkingDirectory } from "./runtime-context";
+import { settingsManager, shouldPersistSessionState } from "./settings-manager";
+import { telemetry } from "./telemetry";
+import { trackBoundaryError } from "./telemetry/errorReporting";
+import { extractTelemetryInputText } from "./telemetry/input";
 import {
   isHeadlessAutoAllowTool,
   isInteractiveApprovalTool,
@@ -101,7 +106,10 @@ import {
   registerExternalTools,
   setExternalToolExecutor,
 } from "./tools/manager";
-import { clearPersistedClientToolRules } from "./tools/toolset";
+import {
+  clearPersistedClientToolRules,
+  prepareToolExecutionContextForScope,
+} from "./tools/toolset";
 import type {
   AutoApprovalMessage,
   BootstrapSessionStateRequest,
@@ -137,8 +145,50 @@ const LLM_API_ERROR_MAX_RETRIES = 3;
 // Retry 1: same input. Retry 2: with system reminder nudge.
 const EMPTY_RESPONSE_MAX_RETRIES = 2;
 
+// Provider fallback: Anthropic model ID → Bedrock model ID.
+// After 1 failed retry against Anthropic, automatically retry via Bedrock.
+const PROVIDER_FALLBACK_MAP: Record<string, string> = {
+  // Opus 4.6 variants → Bedrock Opus 4.6
+  opus: "bedrock-opus-4.6",
+  "opus-4.6-no-reasoning": "bedrock-opus-4.6",
+  "opus-4.6-low": "bedrock-opus-4.6",
+  "opus-4.6-medium": "bedrock-opus-4.6",
+  "opus-4.6-xhigh": "bedrock-opus-4.6",
+  // Sonnet 4.6 variants → Bedrock Sonnet 4.6
+  sonnet: "bedrock-sonnet-4.6",
+  "sonnet-1m": "bedrock-sonnet-4.6",
+  "sonnet-4.6-no-reasoning": "bedrock-sonnet-4.6",
+  "sonnet-4.6-low": "bedrock-sonnet-4.6",
+  "sonnet-4.6-medium": "bedrock-sonnet-4.6",
+  "sonnet-4.6-xhigh": "bedrock-sonnet-4.6",
+};
+
 // Retry config for 409 "conversation busy" errors (exponential backoff)
 const CONVERSATION_BUSY_MAX_RETRIES = 3; // 10s -> 20s -> 40s
+
+function trackHeadlessBoundaryError(
+  errorType: string,
+  error: unknown,
+  context: string,
+): void {
+  trackBoundaryError({
+    errorType,
+    error,
+    context,
+  });
+}
+
+function reportAndExitHeadless(
+  errorType: string,
+  error: unknown,
+  context: string,
+): never {
+  trackHeadlessBoundaryError(errorType, error, context);
+  console.error(
+    error instanceof Error ? `Error: ${error.message}` : String(error),
+  );
+  process.exit(1);
+}
 
 export type BidirectionalQueuedInput = QueuedTurnInput<
   MessageCreate["content"]
@@ -151,6 +201,61 @@ export function mergeBidirectionalQueuedInput(
     normalizeUserContent: (content) => content,
   });
 }
+
+function trackTelemetryUserInputFromContent(
+  content: MessageCreate["content"],
+  modelId: string,
+): void {
+  const inputText = extractTelemetryInputText(content);
+  if (inputText.length === 0) {
+    return;
+  }
+  telemetry.trackUserInput(inputText, "user", modelId);
+}
+
+function shouldTrackTelemetryForQueuedMessage(
+  queuedKind?: QueuedMessage["kind"],
+): boolean {
+  return queuedKind !== "task_notification";
+}
+
+function contentToTaskNotificationText(
+  content: MessageCreate["content"],
+): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  return content
+    .flatMap((part) =>
+      part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+    )
+    .join("");
+}
+
+function toBidirectionalQueuedInput(
+  content: MessageCreate["content"],
+  queuedKind?: QueuedMessage["kind"],
+): BidirectionalQueuedInput {
+  if (queuedKind === "task_notification") {
+    return {
+      kind: "task_notification",
+      text: contentToTaskNotificationText(content),
+    };
+  }
+
+  return {
+    kind: "user",
+    content,
+  };
+}
+
+export const __headlessTestUtils = {
+  trackTelemetryUserInputFromContent,
+  shouldTrackTelemetryForQueuedMessage,
+  contentToTaskNotificationText,
+  toBidirectionalQueuedInput,
+};
 
 type ReflectionOverrides = {
   trigger?: ReflectionTrigger;
@@ -221,7 +326,7 @@ async function applyReflectionOverrides(
   agentId: string,
   overrides: ReflectionOverrides,
 ): Promise<ReflectionSettings> {
-  const current = getReflectionSettings();
+  const current = getReflectionSettings(agentId);
   const merged: ReflectionSettings = {
     trigger: overrides.trigger ?? current.trigger,
     stepCount: overrides.stepCount ?? current.stepCount,
@@ -250,19 +355,53 @@ async function applyReflectionOverrides(
     await settingsManager.loadLocalProjectSettings();
   }
 
-  const legacyMode = reflectionSettingsToLegacyMode(merged);
-  settingsManager.updateLocalProjectSettings({
-    memoryReminderInterval: legacyMode,
-    reflectionTrigger: merged.trigger,
-    reflectionStepCount: merged.stepCount,
-  });
-  settingsManager.updateSettings({
-    memoryReminderInterval: legacyMode,
-    reflectionTrigger: merged.trigger,
-    reflectionStepCount: merged.stepCount,
-  });
+  await persistReflectionSettingsForAgent(agentId, merged);
 
   return merged;
+}
+
+async function prepareHeadlessToolExecutionContext(params: {
+  agentId: string;
+  conversationId: string;
+  overrideModel?: string | null;
+}): Promise<{
+  preparedToolContext: Awaited<
+    ReturnType<typeof prepareToolExecutionContextForScope>
+  >;
+  availableTools: string[];
+}> {
+  const preparedToolContext = await prepareToolExecutionContextForScope({
+    agentId: params.agentId,
+    conversationId: params.conversationId,
+    overrideModel: params.overrideModel,
+    workingDirectory: getCurrentWorkingDirectory(),
+    exclude: ["AskUserQuestion"],
+  });
+
+  return {
+    preparedToolContext,
+    availableTools: preparedToolContext.preparedToolContext.clientTools.map(
+      (tool) => tool.name,
+    ),
+  };
+}
+
+async function flushAndExit(code: number): Promise<never> {
+  const flushWritable = (stream: NodeJS.WriteStream): Promise<void> =>
+    new Promise((resolve) => {
+      if (stream.destroyed || stream.writableEnded) {
+        resolve();
+        return;
+      }
+      stream.write("", () => resolve());
+    });
+
+  await Promise.allSettled([
+    flushWritable(process.stdout),
+    flushWritable(process.stderr),
+  ]);
+
+  process.exit(code);
 }
 
 export async function handleHeadlessCommand(
@@ -273,6 +412,7 @@ export async function handleHeadlessCommand(
   systemInfoReminderEnabledOverride?: boolean,
 ) {
   const { values, positionals } = parsedArgs;
+  telemetry.setSurface("headless");
 
   // Set tool filter if provided (controls which tools are loaded)
   if (values.tools !== undefined) {
@@ -292,6 +432,7 @@ export async function handleHeadlessCommand(
         "acceptEdits",
         "bypassPermissions",
         "plan",
+        "memory",
       ];
       if (validModes.includes(permissionModeValue)) {
         permissionMode.setMode(
@@ -299,7 +440,8 @@ export async function handleHeadlessCommand(
             | "default"
             | "acceptEdits"
             | "bypassPermissions"
-            | "plan",
+            | "plan"
+            | "memory",
         );
       }
     }
@@ -355,6 +497,11 @@ export async function handleHeadlessCommand(
   }
 
   if (!prompt && !isBidirectionalMode) {
+    trackHeadlessBoundaryError(
+      "headless_missing_prompt",
+      "No prompt provided",
+      "headless_startup_input_validation",
+    );
     console.error("Error: No prompt provided");
     process.exit(1);
   }
@@ -364,6 +511,11 @@ export async function handleHeadlessCommand(
 
   // Check for --resume flag (interactive only)
   if (values.resume) {
+    trackHeadlessBoundaryError(
+      "headless_invalid_resume_flag",
+      "--resume is for interactive mode only in headless mode",
+      "headless_startup_flag_validation",
+    );
     console.error(
       "Error: --resume is for interactive mode only (opens conversation selector).\n" +
         "In headless mode, use:\n" +
@@ -378,6 +530,7 @@ export async function handleHeadlessCommand(
 
   // Resolve agent (same logic as interactive mode)
   let agent: AgentState | null = null;
+  let autoEnableMemfsForFreshAgent = false;
   let specifiedAgentId = values.agent;
   const specifiedAgentName = values.name;
   let specifiedConversationId = values.conversation;
@@ -421,10 +574,11 @@ export async function handleHeadlessCommand(
     try {
       return parseReflectionOverrides(values);
     } catch (error) {
-      console.error(
-        error instanceof Error ? `Error: ${error.message}` : String(error),
+      return reportAndExitHeadless(
+        "headless_reflection_overrides_failed",
+        error,
+        "headless_startup_reflection_overrides",
       );
-      process.exit(1);
     }
   })();
   const maxTurnsRaw = values["max-turns"];
@@ -440,10 +594,11 @@ export async function handleHeadlessCommand(
         noBundledSkills: noBundledSkillsFlag,
       });
     } catch (error) {
-      console.error(
-        error instanceof Error ? `Error: ${error.message}` : String(error),
+      return reportAndExitHeadless(
+        "headless_skill_sources_failed",
+        error,
+        "headless_startup_skill_sources",
       );
-      process.exit(1);
     }
   })();
 
@@ -457,6 +612,11 @@ export async function handleHeadlessCommand(
       flagName: "max-turns",
     });
   } catch (error) {
+    trackHeadlessBoundaryError(
+      "headless_max_turns_parse_failed",
+      error,
+      "headless_startup_max_turns",
+    );
     console.error(
       `Error: ${error instanceof Error ? error.message : String(error)}`,
     );
@@ -478,10 +638,11 @@ export async function handleHeadlessCommand(
     specifiedConversationId = normalized.specifiedConversationId ?? undefined;
     specifiedAgentId = normalized.specifiedAgentId ?? undefined;
   } catch (error) {
-    console.error(
-      error instanceof Error ? `Error: ${error.message}` : String(error),
+    return reportAndExitHeadless(
+      "headless_conversation_shorthand_failed",
+      error,
+      "headless_startup_conversation_shorthand",
     );
-    process.exit(1);
   }
 
   // Validate --conv default requires --agent (unless --new-agent will create one)
@@ -492,6 +653,11 @@ export async function handleHeadlessCommand(
       forceNew,
     });
   } catch (error) {
+    trackHeadlessBoundaryError(
+      "headless_conversation_flag_validation_failed",
+      error,
+      "headless_startup_conversation_flag_validation",
+    );
     console.error(
       error instanceof Error ? `Error: ${error.message}` : String(error),
     );
@@ -550,10 +716,11 @@ export async function handleHeadlessCommand(
       ],
     });
   } catch (error) {
-    console.error(
-      error instanceof Error ? `Error: ${error.message}` : String(error),
+    return reportAndExitHeadless(
+      "headless_flag_conflict_validation_failed",
+      error,
+      "headless_startup_flag_conflicts",
     );
-    process.exit(1);
   }
 
   // Validate --import flag (also accepts legacy --from-af)
@@ -579,10 +746,11 @@ export async function handleHeadlessCommand(
         ],
       });
     } catch (error) {
-      console.error(
-        error instanceof Error ? `Error: ${error.message}` : String(error),
+      return reportAndExitHeadless(
+        "headless_import_flag_validation_failed",
+        error,
+        "headless_startup_import_flag_validation",
       );
-      process.exit(1);
     }
 
     // Check if this looks like a registry handle (@author/name)
@@ -677,6 +845,11 @@ export async function handleHeadlessCommand(
         }
       }
     } catch (error) {
+      trackHeadlessBoundaryError(
+        "headless_memory_blocks_parse_failed",
+        error,
+        "headless_startup_memory_blocks",
+      );
       console.error(
         `Error: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -721,7 +894,12 @@ export async function handleHeadlessCommand(
         specifiedConversationId,
       );
       agent = await client.agents.retrieve(conversation.agent_id);
-    } catch (_error) {
+    } catch (error) {
+      trackHeadlessBoundaryError(
+        "headless_conversation_lookup_failed",
+        error,
+        "headless_startup_conversation_lookup",
+      );
       console.error(`Conversation ${specifiedConversationId} not found`);
       process.exit(1);
     }
@@ -783,9 +961,7 @@ export async function handleHeadlessCommand(
   if (!agent && forceNew) {
     const updateArgs = getModelUpdateArgs(model);
     // Pre-determine memfs mode so the agent is created with the correct prompt.
-    const { isLettaCloud, enableMemfsIfCloud } = await import(
-      "./agent/memoryFilesystem"
-    );
+    const { isLettaCloud } = await import("./agent/memoryFilesystem");
     const willAutoEnableMemfs =
       shouldAutoEnableMemfsForNewAgent && (await isLettaCloud());
     const effectiveMemoryMode =
@@ -808,17 +984,15 @@ export async function handleHeadlessCommand(
     };
     const result = await createAgent(createOptions);
     agent = result.agent;
-
-    // Enable memfs on Letta Cloud (tags, repo clone, tool detach).
-    if (willAutoEnableMemfs) {
-      await enableMemfsIfCloud(agent.id);
-    }
+    autoEnableMemfsForFreshAgent = willAutoEnableMemfs;
   }
 
   // Priority 4: Try to resume from project settings (.letta/settings.local.json)
   if (!agent) {
     await settingsManager.loadLocalProjectSettings();
-    const localAgentId = settingsManager.getLocalLastAgentId(process.cwd());
+    const localAgentId = settingsManager.getLocalLastAgentId(
+      getCurrentWorkingDirectory(),
+    );
     if (localAgentId) {
       try {
         agent = await client.agents.retrieve(localAgentId);
@@ -859,6 +1033,7 @@ export async function handleHeadlessCommand(
     process.exit(1);
   }
   markMilestone("HEADLESS_AGENT_RESOLVED");
+  telemetry.setCurrentAgentId(agent.id);
 
   // Check if we're resuming an existing agent (not creating a new one)
   const isResumingAgent = !!(specifiedAgentId || (!forceNew && !fromAfFile));
@@ -901,9 +1076,18 @@ export async function handleHeadlessCommand(
   let effectiveReflectionSettings: ReflectionSettings;
 
   const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
+  const startupMemfsFlag = autoEnableMemfsForFreshAgent ? true : memfsFlag;
 
   // Captured so prompt logic below can await it when needed.
   let memfsBgPromise: Promise<unknown> | undefined;
+
+  // Init secrets cache — runs in parallel with memfs sync below.
+  const secretsAgentId = agent?.id;
+  const secretsInitPromise = secretsAgentId
+    ? import("./utils/secretsStore").then(({ initSecretsFromServer }) =>
+        initSecretsFromServer(secretsAgentId),
+      )
+    : Promise.resolve();
 
   // Apply memfs flags and auto-enable from server tag when local settings are missing.
   // Respects memfsStartupPolicy:
@@ -914,12 +1098,17 @@ export async function handleHeadlessCommand(
     // Run enable/disable logic but skip the git pull.
     try {
       const { applyMemfsFlags } = await import("./agent/memoryFilesystem");
-      await applyMemfsFlags(agent.id, memfsFlag, noMemfsFlag, {
+      await applyMemfsFlags(agent.id, startupMemfsFlag, noMemfsFlag, {
         pullOnExistingRepo: false,
         agentTags: agent.tags,
         skipPromptUpdate: forceNew,
       });
     } catch (error) {
+      trackHeadlessBoundaryError(
+        "headless_memfs_flags_failed",
+        error,
+        "headless_startup_memfs_flags",
+      );
       console.error(
         `Memory flags failed: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -928,11 +1117,16 @@ export async function handleHeadlessCommand(
   } else if (memfsStartupPolicy === "background") {
     // Fire pull async; don't block session initialisation.
     const { applyMemfsFlags } = await import("./agent/memoryFilesystem");
-    memfsBgPromise = applyMemfsFlags(agent.id, memfsFlag, noMemfsFlag, {
+    memfsBgPromise = applyMemfsFlags(agent.id, startupMemfsFlag, noMemfsFlag, {
       pullOnExistingRepo: true,
       agentTags: agent.tags,
       skipPromptUpdate: forceNew,
     }).catch((error) => {
+      trackHeadlessBoundaryError(
+        "headless_memfs_background_pull_failed",
+        error,
+        "headless_runtime_memfs_background_pull",
+      );
       // Log to stderr only — the session is already live.
       console.error(
         `[memfs background pull] ${error instanceof Error ? error.message : String(error)}`,
@@ -944,7 +1138,7 @@ export async function handleHeadlessCommand(
       const { applyMemfsFlags } = await import("./agent/memoryFilesystem");
       const memfsResult = await applyMemfsFlags(
         agent.id,
-        memfsFlag,
+        startupMemfsFlag,
         noMemfsFlag,
         {
           pullOnExistingRepo: true,
@@ -953,12 +1147,22 @@ export async function handleHeadlessCommand(
         },
       );
       if (memfsResult.pullSummary?.includes("CONFLICT")) {
+        trackHeadlessBoundaryError(
+          "headless_memfs_conflict",
+          "Memory has merge conflicts. Run in interactive mode to resolve.",
+          "headless_startup_memfs_sync",
+        );
         console.error(
           "Memory has merge conflicts. Run in interactive mode to resolve.",
         );
         process.exit(1);
       }
     } catch (error) {
+      trackHeadlessBoundaryError(
+        "headless_memfs_sync_failed",
+        error,
+        "headless_startup_memfs_sync",
+      );
       console.error(
         `Memory git sync failed: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -971,10 +1175,27 @@ export async function handleHeadlessCommand(
     await memfsBgPromise;
   }
 
+  // Ensure secrets cache is populated (non-fatal).
+  try {
+    await secretsInitPromise;
+  } catch (error) {
+    import("./utils/debug").then(({ debugLog }) =>
+      debugLog(
+        "secrets",
+        `Failed to init secrets: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+  }
+
   // Apply --system flag after memfs sync so isMemfsEnabled() is up to date.
   if (isResumingAgent && systemPromptPreset) {
     const result = await updateAgentSystemPrompt(agent.id, systemPromptPreset);
     if (!result.success || !result.agent) {
+      trackHeadlessBoundaryError(
+        "headless_system_prompt_update_failed",
+        result.message,
+        "headless_startup_system_prompt",
+      );
       console.error(`Failed to update system prompt: ${result.message}`);
       process.exit(1);
     }
@@ -1111,16 +1332,9 @@ export async function handleHeadlessCommand(
 
   // Save session (agent + conversation) to both project and global settings
   // Skip for subagents - they shouldn't pollute the LRU settings
-  if (!isSubagent) {
+  if (shouldPersistSessionState()) {
     await settingsManager.loadLocalProjectSettings();
-    settingsManager.setLocalLastSession(
-      { agentId: agent.id, conversationId },
-      process.cwd(),
-    );
-    settingsManager.setGlobalLastSession({
-      agentId: agent.id,
-      conversationId,
-    });
+    settingsManager.persistSession(agent.id, conversationId);
   }
 
   // Set agent context for tools that need it (e.g., Skill tool, Task tool)
@@ -1142,12 +1356,15 @@ export async function handleHeadlessCommand(
     process.exit(1);
   }
 
-  const { getClientToolsFromRegistry } = await import("./tools/manager");
-  const loadedToolNames = getClientToolsFromRegistry().map((t) => t.name);
-  const availableTools =
-    loadedToolNames.length > 0
-      ? loadedToolNames
-      : agent.tools?.map((t) => t.name).filter((n): n is string => !!n) || [];
+  let availableTools =
+    agent.tools?.map((t) => t.name).filter((n): n is string => !!n) || [];
+  {
+    const initialToolContext = await prepareHeadlessToolExecutionContext({
+      agentId: agent.id,
+      conversationId,
+    });
+    availableTools = initialToolContext.availableTools;
+  }
 
   // If input-format is stream-json, use bidirectional mode
   if (isBidirectionalMode) {
@@ -1170,9 +1387,22 @@ export async function handleHeadlessCommand(
 
   // Initialize session stats
   const sessionStats = new SessionStats();
+  telemetry.setSessionStatsGetter(() => sessionStats.getSnapshot());
 
   // Use agent.id as session_id for all stream-json messages
   const sessionId = agent.id;
+  const exitHeadless = async (
+    code: number,
+    exitReason: string,
+  ): Promise<never> => {
+    try {
+      telemetry.trackSessionEnd(sessionStats.getSnapshot(), exitReason);
+      await telemetry.flush();
+    } finally {
+      telemetry.setSessionStatsGetter(undefined);
+    }
+    return await flushAndExit(code);
+  };
 
   // Output init event for stream-json format
   if (outputFormat === "stream-json") {
@@ -1184,7 +1414,7 @@ export async function handleHeadlessCommand(
       conversation_id: conversationId,
       model: agent.llm_config?.model ?? "",
       tools: availableTools,
-      cwd: process.cwd(),
+      cwd: getCurrentWorkingDirectory(),
       mcp_servers: [],
       permission_mode: "",
       slash_commands: [],
@@ -1310,12 +1540,21 @@ export async function handleHeadlessCommand(
         }
       }
 
-      const executedResults = await executeApprovalBatch(decisions);
+      const recoveryToolContext = await prepareHeadlessToolExecutionContext({
+        agentId: agent.id,
+        conversationId,
+      });
+      availableTools = recoveryToolContext.availableTools;
+      const executedResults = await executeApprovalBatch(decisions, undefined, {
+        toolContextId:
+          recoveryToolContext.preparedToolContext.preparedToolContext.contextId,
+      });
 
       // Send all results in one batch
       const approvalInput: ApprovalCreate = {
         type: "approval",
         approvals: executedResults as ApprovalResult[],
+        otid: randomUUID(),
       };
 
       // Inject queued skill content as user message parts (LET-7353)
@@ -1335,6 +1574,7 @@ export async function handleHeadlessCommand(
               type: "text" as const,
               text: sc.content,
             })),
+            otid: randomUUID(),
           });
         }
       }
@@ -1343,7 +1583,11 @@ export async function handleHeadlessCommand(
       const approvalStream = await sendMessageStream(
         conversationId,
         approvalMessages,
-        { agentId: agent.id },
+        {
+          agentId: agent.id,
+          preparedToolContext:
+            recoveryToolContext.preparedToolContext.preparedToolContext,
+        },
       );
       const drainResult = await drainStreamWithResume(
         approvalStream,
@@ -1370,7 +1614,28 @@ export async function handleHeadlessCommand(
   // Clear any pending approvals before starting a new turn - ONLY when resuming (LET-7101)
   // For new agents/conversations, lazy recovery handles any edge cases
   if (isResumingAgent) {
-    await resolveAllPendingApprovals();
+    try {
+      await resolveAllPendingApprovals();
+    } catch (approvalError) {
+      // Don't crash on pre-loop approval resolution (e.g., 409 from server-side
+      // sleeptime run holding the conversation lock). The main loop's own
+      // approval-recovery and conversation-busy retry logic will handle it.
+      if (outputFormat === "stream-json") {
+        const errorMsg: ErrorMessage = {
+          type: "error",
+          message: `Failed to resolve pending approvals on resume: ${approvalError instanceof Error ? approvalError.message : String(approvalError)}`,
+          stop_reason: "error",
+          session_id: sessionId,
+          uuid: `error-pre-loop-approval-${randomUUID()}`,
+        };
+        console.log(JSON.stringify(errorMsg));
+      } else {
+        console.error(
+          `Warning: Failed to resolve pending approvals on resume: ${approvalError instanceof Error ? approvalError.message : String(approvalError)}`,
+        );
+      }
+      // Continue to main loop — lazy recovery will handle stale approvals
+    }
   }
 
   // Build message content with reminders
@@ -1406,9 +1671,11 @@ ${SYSTEM_REMINDER_CLOSE}
       name: agent.name,
       description: agent.description,
       lastRunAt: lastRunAt ?? null,
+      conversationId,
     },
     state: sharedReminderState,
     sessionContextReminderEnabled: systemInfoReminderEnabled,
+    workingDirectory: getCurrentWorkingDirectory(),
     reflectionSettings: effectiveReflectionSettings,
     skillSources: resolvedSkillSources,
     resolvePlanModeReminder: async () => {
@@ -1457,24 +1724,40 @@ ${SYSTEM_REMINDER_CLOSE}
   // Add user prompt
   pushPart(prompt);
 
+  telemetry.trackUserInput(
+    prompt,
+    "user",
+    agent.llm_config?.model ?? "unknown",
+  );
+
   // Start with the user message
   let currentInput: Array<MessageCreate | ApprovalCreate> = [
     {
       role: "user",
       content: contentParts,
+      otid: randomUUID(),
     },
   ];
+  const refreshCurrentInputOtids = () => {
+    // Terminal stop-reason retries are NEW requests and must not reuse OTIDs.
+    currentInput = currentInput.map((item) => ({
+      ...item,
+      otid: randomUUID(),
+    }));
+  };
 
   // Track lastRunId outside the while loop so it's available in catch block
   let lastKnownRunId: string | null = null;
   let llmApiErrorRetries = 0;
   let emptyResponseRetries = 0;
   let conversationBusyRetries = 0;
+  let providerFallbackAttempted = false;
+  let overrideModelHandle: string | undefined;
   markMilestone("HEADLESS_FIRST_STREAM_START");
   measureSinceMilestone("headless-setup-total", "HEADLESS_CLIENT_READY");
 
   // Helper to check max turns limit using server-side step count from buffers
-  const checkMaxTurns = () => {
+  const checkMaxTurns = async (): Promise<void> => {
     if (maxTurns !== undefined && buffers.usage.stepCount >= maxTurns) {
       if (outputFormat === "stream-json") {
         const errorMsg: ErrorMessage = {
@@ -1490,14 +1773,23 @@ ${SYSTEM_REMINDER_CLOSE}
           `Maximum turns limit reached (${buffers.usage.stepCount}/${maxTurns} steps)`,
         );
       }
-      process.exit(1);
+      await exitHeadless(1, "headless_max_steps_reached");
     }
   };
 
   try {
     while (true) {
-      // Check max turns limit before starting a new turn (uses server-side step count)
-      checkMaxTurns();
+      const hasApprovalContinuation = currentInput.some(
+        (item) => item.type === "approval",
+      );
+
+      // Check max turns limit before starting a new user turn.
+      // Do NOT enforce before approval continuations: otherwise we can exit
+      // with max_steps while the backend is still waiting for the approval
+      // response, leaving the run stuck in requires_approval.
+      if (!hasApprovalContinuation) {
+        await checkMaxTurns();
+      }
 
       // Inject queued skill content as user message parts (LET-7353)
       {
@@ -1514,6 +1806,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 type: "text" as const,
                 text: sc.content,
               })),
+              otid: randomUUID(),
             },
           ];
         }
@@ -1523,8 +1816,17 @@ ${SYSTEM_REMINDER_CLOSE}
       let stream: Awaited<ReturnType<typeof sendMessageStream>>;
       let turnToolContextId: string | null = null;
       try {
+        const turnToolContext = await prepareHeadlessToolExecutionContext({
+          agentId: agent.id,
+          conversationId,
+          overrideModel: overrideModelHandle,
+        });
+        availableTools = turnToolContext.availableTools;
         stream = await sendMessageStream(conversationId, currentInput, {
           agentId: agent.id,
+          overrideModel: overrideModelHandle,
+          preparedToolContext:
+            turnToolContext.preparedToolContext.preparedToolContext,
         });
         turnToolContextId = getStreamToolContextId(stream);
       } catch (preStreamError) {
@@ -1569,44 +1871,95 @@ ${SYSTEM_REMINDER_CLOSE}
           continue;
         }
 
-        // Check for 409 "conversation busy" error - retry once with delay
-        // TODO: Add pre-stream resume logic for parity with App.tsx.
-        // Before waiting, attempt to discover the in-flight run via
-        // discoverFallbackRunIdWithTimeout() and resume its stream with
-        // client.runs.messages.stream() + drainStream(). See App.tsx
-        // retry_conversation_busy handler for reference implementation.
+        // Check for 409 "conversation busy" - resume via conversation stream endpoint.
+        // Server resolves: (1) otid lookup, (2) active run fallback.
+        // OTID lookup provides server-side request ownership validation.
+        // Falls back to exponential backoff retry if the endpoint fails.
         if (preStreamAction === "retry_conversation_busy") {
-          conversationBusyRetries += 1;
-          const retryDelayMs = getRetryDelayMs({
-            category: "conversation_busy",
-            attempt: conversationBusyRetries,
-          });
+          const messageOtid = currentInput
+            .map((item) => (item as Record<string, unknown>).otid)
+            .find((v): v is string => typeof v === "string");
 
-          // Emit retry message for stream-json mode
-          if (outputFormat === "stream-json") {
-            const retryMsg: RetryMessage = {
-              type: "retry",
-              reason: "error", // 409 conversation busy is a pre-stream error
+          try {
+            const client = await getClient();
+            stream = (await client.conversations.messages.stream(
+              conversationId,
+              // Cast needed until SDK MessageStreamParams includes otid field
+              {
+                agent_id:
+                  conversationId === "default"
+                    ? (agent?.id ?? undefined)
+                    : undefined,
+                otid: messageOtid ?? undefined,
+                starting_after: 0,
+                batch_size: 1000,
+              } as unknown as Parameters<
+                typeof client.conversations.messages.stream
+              >[1],
+            )) as Awaited<ReturnType<typeof sendMessageStream>>;
+            conversationBusyRetries = 0;
+            // Fall through to drain
+          } catch {
+            conversationBusyRetries += 1;
+            const retryDelayMs = getRetryDelayMs({
+              category: "conversation_busy",
               attempt: conversationBusyRetries,
-              max_attempts: CONVERSATION_BUSY_MAX_RETRIES,
-              delay_ms: retryDelayMs,
-              session_id: sessionId,
-              uuid: `retry-conversation-busy-${randomUUID()}`,
-            };
-            console.log(JSON.stringify(retryMsg));
-          } else {
-            console.error(
-              `Conversation is busy, waiting ${Math.round(retryDelayMs / 1000)}s and retrying...`,
-            );
-          }
+            });
 
-          // Wait before retry
-          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-          continue;
+            if (outputFormat === "stream-json") {
+              const retryMsg: RetryMessage = {
+                type: "retry",
+                reason: "error",
+                attempt: conversationBusyRetries,
+                max_attempts: CONVERSATION_BUSY_MAX_RETRIES,
+                delay_ms: retryDelayMs,
+                session_id: sessionId,
+                uuid: `retry-conversation-busy-${randomUUID()}`,
+              };
+              console.log(JSON.stringify(retryMsg));
+            } else {
+              console.error(
+                `Conversation is busy, waiting ${Math.round(retryDelayMs / 1000)}s and retrying...`,
+              );
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+            continue;
+          }
         }
 
         if (preStreamAction === "retry_transient") {
           const attempt = llmApiErrorRetries + 1;
+          llmApiErrorRetries = attempt;
+
+          // Provider fallback: after 1 retry against Anthropic, switch to Bedrock
+          if (attempt >= 2 && !providerFallbackAttempted && model) {
+            const fallbackId = PROVIDER_FALLBACK_MAP[model];
+            const fallbackHandle = fallbackId
+              ? getModelInfo(fallbackId)?.handle
+              : undefined;
+            if (fallbackHandle) {
+              providerFallbackAttempted = true;
+              overrideModelHandle = fallbackHandle;
+              if (outputFormat === "stream-json") {
+                console.log(
+                  JSON.stringify({
+                    type: "status",
+                    message: "Anthropic API error; falling back to Bedrock...",
+                    session_id: sessionId,
+                    uuid: `fallback-${randomUUID()}`,
+                  }),
+                );
+              } else {
+                console.error(
+                  "Anthropic API error; falling back to Bedrock...",
+                );
+              }
+              conversationBusyRetries = 0;
+              continue;
+            }
+          }
+
           const retryAfterMs =
             preStreamError instanceof APIError
               ? parseRetryAfterHeaderMs(
@@ -1619,8 +1972,6 @@ ${SYSTEM_REMINDER_CLOSE}
             detail: errorDetail,
             retryAfterMs,
           });
-
-          llmApiErrorRetries = attempt;
 
           if (outputFormat === "stream-json") {
             const retryMsg: RetryMessage = {
@@ -1818,8 +2169,13 @@ ${SYSTEM_REMINDER_CLOSE}
       // Track API duration for this stream
       sessionStats.endTurn(apiDurationMs);
 
-      // Check max turns after each turn (server may have taken multiple steps)
-      checkMaxTurns();
+      // Check max turns after each turn (server may have taken multiple steps),
+      // but defer the limit when we're still resolving pending approvals.
+      // Otherwise we can exit while the backend is waiting for approval input,
+      // leaving the run stuck in requires_approval.
+      if (stopReason !== "requires_approval" && !approvalPendingRecovery) {
+        await checkMaxTurns();
+      }
 
       if (approvalPendingRecovery) {
         await resolveAllPendingApprovals();
@@ -1839,7 +2195,7 @@ ${SYSTEM_REMINDER_CLOSE}
       if (stopReason === "requires_approval") {
         if (approvals.length === 0) {
           console.error("Unexpected empty approvals array");
-          process.exit(1);
+          await exitHeadless(1, "headless_requires_approval_empty");
         }
 
         // Phase 1: Collect decisions for all approvals
@@ -1918,12 +2274,12 @@ ${SYSTEM_REMINDER_CLOSE}
         );
 
         // Send all results in one batch
-        currentInput = [
-          {
-            type: "approval",
-            approvals: executedResults as ApprovalResult[],
-          },
-        ];
+        const approvalInputWithOtid = {
+          type: "approval" as const,
+          approvals: executedResults as ApprovalResult[],
+          otid: randomUUID(),
+        };
+        currentInput = [approvalInputWithOtid];
         continue;
       }
 
@@ -1949,13 +2305,41 @@ ${SYSTEM_REMINDER_CLOSE}
       if (stopReason === "llm_api_error") {
         if (llmApiErrorRetries < LLM_API_ERROR_MAX_RETRIES) {
           const attempt = llmApiErrorRetries + 1;
+          llmApiErrorRetries = attempt;
+
+          // Provider fallback: after 1 retry against Anthropic, switch to Bedrock
+          if (attempt >= 2 && !providerFallbackAttempted && model) {
+            const fallbackId = PROVIDER_FALLBACK_MAP[model];
+            const fallbackHandle = fallbackId
+              ? getModelInfo(fallbackId)?.handle
+              : undefined;
+            if (fallbackHandle) {
+              providerFallbackAttempted = true;
+              overrideModelHandle = fallbackHandle;
+              if (outputFormat === "stream-json") {
+                console.log(
+                  JSON.stringify({
+                    type: "status",
+                    message: "Anthropic API error; falling back to Bedrock...",
+                    session_id: sessionId,
+                    uuid: `fallback-${randomUUID()}`,
+                  }),
+                );
+              } else {
+                console.error(
+                  "Anthropic API error; falling back to Bedrock...",
+                );
+              }
+              refreshCurrentInputOtids();
+              continue;
+            }
+          }
+
           const delayMs = getRetryDelayMs({
             category: "transient_provider",
             attempt,
             detail: detailFromRun,
           });
-
-          llmApiErrorRetries = attempt;
 
           if (outputFormat === "stream-json") {
             const retryMsg: RetryMessage = {
@@ -1979,6 +2363,8 @@ ${SYSTEM_REMINDER_CLOSE}
           // Exponential backoff before retrying the same input
           await new Promise((resolve) => setTimeout(resolve, delayMs));
 
+          // Post-stream retry creates a new run/request.
+          refreshCurrentInputOtids();
           continue;
         }
       }
@@ -2027,7 +2413,7 @@ ${SYSTEM_REMINDER_CLOSE}
           } else {
             console.error("Failed to fetch pending approvals for resync");
           }
-          process.exit(1);
+          await exitHeadless(1, "headless_approval_resync_failed");
         }
       }
 
@@ -2049,24 +2435,27 @@ ${SYSTEM_REMINDER_CLOSE}
       ];
       if (nonRetriableReasons.includes(stopReason)) {
         // Fall through to error display
-      } else if (lastRunId && llmApiErrorRetries < LLM_API_ERROR_MAX_RETRIES) {
+      } else if (llmApiErrorRetries < LLM_API_ERROR_MAX_RETRIES) {
         try {
-          const run = await client.runs.retrieve(lastRunId);
-          const metaError = run.metadata?.error as
-            | {
-                error_type?: string;
-                message?: string;
-                detail?: string;
-                // Handle nested error structure (error.error) that can occur in some edge cases
-                error?: { error_type?: string; detail?: string };
-              }
-            | undefined;
+          let errorType: string | undefined;
+          let detail = detailFromRun ?? latestErrorText ?? "";
 
-          // Check for llm_error at top level or nested (handles error.error nesting)
-          const errorType =
-            metaError?.error_type ?? metaError?.error?.error_type;
+          if (lastRunId) {
+            const run = await client.runs.retrieve(lastRunId);
+            const metaError = run.metadata?.error as
+              | {
+                  error_type?: string;
+                  message?: string;
+                  detail?: string;
+                  // Handle nested error structure (error.error) that can occur in some edge cases
+                  error?: { error_type?: string; detail?: string };
+                }
+              | undefined;
 
-          const detail = metaError?.detail ?? metaError?.error?.detail ?? "";
+            // Check for llm_error at top level or nested (handles error.error nesting)
+            errorType = metaError?.error_type ?? metaError?.error?.error_type;
+            detail = metaError?.detail ?? metaError?.error?.detail ?? detail;
+          }
 
           // Special handling for empty response errors (Opus 4.6 SADs)
           // Empty LLM response retry (e.g. Opus 4.6 occasionally returns no content).
@@ -2092,6 +2481,7 @@ ${SYSTEM_REMINDER_CLOSE}
               const nudgeMessage: MessageCreate = {
                 role: "system",
                 content: `<system-reminder>The previous response was empty. Please provide a response with either text content or a tool call.</system-reminder>`,
+                otid: randomUUID(),
               };
               currentInput = [...currentInput, nudgeMessage];
             }
@@ -2115,6 +2505,8 @@ ${SYSTEM_REMINDER_CLOSE}
             }
 
             await new Promise((resolve) => setTimeout(resolve, delayMs));
+            // Empty-response retry creates a new run/request.
+            refreshCurrentInputOtids();
             continue;
           }
 
@@ -2148,9 +2540,52 @@ ${SYSTEM_REMINDER_CLOSE}
             }
 
             await new Promise((resolve) => setTimeout(resolve, delayMs));
+            // Post-stream retry creates a new run/request.
+            refreshCurrentInputOtids();
             continue;
           }
         } catch (_e) {
+          if (
+            shouldRetryRunMetadataError(
+              undefined,
+              detailFromRun ?? latestErrorText,
+            )
+          ) {
+            const attempt = llmApiErrorRetries + 1;
+            const detail = detailFromRun ?? latestErrorText;
+            const delayMs = getRetryDelayMs({
+              category: "transient_provider",
+              attempt,
+              detail,
+            });
+
+            llmApiErrorRetries = attempt;
+
+            if (outputFormat === "stream-json") {
+              const retryMsg: RetryMessage = {
+                type: "retry",
+                reason: "llm_api_error",
+                attempt,
+                max_attempts: LLM_API_ERROR_MAX_RETRIES,
+                delay_ms: delayMs,
+                run_id: lastRunId ?? undefined,
+                session_id: sessionId,
+                uuid: `retry-${lastRunId || randomUUID()}`,
+              };
+              console.log(JSON.stringify(retryMsg));
+            } else {
+              const delaySeconds = Math.round(delayMs / 1000);
+              console.error(
+                `LLM API error encountered (attempt ${attempt} of ${LLM_API_ERROR_MAX_RETRIES}), retrying in ${delaySeconds}s...`,
+              );
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            // Post-stream retry creates a new run/request.
+            refreshCurrentInputOtids();
+            continue;
+          }
+
           // If we can't fetch run metadata, fall through to normal error handling
         }
       }
@@ -2196,6 +2631,11 @@ ${SYSTEM_REMINDER_CLOSE}
         }
       }
 
+      trackHeadlessBoundaryError(
+        "headless_turn_failed",
+        errorMessage,
+        "headless_turn_execution",
+      );
       if (outputFormat === "stream-json") {
         // Emit error event
         const errorMsg: ErrorMessage = {
@@ -2210,7 +2650,7 @@ ${SYSTEM_REMINDER_CLOSE}
       } else {
         console.error(`Error: ${errorMessage}`);
       }
-      process.exit(1);
+      await exitHeadless(1, "headless_stop_reason_error");
     }
   } catch (error) {
     // Mark incomplete tool calls as cancelled
@@ -2218,6 +2658,11 @@ ${SYSTEM_REMINDER_CLOSE}
 
     // Use comprehensive error formatting (same as TUI mode)
     const errorDetails = formatErrorDetails(error, agent.id);
+    trackHeadlessBoundaryError(
+      "headless_runtime_exception",
+      error,
+      "headless_turn_execution",
+    );
 
     if (outputFormat === "stream-json") {
       const errorMsg: ErrorMessage = {
@@ -2232,7 +2677,7 @@ ${SYSTEM_REMINDER_CLOSE}
     } else {
       console.error(`Error: ${errorDetails}`);
     }
-    process.exit(1);
+    await exitHeadless(1, "headless_runtime_exception");
   }
 
   // Update stats with final usage data from buffers
@@ -2339,7 +2784,7 @@ ${SYSTEM_REMINDER_CLOSE}
     // text format (default)
     if (!resultText || resultText === "No assistant response found") {
       console.error("No assistant response found");
-      process.exit(1);
+      await exitHeadless(1, "headless_missing_result_text");
     }
     console.log(resultText);
   }
@@ -2347,6 +2792,7 @@ ${SYSTEM_REMINDER_CLOSE}
   // Report all milestones at the end for latency audit
   markMilestone("HEADLESS_COMPLETE");
   reportAllMilestones();
+  await exitHeadless(0, "headless_complete");
 }
 
 /**
@@ -2366,7 +2812,16 @@ async function runBidirectionalMode(
   reflectionSettings: ReflectionSettings,
 ): Promise<void> {
   const sessionId = agent.id;
+  const telemetryModelId = agent.llm_config?.model ?? "unknown";
   const readline = await import("node:readline");
+  const exitBidirectional = async (
+    code: number,
+    exitReason: string,
+  ): Promise<never> => {
+    telemetry.trackSessionEnd(undefined, exitReason);
+    await telemetry.flush();
+    return await flushAndExit(code);
+  };
 
   // Emit init event
   const initEvent = {
@@ -2377,7 +2832,7 @@ async function runBidirectionalMode(
     conversation_id: conversationId,
     model: agent.llm_config?.model,
     tools: availableTools,
-    cwd: process.cwd(),
+    cwd: getCurrentWorkingDirectory(),
     memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
     skill_sources: skillSources,
     system_info_reminder_enabled: systemInfoReminderEnabled,
@@ -2476,11 +2931,20 @@ async function runBidirectionalMode(
       const { executeApprovalBatch } = await import(
         "./agent/approval-execution"
       );
-      const executedResults = await executeApprovalBatch(decisions);
+      const recoveryToolContext = await prepareHeadlessToolExecutionContext({
+        agentId: agent.id,
+        conversationId,
+      });
+      availableTools = recoveryToolContext.availableTools;
+      const executedResults = await executeApprovalBatch(decisions, undefined, {
+        toolContextId:
+          recoveryToolContext.preparedToolContext.preparedToolContext.contextId,
+      });
 
       const approvalInput: ApprovalCreate = {
         type: "approval",
         approvals: executedResults as ApprovalResult[],
+        otid: randomUUID(),
       };
 
       const approvalMessages: Array<
@@ -2500,6 +2964,7 @@ async function runBidirectionalMode(
               type: "text" as const,
               text: sc.content,
             })),
+            otid: randomUUID(),
           });
         }
       }
@@ -2507,7 +2972,11 @@ async function runBidirectionalMode(
       const approvalStream = await sendMessageStream(
         conversationId,
         approvalMessages,
-        { agentId: agent.id },
+        {
+          agentId: agent.id,
+          preparedToolContext:
+            recoveryToolContext.preparedToolContext.preparedToolContext,
+        },
       );
       const drainResult = await drainStreamWithResume(
         approvalStream,
@@ -2639,6 +3108,12 @@ async function runBidirectionalMode(
       msgQueueRuntime.enqueue({
         kind: "task_notification",
         source: "task_notification",
+        text: input.text,
+      } as Parameters<typeof msgQueueRuntime.enqueue>[0]);
+    } else if (input.kind === "cron_prompt") {
+      msgQueueRuntime.enqueue({
+        kind: "cron_prompt",
+        source: "cron",
         text: input.text,
       } as Parameters<typeof msgQueueRuntime.enqueue>[0]);
     } else {
@@ -2896,17 +3371,30 @@ async function runBidirectionalMode(
         };
       }
 
-      const executedResults = await executeApprovalBatch(decisions);
+      const recoveryToolContext = await prepareHeadlessToolExecutionContext({
+        agentId: agent.id,
+        conversationId: targetConversationId,
+      });
+      availableTools = recoveryToolContext.availableTools;
+      const executedResults = await executeApprovalBatch(decisions, undefined, {
+        toolContextId:
+          recoveryToolContext.preparedToolContext.preparedToolContext.contextId,
+      });
       approvalsProcessed += executedResults.length;
 
       const approvalInput: ApprovalCreate = {
         type: "approval",
         approvals: executedResults as ApprovalResult[],
+        otid: randomUUID(),
       };
       const approvalStream = await sendMessageStream(
         targetConversationId,
         [approvalInput],
-        { agentId: agent.id },
+        {
+          agentId: agent.id,
+          preparedToolContext:
+            recoveryToolContext.preparedToolContext.preparedToolContext,
+        },
       );
 
       const drainResult = await drainStreamWithResume(
@@ -2946,6 +3434,7 @@ async function runBidirectionalMode(
       request_id?: string;
       request?: { subtype: string };
       session_id?: string;
+      _queuedKind?: QueuedMessage["kind"];
     };
 
     try {
@@ -3172,12 +3661,21 @@ async function runBidirectionalMode(
 
     // Handle user messages
     if (message.type === "user" && message.message?.content !== undefined) {
-      const queuedInputs: BidirectionalQueuedInput[] = [
-        {
-          kind: "user",
-          content: message.message.content,
-        },
-      ];
+      const firstQueuedInput = toBidirectionalQueuedInput(
+        message.message.content,
+        message._queuedKind,
+      );
+      if (
+        firstQueuedInput.kind === "user" &&
+        shouldTrackTelemetryForQueuedMessage(message._queuedKind)
+      ) {
+        trackTelemetryUserInputFromContent(
+          message.message.content,
+          telemetryModelId,
+        );
+      }
+
+      const queuedInputs: BidirectionalQueuedInput[] = [firstQueuedInput];
 
       // Batch any already-buffered user lines into the same turn, mirroring
       // TUI queue dequeue behavior (single coalesced submit when idle).
@@ -3205,32 +3703,20 @@ async function runBidirectionalMode(
           parsedCandidate.message?.content !== undefined
         ) {
           lineQueue.shift();
-          if (parsedCandidate._queuedKind === "task_notification") {
-            const notificationText =
-              typeof parsedCandidate.message.content === "string"
-                ? parsedCandidate.message.content
-                : parsedCandidate.message.content
-                    .reduce((texts: string[], part) => {
-                      if (
-                        part.type === "text" &&
-                        "text" in part &&
-                        typeof part.text === "string"
-                      ) {
-                        texts.push(part.text);
-                      }
-                      return texts;
-                    }, [])
-                    .join("");
-            queuedInputs.push({
-              kind: "task_notification",
-              text: notificationText,
-            });
-          } else {
-            queuedInputs.push({
-              kind: "user",
-              content: parsedCandidate.message.content,
-            });
+          const queuedInput = toBidirectionalQueuedInput(
+            parsedCandidate.message.content,
+            parsedCandidate._queuedKind,
+          );
+          if (
+            queuedInput.kind === "user" &&
+            shouldTrackTelemetryForQueuedMessage(parsedCandidate._queuedKind)
+          ) {
+            trackTelemetryUserInputFromContent(
+              parsedCandidate.message.content,
+              telemetryModelId,
+            );
           }
+          queuedInputs.push(queuedInput);
           continue;
         }
 
@@ -3281,9 +3767,11 @@ async function runBidirectionalMode(
             name: agent.name,
             description: agent.description,
             lastRunAt: lastRunAt ?? null,
+            conversationId,
           },
           state: sharedReminderState,
           sessionContextReminderEnabled: systemInfoReminderEnabled,
+          workingDirectory: getCurrentWorkingDirectory(),
           reflectionSettings,
           skillSources,
           resolvePlanModeReminder: async () => {
@@ -3335,8 +3823,15 @@ async function runBidirectionalMode(
           let stream: Awaited<ReturnType<typeof sendMessageStream>>;
           let turnToolContextId: string | null = null;
           try {
+            const turnToolContext = await prepareHeadlessToolExecutionContext({
+              agentId: agent.id,
+              conversationId,
+            });
+            availableTools = turnToolContext.availableTools;
             stream = await sendMessageStream(conversationId, currentInput, {
               agentId: agent.id,
+              preparedToolContext:
+                turnToolContext.preparedToolContext.preparedToolContext,
             });
             turnToolContextId = getStreamToolContextId(stream);
           } catch (preStreamError) {
@@ -3628,12 +4123,12 @@ async function runBidirectionalMode(
             );
 
             // Send approval results back to continue
-            currentInput = [
-              {
-                type: "approval",
-                approvals: executedResults,
-              } as unknown as MessageCreate,
-            ];
+            const approvalInputWithOtid = {
+              type: "approval" as const,
+              approvals: executedResults,
+              otid: randomUUID(),
+            };
+            currentInput = [approvalInputWithOtid as unknown as MessageCreate];
 
             // Continue the loop to process the next stream
             continue;
@@ -3716,6 +4211,11 @@ async function runBidirectionalMode(
       } catch (error) {
         // Use formatErrorDetails for comprehensive error formatting (same as one-shot mode)
         const errorDetails = formatErrorDetails(error, agent.id);
+        trackHeadlessBoundaryError(
+          "headless_bidirectional_runtime_exception",
+          error,
+          "headless_bidirectional_turn",
+        );
         const errorMsg: ErrorMessage = {
           type: "error",
           message: errorDetails,
@@ -3763,5 +4263,5 @@ async function runBidirectionalMode(
 
   // Stdin closed, exit gracefully
   setMessageQueueAdder(null);
-  process.exit(0);
+  await exitBidirectional(0, "headless_bidirectional_stdin_closed");
 }

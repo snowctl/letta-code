@@ -1,9 +1,13 @@
 import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
 import type WebSocket from "ws";
-import type { ApprovalResult } from "../../agent/approval-execution";
+import type {
+  ApprovalDecision,
+  ApprovalResult,
+} from "../../agent/approval-execution";
+import type { ContextTracker } from "../../cli/helpers/contextTracker";
 import type { ApprovalRequest } from "../../cli/helpers/stream";
-
+import type { ApprovalContext } from "../../permissions/analyzer";
 import type {
   DequeuedBatch,
   QueueBlockedReason,
@@ -11,6 +15,7 @@ import type {
   QueueRuntime,
 } from "../../queue/queueRuntime";
 import type { SharedReminderState } from "../../reminders/state";
+import type { ToolsetName, ToolsetPreference } from "../../tools/toolset";
 import type {
   ApprovalResponseBody,
   ControlRequest,
@@ -55,7 +60,7 @@ export interface IncomingMessage {
 }
 
 export interface ModeChangePayload {
-  mode: "default" | "acceptEdits" | "plan" | "bypassPermissions";
+  mode: "default" | "acceptEdits" | "plan" | "memory" | "bypassPermissions";
 }
 
 export interface ChangeCwdMessage {
@@ -87,6 +92,7 @@ export type PendingApprovalResolver = {
 export type RecoveredPendingApproval = {
   approval: ApprovalRequest;
   controlRequest: ControlRequest;
+  approvalContext: ApprovalContext | null;
 };
 
 export type RecoveredApprovalState = {
@@ -95,6 +101,8 @@ export type RecoveredApprovalState = {
   approvalsByRequestId: Map<string, RecoveredPendingApproval>;
   pendingRequestIds: Set<string>;
   responsesByRequestId: Map<string, ApprovalResponseBody>;
+  autoDecisions?: ApprovalDecision[];
+  allApprovals?: ApprovalRequest[];
 };
 
 export type ConversationRuntime = {
@@ -119,6 +127,9 @@ export type ConversationRuntime = {
   pendingTurns: number;
   isRecoveringApprovals: boolean;
   loopStatus: LoopStatus;
+  currentToolset: ToolsetName | null;
+  currentToolsetPreference: ToolsetPreference;
+  currentLoadedTools: string[];
   pendingApprovalBatchByToolCallId: Map<string, string>;
   pendingInterruptedResults: Array<ApprovalResult> | null;
   pendingInterruptedContext: {
@@ -129,6 +140,10 @@ export type ConversationRuntime = {
   continuationEpoch: number;
   activeExecutingToolCallIds: string[];
   pendingInterruptedToolCallIds: string[] | null;
+  /** Per-conversation reminder state (session-context, agent-info, etc.). */
+  reminderState: SharedReminderState;
+  /** Per-conversation tracker for compaction/reflection cadence. */
+  contextTracker: ContextTracker;
 };
 
 export type ListenerRuntime = {
@@ -137,6 +152,8 @@ export type ListenerRuntime = {
   reconnectTimeout: NodeJS.Timeout | null;
   intentionallyClosed: boolean;
   hasSuccessfulConnection: boolean;
+  /** True once the WS has connected at least once. Never reset to false. */
+  everConnected: boolean;
   sessionId: string;
   eventSeqCounter: number;
   lastStopReason: string | null;
@@ -154,11 +171,24 @@ export type ListenerRuntime = {
     string,
     import("./permissionMode").ConversationPermissionModeState
   >;
+  /** Per-conversation reminder state survives ConversationRuntime eviction. */
+  reminderStateByConversation: Map<string, SharedReminderState>;
+  /** Per-conversation context tracker survives ConversationRuntime eviction. */
+  contextTrackerByConversation: Map<string, ContextTracker>;
+  /** Shared recompile coalescing for memory-writing subagents. */
+  systemPromptRecompileByConversation: Map<string, Promise<void>>;
+  queuedSystemPromptRecompileByConversation: Set<string>;
   connectionId: string | null;
   connectionName: string | null;
   conversationRuntimes: Map<string, ConversationRuntime>;
   approvalRuntimeKeyByRequestId: Map<string, string>;
+  /** Agent IDs whose memfs repo has been cloned/pulled this session. Concurrent callers coalesce on the same promise. */
+  memfsSyncedAgents: Map<string, Promise<void>>;
   lastEmittedStatus: "idle" | "receiving" | "processing" | null;
+  /** Unsubscribe from subagent state store (set on socket open, cleared on close). */
+  _unsubscribeSubagentState?: (() => void) | undefined;
+  /** Unsubscribe from subagent stream events (set on socket open, cleared on close). */
+  _unsubscribeSubagentStreamEvents?: (() => void) | undefined;
 };
 
 export interface InterruptPopulateInput {

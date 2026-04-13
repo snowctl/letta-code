@@ -1,10 +1,19 @@
 import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
+import type { LettaStreamingResponse } from "@letta-ai/letta-client/resources/agents/messages";
 import WebSocket from "ws";
+import { getMemoryFilesystemRoot } from "../../agent/memoryFilesystem";
+import { getGitContext } from "../../cli/helpers/gitContext";
+import { getReflectionSettings } from "../../cli/helpers/memoryReminder";
+import { getSubagents } from "../../cli/helpers/subagentState";
 import { permissionMode } from "../../permissions/mode";
 import type { DequeuedBatch } from "../../queue/queueRuntime";
 import { settingsManager } from "../../settings-manager";
-import { getToolNames } from "../../tools/manager";
+import {
+  backgroundProcesses,
+  backgroundTasks,
+} from "../../tools/impl/process_manager";
 import type {
+  BackgroundProcessSummary,
   DeviceStatus,
   DeviceStatusUpdateMessage,
   LoopState,
@@ -18,8 +27,12 @@ import type {
   StopReasonType,
   StreamDelta,
   StreamDeltaMessage,
+  SubagentSnapshot,
+  SubagentStateUpdateMessage,
   WsProtocolMessage,
 } from "../../types/protocol_v2";
+import { isDebugEnabled } from "../../utils/debug";
+import { SUPPORTED_REMOTE_COMMANDS } from "./commands";
 import { SYSTEM_REMINDER_RE } from "./constants";
 import { getConversationWorkingDirectory } from "./cwd";
 import { getConversationPermissionModeState } from "./permissionMode";
@@ -27,6 +40,7 @@ import {
   getConversationRuntime,
   getPendingControlRequests,
   getRecoveredApprovalStateForScope,
+  hasInterruptedCacheForScope,
   nextEventSeq,
   safeEmitWsEvent,
 } from "./runtime";
@@ -42,6 +56,41 @@ import type {
 } from "./types";
 
 type RuntimeCarrier = ListenerRuntime | ConversationRuntime | null;
+
+const GIT_CONTEXT_CACHE_TTL_MS = 15_000;
+const MAX_GIT_CONTEXT_CACHE_ENTRIES = 64;
+const gitContextCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    value: ReturnType<typeof getGitContext>;
+  }
+>();
+
+function getCachedDeviceGitContext(
+  cwd: string,
+): ReturnType<typeof getGitContext> {
+  const now = Date.now();
+  const cached = gitContextCache.get(cwd);
+  if (cached && cached.expiresAt > now) {
+    return cached.value;
+  }
+
+  const value = getGitContext(cwd);
+  gitContextCache.set(cwd, {
+    expiresAt: now + GIT_CONTEXT_CACHE_TTL_MS,
+    value,
+  });
+
+  if (gitContextCache.size > MAX_GIT_CONTEXT_CACHE_ENTRIES) {
+    const oldestKey = gitContextCache.keys().next().value;
+    if (oldestKey) {
+      gitContextCache.delete(oldestKey);
+    }
+  }
+
+  return value;
+}
 
 function getListenerRuntime(runtime: RuntimeCarrier): ListenerRuntime | null {
   if (!runtime) return null;
@@ -67,6 +116,42 @@ function getScopeForRuntime(
   return scope ?? {};
 }
 
+export function buildBackgroundProcessSnapshot(): BackgroundProcessSummary[] {
+  const bashProcesses: BackgroundProcessSummary[] = Array.from(
+    backgroundProcesses.entries(),
+  )
+    .filter(([, proc]) => proc.status === "running")
+    .map(([processId, proc]) => ({
+      process_id: processId,
+      kind: "bash",
+      command: proc.command,
+      started_at_ms: proc.startTime?.getTime() ?? null,
+      status: proc.status,
+      exit_code: proc.exitCode,
+    }));
+
+  const taskProcesses: BackgroundProcessSummary[] = Array.from(
+    backgroundTasks.entries(),
+  )
+    .filter(([, task]) => task.status === "running")
+    .map(([processId, task]) => ({
+      process_id: processId,
+      kind: "agent_task",
+      task_type: task.subagentType,
+      description: task.description,
+      started_at_ms: task.startTime.getTime(),
+      status: task.status,
+      subagent_id: task.subagentId,
+      ...(task.error ? { error: task.error } : {}),
+    }));
+
+  return [...bashProcesses, ...taskProcesses].sort((a, b) => {
+    const aStart = a.started_at_ms ?? 0;
+    const bStart = b.started_at_ms ?? 0;
+    return bStart - aStart;
+  });
+}
+
 export function emitRuntimeStateUpdates(
   runtime: RuntimeCarrier,
   scope?: {
@@ -87,20 +172,25 @@ export function buildDeviceStatus(
 ): DeviceStatus {
   const listener = getListenerRuntime(runtime);
   if (!listener) {
+    const fallbackCwd = process.cwd();
     return {
       current_connection_id: null,
       connection_name: null,
       is_online: false,
       is_processing: false,
       current_permission_mode: permissionMode.getMode(),
-      current_working_directory: process.cwd(),
+      current_working_directory: fallbackCwd,
+      git_context: getCachedDeviceGitContext(fallbackCwd),
       letta_code_version: process.env.npm_package_version || null,
       current_toolset: null,
       current_toolset_preference: "auto",
-      current_loaded_tools: getToolNames(),
+      current_loaded_tools: [],
       current_available_skills: [],
-      background_processes: [],
+      background_processes: buildBackgroundProcessSnapshot(),
       pending_control_requests: [],
+      memory_directory: null,
+      reflection_settings: null,
+      supported_commands: [...SUPPORTED_REMOTE_COMMANDS],
     };
   }
   const scope = getScopeForRuntime(runtime, params);
@@ -127,24 +217,53 @@ export function buildDeviceStatus(
     scopedAgentId,
     scopedConversationId,
   );
+  const interruptedCacheActive = hasInterruptedCacheForScope(listener, scope);
+  const resolvedCwd = getConversationWorkingDirectory(
+    listener,
+    scopedAgentId,
+    scopedConversationId,
+  );
+  const reflectionSettings = (() => {
+    if (!scopedAgentId) {
+      return null;
+    }
+    try {
+      return getReflectionSettings(scopedAgentId, resolvedCwd);
+    } catch {
+      return null;
+    }
+  })();
   return {
     current_connection_id: listener.connectionId,
     connection_name: listener.connectionName,
     is_online: listener.socket?.readyState === WebSocket.OPEN,
     is_processing: !!conversationRuntime?.isProcessing,
     current_permission_mode: conversationPermissionModeState.mode,
-    current_working_directory: getConversationWorkingDirectory(
-      listener,
-      scopedAgentId,
-      scopedConversationId,
-    ),
+    current_working_directory: resolvedCwd,
+    git_context: getCachedDeviceGitContext(resolvedCwd),
     letta_code_version: process.env.npm_package_version || null,
-    current_toolset: toolsetPreference === "auto" ? null : toolsetPreference,
-    current_toolset_preference: toolsetPreference,
-    current_loaded_tools: getToolNames(),
+    current_toolset:
+      conversationRuntime?.currentToolset ??
+      (toolsetPreference === "auto" ? null : toolsetPreference),
+    current_toolset_preference:
+      conversationRuntime?.currentToolsetPreference ?? toolsetPreference,
+    current_loaded_tools: conversationRuntime?.currentLoadedTools ?? [],
     current_available_skills: [],
-    background_processes: [],
-    pending_control_requests: getPendingControlRequests(listener, scope),
+    background_processes: buildBackgroundProcessSnapshot(),
+    pending_control_requests: interruptedCacheActive
+      ? []
+      : getPendingControlRequests(listener, scope),
+    memory_directory: scopedAgentId
+      ? getMemoryFilesystemRoot(scopedAgentId)
+      : null,
+    supported_commands: [...SUPPORTED_REMOTE_COMMANDS],
+    reflection_settings: scopedAgentId
+      ? {
+          agent_id: scopedAgentId,
+          trigger: reflectionSettings?.trigger ?? "compaction-event",
+          step_count: reflectionSettings?.stepCount ?? 25,
+        }
+      : null,
   };
 }
 
@@ -157,28 +276,50 @@ export function buildLoopStatus(
 ): LoopState {
   const listener = getListenerRuntime(runtime);
   if (!listener) {
-    return { status: "WAITING_ON_INPUT", active_run_ids: [] };
+    return {
+      status: "WAITING_ON_INPUT",
+      active_run_ids: [],
+      plan_file_path: null,
+    };
   }
   const scope = getScopeForRuntime(runtime, params);
   const scopedAgentId = resolveScopedAgentId(listener, scope);
   const scopedConversationId = resolveScopedConversationId(listener, scope);
+  const conversationPermissionModeState = getConversationPermissionModeState(
+    listener,
+    scopedAgentId,
+    scopedConversationId,
+  );
   const conversationRuntime = getConversationRuntime(
     listener,
     scopedAgentId,
     scopedConversationId,
   );
+  const interruptedCacheActive = hasInterruptedCacheForScope(listener, scope);
   const recovered = getRecoveredApprovalStateForScope(listener, scope);
-  const status =
-    recovered &&
-    recovered.pendingRequestIds.size > 0 &&
-    conversationRuntime?.loopStatus === "WAITING_ON_INPUT"
+  const status = interruptedCacheActive
+    ? !conversationRuntime?.isProcessing
+      ? "WAITING_ON_INPUT"
+      : conversationRuntime?.loopStatus === "WAITING_ON_APPROVAL"
+        ? "WAITING_ON_INPUT"
+        : (conversationRuntime?.loopStatus ?? "WAITING_ON_INPUT")
+    : recovered &&
+        recovered.pendingRequestIds.size > 0 &&
+        conversationRuntime?.loopStatus === "WAITING_ON_INPUT"
       ? "WAITING_ON_APPROVAL"
       : (conversationRuntime?.loopStatus ?? "WAITING_ON_INPUT");
   return {
     status,
-    active_run_ids: conversationRuntime?.activeRunId
-      ? [conversationRuntime.activeRunId]
-      : [],
+    active_run_ids:
+      interruptedCacheActive && !conversationRuntime?.isProcessing
+        ? []
+        : conversationRuntime?.activeRunId
+          ? [conversationRuntime.activeRunId]
+          : [],
+    plan_file_path:
+      conversationPermissionModeState.mode === "plan"
+        ? conversationPermissionModeState.planFilePath
+        : null,
   };
 }
 
@@ -273,7 +414,9 @@ export function emitProtocolV2Message(
     });
     return;
   }
-  console.log(`[Listen V2] Emitting ${message.type} (seq=${eventSeq})`);
+  if (isDebugEnabled()) {
+    console.log(`[Listen V2] Emitting ${message.type} (seq=${eventSeq})`);
+  }
   safeEmitWsEvent("send", "protocol", outbound);
 }
 
@@ -450,6 +593,104 @@ export function emitStateSync(
   emitDeviceStatusUpdate(socket, runtime, scope);
   emitLoopStatusUpdate(socket, runtime, scope);
   emitQueueUpdate(socket, runtime, scope);
+  emitSubagentStateUpdate(socket, runtime, scope);
+}
+
+// ─────────────────────────────────────────────
+// Subagent state
+// ─────────────────────────────────────────────
+
+function resolveSubagentScopeForSnapshot(
+  runtime: RuntimeCarrier,
+  scope?: {
+    agent_id?: string | null;
+    conversation_id?: string | null;
+  },
+): RuntimeScope | null {
+  const listener = getListenerRuntime(runtime);
+  return resolveRuntimeScope(listener, getScopeForRuntime(runtime, scope));
+}
+
+export function buildSubagentSnapshot(
+  runtime: RuntimeCarrier,
+  scope?: {
+    agent_id?: string | null;
+    conversation_id?: string | null;
+  },
+): SubagentSnapshot[] {
+  const runtimeScope = resolveSubagentScopeForSnapshot(runtime, scope);
+
+  return getSubagents()
+    .filter((a) => {
+      // Include all statuses (pending, running, completed, error) so the
+      // web UI receives the final state with tool calls and agent URL
+      // before the subagent is cleaned up from the store.
+      if (a.silent && a.isBackground !== true) {
+        return false;
+      }
+
+      if (!runtimeScope) {
+        return true;
+      }
+
+      // Scope listener-mode snapshots to the parent runtime that launched
+      // the subagent so active reflection/task state does not bleed across
+      // other agent/conversation tabs.
+      if (!a.parentAgentId || a.parentAgentId !== runtimeScope.agent_id) {
+        return false;
+      }
+      const parentConversationId = a.parentConversationId ?? "default";
+      return parentConversationId === runtimeScope.conversation_id;
+    })
+    .map((a) => ({
+      subagent_id: a.id,
+      subagent_type: a.type,
+      description: a.description,
+      status: a.status,
+      agent_url: a.agentURL,
+      model: a.model,
+      is_background: a.isBackground,
+      silent: a.silent,
+      tool_call_id: a.toolCallId,
+      parent_agent_id: a.parentAgentId,
+      parent_conversation_id: a.parentConversationId,
+      start_time: a.startTime,
+      tool_calls: a.toolCalls,
+      total_tokens: a.totalTokens,
+      duration_ms: a.durationMs,
+      error: a.error,
+    }));
+}
+
+export function emitSubagentStateUpdate(
+  socket: WebSocket,
+  runtime: RuntimeCarrier,
+  scope?: {
+    agent_id?: string | null;
+    conversation_id?: string | null;
+  },
+): void {
+  const message: Omit<
+    SubagentStateUpdateMessage,
+    "runtime" | "event_seq" | "emitted_at" | "idempotency_key"
+  > = {
+    type: "update_subagent_state",
+    subagents: buildSubagentSnapshot(runtime, scope),
+  };
+  emitProtocolV2Message(socket, runtime, message, scope);
+}
+
+export function emitSubagentStateIfOpen(
+  runtime: RuntimeCarrier,
+  scope?: {
+    agent_id?: string | null;
+    conversation_id?: string | null;
+  },
+): void {
+  const listener = getListenerRuntime(runtime);
+  if (listener?.socket?.readyState === WebSocket.OPEN) {
+    emitSubagentStateUpdate(listener.socket, runtime, scope);
+  }
 }
 
 export function scheduleQueueEmit(
@@ -511,6 +752,7 @@ export function emitLoopErrorDelta(
     runId?: string | null;
     agentId?: string | null;
     conversationId?: string | null;
+    apiError?: LettaStreamingResponse.LettaErrorMessage;
   },
 ): void {
   emitCanonicalMessageDelta(
@@ -521,6 +763,7 @@ export function emitLoopErrorDelta(
       message: params.message,
       stop_reason: params.stopReason,
       is_terminal: params.isTerminal,
+      ...(params.apiError ? { api_error: params.apiError } : {}),
     } as StreamDelta,
     {
       agent_id: params.agentId,
@@ -605,6 +848,7 @@ export function emitStreamDelta(
     agent_id?: string | null;
     conversation_id?: string | null;
   },
+  subagentId?: string,
 ): void {
   const message: Omit<
     StreamDeltaMessage,
@@ -612,6 +856,7 @@ export function emitStreamDelta(
   > = {
     type: "stream_delta",
     delta,
+    ...(subagentId ? { subagent_id: subagentId } : {}),
   };
   emitProtocolV2Message(socket, runtime, message, scope);
 }

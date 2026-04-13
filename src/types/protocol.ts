@@ -349,6 +349,8 @@ export interface ResultMessage extends MessageEnvelope {
 export type QueueItemSource =
   | "user"
   | "task_notification"
+  | "cron"
+  | "channel"
   | "subagent"
   | "system";
 
@@ -362,6 +364,7 @@ export type QueueItemSource =
 export type QueueItemKind =
   | "message"
   | "task_notification"
+  | "cron_prompt"
   | "approval_result"
   | "overlay_action";
 

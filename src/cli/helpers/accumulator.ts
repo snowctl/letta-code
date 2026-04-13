@@ -383,6 +383,11 @@ export function markCurrentLineAsFinished(b: Buffers) {
  * @param setInterruptedFlag - Whether to set the interrupted flag (default true).
  *   Pass false when clearing stale tool calls at stream startup to avoid race conditions
  *   with concurrent processConversation calls reading the flag.
+ * @param reason - Why the cancellation is happening.
+ * @param skipMarkCurrentLine - When true, do NOT call markCurrentLineAsFinished.
+ *   Use this when a stream resume will follow: the resume stream will finalize the
+ *   streaming line with its full text, so prematurely marking it finished would
+ *   cause it to be committed to static with truncated content.
  * @returns true if any tool calls were marked as cancelled
  */
 export type CancelReason =
@@ -402,6 +407,7 @@ export function markIncompleteToolsAsCancelled(
   b: Buffers,
   setInterruptedFlag = true,
   reason: CancelReason = "internal_cancel",
+  skipMarkCurrentLine = false,
 ): boolean {
   // Mark buffer as interrupted to skip stale throttled refreshes
   // (only when actually interrupting, not when clearing stale state at startup)
@@ -422,8 +428,12 @@ export function markIncompleteToolsAsCancelled(
       anyToolsCancelled = true;
     }
   }
-  // Also mark any streaming assistant/reasoning lines as finished
-  markCurrentLineAsFinished(b);
+  // Mark any streaming assistant/reasoning lines as finished, unless a resume
+  // is about to follow (in which case the resume stream will finalize it with
+  // full text — marking it now would freeze truncated content in static).
+  if (!skipMarkCurrentLine) {
+    markCurrentLineAsFinished(b);
+  }
   return anyToolsCancelled;
 }
 
@@ -438,7 +448,7 @@ function getStringProp(obj: Record<string, unknown>, key: string) {
   return typeof v === "string" ? v : undefined;
 }
 
-function extractTextPart(v: unknown): string {
+export function extractTextPart(v: unknown): string {
   if (typeof v === "string") return v;
   if (Array.isArray(v)) {
     return v
@@ -723,7 +733,7 @@ export function onChunk(
       }));
       if (delta) {
         const newText = line.text + delta;
-        b.tokenCount += delta.length;
+        b.tokenCount += Buffer.byteLength(delta, "utf8");
 
         // Try to split at paragraph boundary (only if streaming enabled)
         if (!trySplitContent(b, id, "reasoning", newText)) {
@@ -757,7 +767,7 @@ export function onChunk(
       }));
       if (delta) {
         const newText = line.text + delta;
-        b.tokenCount += delta.length;
+        b.tokenCount += Buffer.byteLength(delta, "utf8");
 
         // Try to split at paragraph boundary (only if streaming enabled)
         if (!trySplitContent(b, id, "assistant", newText)) {
@@ -880,7 +890,7 @@ export function onChunk(
         line = updatedLine;
         b.byId.set(id, updatedLine);
         // Count tool call arguments as LLM output tokens
-        b.tokenCount += argsText.length;
+        b.tokenCount += Buffer.byteLength(argsText, "utf8");
       }
 
       // Track server-side tools and trigger PreToolUse hook (fire-and-forget since execution already started)

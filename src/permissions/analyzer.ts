@@ -4,8 +4,14 @@
 import { homedir } from "node:os";
 import { dirname, relative, resolve, win32 } from "node:path";
 import { canonicalToolName, isFileToolName } from "./canonical";
-import { isReadOnlyShellCommand, SAFE_GH_COMMANDS } from "./readOnlyShell";
+import {
+  isReadOnlyShellCommand,
+  SAFE_GH_COMMANDS,
+  SAFE_GIT_SUBCOMMAND_LIST,
+} from "./readOnlyShell";
 import { unwrapShellLauncherCommand } from "./shell-command-normalization";
+
+const SAFE_GIT_COMMANDS: readonly string[] = SAFE_GIT_SUBCOMMAND_LIST;
 
 export interface ApprovalContext {
   // What rule should be saved if user clicks "approve always"
@@ -251,6 +257,17 @@ function analyzeEditApproval(
     relativeDirPath === "" || relativeDirPath === "."
       ? "**"
       : `${relativeDirPath}/**`;
+
+  if (pattern === "**") {
+    return {
+      recommendedRule: "Edit(**)",
+      ruleDescription: "accept edits mode for this session",
+      approveAlwaysText: "Yes, switch to accept edits mode for this session",
+      defaultScope: "session",
+      allowPersistence: true,
+      safetyLevel: "safe",
+    };
+  }
 
   return {
     recommendedRule: `Edit(${pattern})`,
@@ -538,6 +555,20 @@ function getSkillApprovalText(
   return `Yes, and don't ask again for scripts in ${source} skill '${skillName}'`;
 }
 
+function buildPackageStyleRule(
+  fullCommand: string,
+  safetyLevel: "safe" | "moderate",
+): ApprovalContext {
+  return {
+    recommendedRule: `Bash(${fullCommand}:*)`,
+    ruleDescription: `'${fullCommand}' commands`,
+    approveAlwaysText: `Yes, and don't ask again for '${fullCommand}' commands in this project`,
+    defaultScope: "project",
+    allowPersistence: true,
+    safetyLevel,
+  };
+}
+
 function analyzeBashApproval(
   command: string,
   workingDir: string,
@@ -546,6 +577,8 @@ function analyzeBashApproval(
   const parts = normalizedCommand.trim().split(/\s+/);
   const baseCommand = parts[0] || "";
   const firstArg = parts[1] || "";
+  const topLevelGitSubcommand =
+    baseCommand === "git" ? extractGitSubcommand(parts) : null;
 
   // Check if command contains ANY dangerous commands (including in pipelines)
   if (
@@ -593,11 +626,14 @@ function analyzeBashApproval(
 
   // Git commands - be specific to subcommand
   if (baseCommand === "git") {
-    const gitSubcommand = firstArg;
+    const gitSubcommand = topLevelGitSubcommand;
 
     // Safe read-only git commands
-    const safeGitCommands = ["status", "diff", "log", "show", "branch"];
-    if (safeGitCommands.includes(gitSubcommand)) {
+    if (
+      gitSubcommand &&
+      SAFE_GIT_COMMANDS.includes(gitSubcommand) &&
+      isReadOnlyShellCommand(normalizedCommand, { allowExternalPaths: true })
+    ) {
       return {
         recommendedRule: `Bash(git ${gitSubcommand}:*)`,
         ruleDescription: `'git ${gitSubcommand}' commands`,
@@ -609,7 +645,10 @@ function analyzeBashApproval(
     }
 
     // Git write commands - moderate safety
-    if (["push", "pull", "fetch", "commit", "add"].includes(gitSubcommand)) {
+    if (
+      gitSubcommand &&
+      ["push", "pull", "fetch", "commit", "add"].includes(gitSubcommand)
+    ) {
       return {
         recommendedRule: `Bash(git ${gitSubcommand}:*)`,
         ruleDescription: `'git ${gitSubcommand}' commands`,
@@ -646,27 +685,22 @@ function analyzeBashApproval(
     // Handle "npm run test" format (include both "run" and script name)
     if (subcommand === "run" && thirdPart) {
       const fullCommand = `${baseCommand} ${subcommand} ${thirdPart}`;
-      return {
-        recommendedRule: `Bash(${fullCommand}:*)`,
-        ruleDescription: `'${fullCommand}' commands`,
-        approveAlwaysText: `Yes, and don't ask again for '${fullCommand}' commands in this project`,
-        defaultScope: "project",
-        allowPersistence: true,
-        safetyLevel: "safe",
-      };
+      return buildPackageStyleRule(fullCommand, "safe");
     }
 
     // Handle other subcommands (npm install, bun build, etc.)
     if (subcommand) {
       const fullCommand = `${baseCommand} ${subcommand}`;
-      return {
-        recommendedRule: `Bash(${fullCommand}:*)`,
-        ruleDescription: `'${fullCommand}' commands`,
-        approveAlwaysText: `Yes, and don't ask again for '${fullCommand}' commands in this project`,
-        defaultScope: "project",
-        allowPersistence: true,
-        safetyLevel: "safe",
-      };
+      return buildPackageStyleRule(fullCommand, "safe");
+    }
+  }
+
+  // Package executors are useful to generalize, but broader than plain package
+  // manager subcommands because they can invoke arbitrary binaries/packages.
+  if (baseCommand && ["npx", "bunx"].includes(baseCommand)) {
+    const subcommand = firstArg;
+    if (subcommand) {
+      return buildPackageStyleRule(`${baseCommand} ${subcommand}`, "moderate");
     }
   }
 
@@ -718,13 +752,17 @@ function analyzeBashApproval(
 
       // Check if this segment is git command
       if (segmentBase === "git") {
-        const gitSubcommand = segmentArg;
-        const safeGitCommands = ["status", "diff", "log", "show", "branch"];
+        const gitSubcommand = extractGitSubcommand(segmentParts);
         const writeGitCommands = ["push", "pull", "fetch", "commit", "add"];
+        const isReadOnlyGitSegment = isReadOnlyShellCommand(segment, {
+          allowExternalPaths: true,
+        });
 
         if (
-          safeGitCommands.includes(gitSubcommand) ||
-          writeGitCommands.includes(gitSubcommand)
+          gitSubcommand &&
+          ((SAFE_GIT_COMMANDS.includes(gitSubcommand) &&
+            isReadOnlyGitSegment) ||
+            writeGitCommands.includes(gitSubcommand))
         ) {
           return {
             recommendedRule: `Bash(git ${gitSubcommand}:*)`,
@@ -732,7 +770,7 @@ function analyzeBashApproval(
             approveAlwaysText: `Yes, and don't ask again for 'git ${gitSubcommand}' commands in this project`,
             defaultScope: "project",
             allowPersistence: true,
-            safetyLevel: safeGitCommands.includes(gitSubcommand)
+            safetyLevel: SAFE_GIT_COMMANDS.includes(gitSubcommand)
               ? "safe"
               : "moderate",
           };
@@ -751,26 +789,22 @@ function analyzeBashApproval(
 
         if (subcommand === "run" && thirdPart) {
           const fullCommand = `${segmentBase} ${subcommand} ${thirdPart}`;
-          return {
-            recommendedRule: `Bash(${fullCommand}:*)`,
-            ruleDescription: `'${fullCommand}' commands`,
-            approveAlwaysText: `Yes, and don't ask again for '${fullCommand}' commands in this project`,
-            defaultScope: "project",
-            allowPersistence: true,
-            safetyLevel: "safe",
-          };
+          return buildPackageStyleRule(fullCommand, "safe");
         }
 
         if (subcommand) {
           const fullCommand = `${segmentBase} ${subcommand}`;
-          return {
-            recommendedRule: `Bash(${fullCommand}:*)`,
-            ruleDescription: `'${fullCommand}' commands`,
-            approveAlwaysText: `Yes, and don't ask again for '${fullCommand}' commands in this project`,
-            defaultScope: "project",
-            allowPersistence: true,
-            safetyLevel: "safe",
-          };
+          return buildPackageStyleRule(fullCommand, "safe");
+        }
+      }
+
+      if (segmentBase && ["npx", "bunx"].includes(segmentBase)) {
+        const subcommand = segmentArg;
+        if (subcommand) {
+          return buildPackageStyleRule(
+            `${segmentBase} ${subcommand}`,
+            "moderate",
+          );
         }
       }
 
@@ -809,6 +843,69 @@ function analyzeBashApproval(
     allowPersistence: true,
     safetyLevel: "moderate",
   };
+}
+
+function extractGitSubcommand(parts: string[]): string | null {
+  let index = 1;
+  let skipNext = false;
+
+  while (index < parts.length) {
+    const token = parts[index];
+    if (!token) {
+      index += 1;
+      continue;
+    }
+
+    if (skipNext) {
+      skipNext = false;
+      index += 1;
+      continue;
+    }
+
+    if (
+      token === "-C" ||
+      token === "-c" ||
+      token === "--config-env" ||
+      token === "--exec-path" ||
+      token === "--git-dir" ||
+      token === "--namespace" ||
+      token === "--super-prefix" ||
+      token === "--work-tree"
+    ) {
+      skipNext = true;
+      index += 1;
+      continue;
+    }
+
+    if (
+      (token.startsWith("-C") || token.startsWith("-c")) &&
+      token.length > 2
+    ) {
+      index += 1;
+      continue;
+    }
+
+    if (
+      token.startsWith("--config-env=") ||
+      token.startsWith("--exec-path=") ||
+      token.startsWith("--git-dir=") ||
+      token.startsWith("--namespace=") ||
+      token.startsWith("--super-prefix=") ||
+      token.startsWith("--work-tree=")
+    ) {
+      index += 1;
+      continue;
+    }
+
+    if (token === "--" || token.startsWith("-")) {
+      index += 1;
+      continue;
+    }
+
+    return token;
+  }
+
+  return null;
 }
 
 /**

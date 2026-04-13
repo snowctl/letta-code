@@ -13,9 +13,11 @@ import {
   type ClientTool,
   captureToolExecutionContext,
   type PermissionModeState,
+  type PreparedToolExecutionContext,
   waitForToolsetReady,
 } from "../tools/manager";
 import { debugLog, debugWarn, isDebugEnabled } from "../utils/debug";
+import { createStreamAbortRelay } from "../utils/streamAbortRelay";
 import { isTimingsEnabled } from "../utils/timing";
 import {
   type ApprovalNormalizationOptions,
@@ -23,7 +25,7 @@ import {
 } from "./approval-result-normalization";
 import { getClient } from "./client";
 import { buildClientSkillsPayload } from "./clientSkills";
-import { ALL_SKILL_SOURCES } from "./skillSources";
+import { getSkillSources } from "./context";
 
 const streamRequestStartTimes = new WeakMap<object, number>();
 const streamToolContextIds = new WeakMap<object, string>();
@@ -33,6 +35,7 @@ export type StreamRequestContext = {
   resolvedConversationId: string;
   agentId: string | null;
   requestStartedAtMs: number;
+  otid?: string;
 };
 const streamRequestContexts = new WeakMap<object, StreamRequestContext>();
 
@@ -63,6 +66,13 @@ export type SendMessageStreamOptions = {
   /** Per-conversation permission mode state. When provided, tool execution uses
    *  this scoped state instead of the global permissionMode singleton. */
   permissionModeState?: PermissionModeState;
+  /**
+   * Per-request model override. Uses backend request-scoped override_model and
+   * does not mutate agent/conversation persisted model configuration.
+   */
+  overrideModel?: string;
+  /** Explicit turn-scoped tool snapshot. When present, bypasses the global registry. */
+  preparedToolContext?: PreparedToolExecutionContext;
 };
 
 export function buildConversationMessagesCreateRequestBody(
@@ -93,6 +103,7 @@ export function buildConversationMessagesCreateRequestBody(
     client_skills: clientSkills,
     client_tools: clientTools,
     include_compaction_messages: true,
+    ...(opts.overrideModel ? { override_model: opts.overrideModel } : {}),
     ...(isDefaultConversation ? { agent_id: opts.agentId } : {}),
   };
 }
@@ -123,17 +134,22 @@ export async function sendMessageStream(
   const requestStartedAtMs = Date.now();
   const client = await getClient();
 
-  // Wait for any in-progress toolset switch to complete before reading tools
-  // This prevents sending messages with stale tools during a switch
-  await waitForToolsetReady();
-  const { clientTools, contextId } = captureToolExecutionContext(
-    opts.workingDirectory,
-    opts.permissionModeState,
-  );
+  const preparedToolContext = opts.preparedToolContext
+    ? opts.preparedToolContext
+    : await (async () => {
+        // Wait for any in-progress toolset switch to complete before reading tools
+        // This prevents sending messages with stale tools during a switch
+        await waitForToolsetReady();
+        return captureToolExecutionContext(
+          opts.workingDirectory,
+          opts.permissionModeState,
+        );
+      })();
+  const { clientTools, contextId } = preparedToolContext;
   const { clientSkills, errors: clientSkillDiscoveryErrors } =
     await buildClientSkillsPayload({
       agentId: opts.agentId,
-      skillSources: ALL_SKILL_SOURCES,
+      skillSources: getSkillSources(),
     });
 
   const resolvedConversationId = conversationId;
@@ -196,24 +212,28 @@ export async function sendMessageStream(
     })
     .join(",");
 
+  const firstOtid = (messages[0] as unknown as { otid?: string })?.otid;
   debugLog(
     "send-message-stream",
-    "request_start conversation_id=%s agent_id=%s messages=%s stream_tokens=%s background=%s max_retries=%s",
+    "request_start conversation_id=%s agent_id=%s messages=%s otid=%s stream_tokens=%s background=%s max_retries=%s",
     resolvedConversationId,
     opts.agentId ?? "none",
     messageSummary || "(empty)",
+    firstOtid ?? "none",
     opts.streamTokens ?? true,
     opts.background ?? true,
     requestOptions.maxRetries ?? "default",
   );
 
   let stream: Stream<LettaStreamingResponse>;
+  const abortRelay = createStreamAbortRelay(requestOptions.signal);
   try {
     stream = await client.conversations.messages.create(
       resolvedConversationId,
       requestBody,
       {
         ...requestOptions,
+        ...(abortRelay ? { signal: abortRelay.signal } : {}),
         headers: {
           ...((requestOptions.headers as Record<string, string>) ?? {}),
           ...extraHeaders,
@@ -221,10 +241,12 @@ export async function sendMessageStream(
       },
     );
   } catch (error) {
+    abortRelay?.cleanup();
     debugWarn(
       "send-message-stream",
-      "request_error conversation_id=%s status=%s error=%s",
+      "request_error conversation_id=%s otid=%s status=%s error=%s",
       resolvedConversationId,
+      firstOtid ?? "none",
       (error as { status?: number })?.status ?? "none",
       error instanceof Error ? error.message : String(error),
     );
@@ -233,9 +255,12 @@ export async function sendMessageStream(
 
   debugLog(
     "send-message-stream",
-    "request_ok conversation_id=%s",
+    "request_ok conversation_id=%s otid=%s",
     resolvedConversationId,
+    firstOtid ?? "none",
   );
+
+  abortRelay?.attach(stream as object);
 
   if (requestStartTime !== undefined) {
     streamRequestStartTimes.set(stream as object, requestStartTime);
@@ -246,6 +271,7 @@ export async function sendMessageStream(
     resolvedConversationId,
     agentId: opts.agentId ?? null,
     requestStartedAtMs,
+    otid: firstOtid,
   });
 
   return stream;

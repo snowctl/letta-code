@@ -9,8 +9,9 @@ import {
 } from "../../agent/available-models";
 import { models } from "../../agent/model";
 import {
+  buildByokProviderAliases,
+  isByokHandleForSelector,
   listProviders,
-  type ProviderResponse,
 } from "../../providers/byok-providers";
 import { useTerminalWidth } from "../hooks/useTerminalWidth";
 import { colors } from "./colors";
@@ -29,58 +30,8 @@ type ModelCategory =
   | "server-recommended"
   | "server-all";
 
-// BYOK provider prefixes (ChatGPT OAuth + lc-* providers from /connect)
-const STATIC_BYOK_PROVIDER_PREFIXES = ["chatgpt-plus-pro/", "lc-"];
-
-const PROVIDER_TYPE_TO_BASE_PROVIDER: Record<string, string> = {
-  chatgpt_oauth: "chatgpt-plus-pro",
-  anthropic: "anthropic",
-  openai: "openai",
-  zai: "zai",
-  google_ai: "google_ai",
-  google_vertex: "google_vertex",
-  minimax: "minimax",
-  openrouter: "openrouter",
-  bedrock: "bedrock",
-};
-
-export function buildByokProviderAliases(
-  providers: Array<Pick<ProviderResponse, "name" | "provider_type">>,
-): Record<string, string> {
-  const aliases: Record<string, string> = {
-    "lc-anthropic": "anthropic",
-    "lc-openai": "openai",
-    "lc-zai": "zai",
-    "lc-gemini": "google_ai",
-    "chatgpt-plus-pro": "chatgpt-plus-pro",
-  };
-
-  for (const provider of providers) {
-    const baseProvider = PROVIDER_TYPE_TO_BASE_PROVIDER[provider.provider_type];
-    if (baseProvider) {
-      aliases[provider.name] = baseProvider;
-    }
-  }
-
-  return aliases;
-}
-
-export function isByokHandleForSelector(
-  handle: string,
-  byokProviderAliases: Record<string, string>,
-): boolean {
-  if (
-    STATIC_BYOK_PROVIDER_PREFIXES.some((prefix) => handle.startsWith(prefix))
-  ) {
-    return true;
-  }
-
-  const slashIndex = handle.indexOf("/");
-  if (slashIndex === -1) return false;
-
-  const provider = handle.slice(0, slashIndex);
-  return provider in byokProviderAliases;
-}
+// Re-export for consumers that import from ModelSelector
+export { buildByokProviderAliases, isByokHandleForSelector };
 
 // Get tab order for model categories.
 // For self-hosted servers, only show server-specific tabs.
@@ -242,8 +193,14 @@ export function ModelSelector({
   }, []);
 
   const pickPreferredStaticModel = useCallback(
-    (handle: string): UiModel | undefined => {
-      const staticCandidates = typedModels.filter((m) => m.handle === handle);
+    (handle: string, contextWindow?: number): UiModel | undefined => {
+      const staticCandidates = typedModels.filter(
+        (m) =>
+          m.handle === handle &&
+          (contextWindow === undefined ||
+            (m.updateArgs?.context_window as number | undefined) ===
+              contextWindow),
+      );
       return (
         staticCandidates.find((m) => m.isDefault) ??
         staticCandidates.find((m) => m.isFeatured) ??
@@ -290,15 +247,18 @@ export function ModelSelector({
       );
     }
 
-    // Deduplicate by handle: keep one representative entry per unique handle.
+    // Deduplicate by handle+context_window: keep one representative entry per unique combo.
     // Models with multiple reasoning tiers (e.g., gpt-5.3-codex none/low/med/high/max)
     // share the same handle — the ModelReasoningSelector handles tier selection after pick.
+    // Models with different context_window (e.g., 200k vs 1M) show separately.
     const seen = new Set<string>();
     const deduped: UiModel[] = [];
     for (const m of available) {
-      if (seen.has(m.handle)) continue;
-      seen.add(m.handle);
-      deduped.push(pickPreferredStaticModel(m.handle) ?? m);
+      const contextWindow = m.updateArgs?.context_window as number | undefined;
+      const key = `${m.handle}:${contextWindow ?? 0}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(pickPreferredStaticModel(m.handle, contextWindow) ?? m);
     }
 
     const featured = deduped.filter((m) => m.isFeatured);
@@ -458,13 +418,15 @@ export function ModelSelector({
           m.handle.toLowerCase().includes(query),
       );
     }
-    // Deduplicate by handle (same as supportedModels)
+    // Deduplicate by handle+context_window (same as supportedModels)
     const seen = new Set<string>();
     const deduped: UiModel[] = [];
     for (const m of available) {
-      if (seen.has(m.handle)) continue;
-      seen.add(m.handle);
-      deduped.push(pickPreferredStaticModel(m.handle) ?? m);
+      const contextWindow = m.updateArgs?.context_window as number | undefined;
+      const key = `${m.handle}:${contextWindow ?? 0}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(pickPreferredStaticModel(m.handle, contextWindow) ?? m);
     }
     return deduped;
   }, [

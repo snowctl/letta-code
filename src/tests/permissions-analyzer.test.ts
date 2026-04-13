@@ -30,6 +30,73 @@ test("Git status suggests safe subcommand rule", () => {
   expect(context.safetyLevel).toBe("safe");
 });
 
+test("Git -C status suggests safe subcommand rule", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    { command: "git -C /Users/test/project status --short" },
+    "/Users/test",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(git status:*)");
+  expect(context.approveAlwaysText).toContain("git status");
+  expect(context.safetyLevel).toBe("safe");
+});
+
+test("Git -C remote suggests safe subcommand rule", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    { command: "git -C /Users/test/project remote -v || true" },
+    "/Users/test",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(git remote:*)");
+  expect(context.safetyLevel).toBe("safe");
+});
+
+test("Git branch --list suggests safe subcommand rule", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    { command: "git branch --list 'feature/*'" },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(git branch:*)");
+  expect(context.safetyLevel).toBe("safe");
+});
+
+test("Git branch mutation suggests moderate safety rule", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    { command: "git branch feature/new-work" },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(git branch:*)");
+  expect(context.safetyLevel).toBe("moderate");
+});
+
+test("Git read-only subcommand with unsafe flag suggests moderate safety rule", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    { command: "git show --ext-diff HEAD" },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(git show:*)");
+  expect(context.safetyLevel).toBe("moderate");
+});
+
+test("Git global config override is parsed to true subcommand and remains moderate", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    { command: "git -c core.pager=cat status" },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(git status:*)");
+  expect(context.safetyLevel).toBe("moderate");
+});
+
 test("Git push suggests moderate safety rule", () => {
   const context = analyzeApprovalContext(
     "Bash",
@@ -155,6 +222,19 @@ test("bun run commands suggest safe rule", () => {
 
   expect(context.recommendedRule).toBe("Bash(bun run lint:*)");
   expect(context.safetyLevel).toBe("safe");
+});
+
+test("npx commands suggest moderate wildcard rule", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    { command: "npx tsc --noEmit --project libs/types/tsconfig.lib.json" },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(npx tsc:*)");
+  expect(context.approveAlwaysText).toContain("npx tsc");
+  expect(context.safetyLevel).toBe("moderate");
+  expect(context.defaultScope).toBe("project");
 });
 
 test("yarn commands suggest safe rule", () => {
@@ -402,7 +482,7 @@ test("Edit suggests directory pattern for project-level", () => {
   expect(context.safetyLevel).toBe("safe");
 });
 
-test("Edit at project root suggests project pattern", () => {
+test("Edit at project root suggests accept edits mode for this session", () => {
   if (process.platform === "win32") return; // Skip on Windows - Unix paths
 
   const context = analyzeApprovalContext(
@@ -411,7 +491,9 @@ test("Edit at project root suggests project pattern", () => {
     "/Users/test/project",
   );
 
-  expect(context.approveAlwaysText).toContain("project");
+  expect(context.recommendedRule).toBe("Edit(**)");
+  expect(context.approveAlwaysText).toContain("accept edits mode");
+  expect(context.defaultScope).toBe("session");
   expect(context.safetyLevel).toBe("safe");
 });
 
@@ -587,6 +669,21 @@ test("Very long non-git commands should generate prefix-based wildcards", () => 
   // Should generate wildcard for "npm run lint"
   expect(context.recommendedRule).toBe("Bash(npm run lint:*)");
   expect(context.approveAlwaysText).toContain("npm run lint");
+});
+
+test("Complex npx tsc commands strip cd and pipe suffixes when building approval rules", () => {
+  const context = analyzeApprovalContext(
+    "Bash",
+    {
+      command:
+        'cd /Users/test/project && npx tsc --noEmit --project libs/utils-server/tsconfig.lib.json 2>&1 | grep -i handleStatus || echo "No errors"',
+    },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(npx tsc:*)");
+  expect(context.approveAlwaysText).toContain("npx tsc");
+  expect(context.approveAlwaysText).not.toContain("...");
 });
 
 test("WriteFileGemini uses write-family wildcard rule", () => {

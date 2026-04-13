@@ -1,6 +1,8 @@
 // src/cli/commands/registry.ts
 // Registry of available CLI commands
 
+import { handleSecretCommand } from "./secret";
+
 type CommandHandler = (args: string[]) => Promise<string> | string;
 
 interface Command {
@@ -58,9 +60,17 @@ export const commands: Record<string, Command> = {
     },
   },
   "/reflect": {
-    desc: "Launch a background reflection agent to update memory",
+    desc: "Launch reflection (/reflect [transcript_file])",
+    args: "[transcript_file]",
     order: 50,
-    noArgs: true,
+    handler: () => {
+      // Handled specially in App.tsx
+      return "Launching reflection agent...";
+    },
+  },
+  "/reflection": {
+    desc: "Alias for /reflect",
+    args: "[transcript_file]",
     handler: () => {
       // Handled specially in App.tsx
       return "Launching reflection agent...";
@@ -174,6 +184,23 @@ export const commands: Record<string, Command> = {
       return "Starting new conversation...";
     },
   },
+  "/fork": {
+    desc: "Fork the current conversation",
+    order: 20.5,
+    noArgs: true,
+    handler: () => {
+      // Handled specially in App.tsx to fork current conversation
+      return "Forking conversation...";
+    },
+  },
+  "/btw": {
+    desc: "Fork conversation and ask a side question (/btw <question>)",
+    order: 20.6,
+    handler: () => {
+      // Handled specially in App.tsx to fork and ask in background
+      return "Forking conversation...";
+    },
+  },
   "/pin": {
     desc: "Pin current agent globally, or use -l for local only",
     order: 22,
@@ -244,6 +271,15 @@ export const commands: Record<string, Command> = {
       return "Opening system prompt selector...";
     },
   },
+  "/personality": {
+    desc: "Switch personality",
+    order: 30.5,
+    noArgs: true,
+    handler: () => {
+      // Handled specially in App.tsx to open personality selector
+      return "Opening personality selector...";
+    },
+  },
   "/subagents": {
     desc: "Manage custom subagents",
     order: 31,
@@ -259,6 +295,15 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to show MCP server selector
       return "Opening MCP server manager...";
+    },
+  },
+  "/secret": {
+    desc: "Manage secrets for shell commands",
+    order: 33,
+    args: "<set|list|unset> [key] [value]",
+    handler: async (args: string[]) => {
+      const result = await handleSecretCommand(args);
+      return result.output;
     },
   },
   "/usage": {

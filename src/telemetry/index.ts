@@ -4,8 +4,17 @@ import { settingsManager } from "../settings-manager";
 import { debugLogFile } from "../utils/debug";
 import { getVersion } from "../version";
 
+export type TelemetrySurface = "tui" | "headless" | "websocket";
+
 export interface TelemetryEvent {
-  type: "session_start" | "session_end" | "tool_usage" | "error" | "user_input";
+  type:
+    | "session_start"
+    | "session_end"
+    | "tool_usage"
+    | "error"
+    | "user_input"
+    | "reflection_start"
+    | "reflection_end";
   timestamp: string;
   data: Record<string, unknown>;
 }
@@ -63,17 +72,48 @@ export interface UserInputData {
   model_id: string;
 }
 
+export interface ReflectionStartData {
+  trigger_source: "manual" | "step-count" | "compaction-event";
+  subagent_id?: string;
+  conversation_id?: string;
+  start_message_id?: string;
+  end_message_id?: string;
+}
+
+export interface ReflectionEndData {
+  trigger_source: "manual" | "step-count" | "compaction-event";
+  success: boolean;
+  subagent_id?: string;
+  conversation_id?: string;
+  error?: string;
+}
+
 class TelemetryManager {
   private events: TelemetryEvent[] = [];
   private sessionId: string;
   private deviceId: string | null = null;
   private currentAgentId: string | null = null;
+  private surface: TelemetrySurface = "tui";
   private sessionStartTime: number;
   private messageCount = 0;
   private toolCallCount = 0;
   private sessionEndTracked = false;
+  private initialized = false;
   private flushInterval: NodeJS.Timeout | null = null;
   private serverVersion: string | null = null;
+
+  private async resolveTelemetryApiKey(): Promise<string | undefined> {
+    if (process.env.LETTA_API_KEY) {
+      return process.env.LETTA_API_KEY;
+    }
+
+    try {
+      const settings = await settingsManager.getSettingsWithSecureTokens();
+      return settings.env?.LETTA_API_KEY || undefined;
+    } catch {
+      return undefined;
+    }
+  }
   private readonly FLUSH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
   private readonly MAX_BATCH_SIZE = 100;
   private sessionStatsGetter?: () => {
@@ -115,12 +155,28 @@ class TelemetryManager {
   }
 
   /**
+   * Check if the user is connected to Letta Cloud (api.letta.com)
+   */
+  private isCloudUser(): boolean {
+    try {
+      return getServerUrl().includes("api.letta.com");
+    } catch {
+      // Settings not initialized yet — check env var directly
+      return (
+        !process.env.LETTA_BASE_URL ||
+        process.env.LETTA_BASE_URL.includes("api.letta.com")
+      );
+    }
+  }
+
+  /**
    * Initialize telemetry and start periodic flushing
    */
   init() {
-    if (!this.isTelemetryEnabled()) {
+    if (!this.isTelemetryEnabled() || this.initialized) {
       return;
     }
+    this.initialized = true;
 
     // Initialize device ID (persistent across sessions)
     this.deviceId = settingsManager.getOrCreateDeviceId();
@@ -159,6 +215,36 @@ class TelemetryManager {
       process.exit(0);
     });
 
+    process.on("uncaughtException", (error) => {
+      try {
+        this.trackError(
+          "uncaught_exception",
+          error instanceof Error ? error.message : String(error),
+          "process_uncaught_exception",
+        );
+        this.flush().catch(() => {
+          // Silently ignore
+        });
+      } catch {
+        // Silently ignore - don't prevent process from exiting
+      }
+    });
+
+    process.on("unhandledRejection", (reason) => {
+      try {
+        this.trackError(
+          "unhandled_rejection",
+          reason instanceof Error ? reason.message : String(reason),
+          "process_unhandled_rejection",
+        );
+        this.flush().catch(() => {
+          // Silently ignore
+        });
+      } catch {
+        // Silently ignore - don't prevent process from exiting
+      }
+    });
+
     // TODO: Add telemetry for crashes and abnormal exits
     // Current limitation: We can't reliably flush telemetry on process.on("exit")
     // because the event loop is shut down and async operations don't work.
@@ -178,7 +264,9 @@ class TelemetryManager {
       | SessionEndData
       | ToolUsageData
       | ErrorData
-      | UserInputData,
+      | UserInputData
+      | ReflectionStartData
+      | ReflectionEndData,
   ) {
     if (!this.isTelemetryEnabled()) {
       return;
@@ -191,6 +279,7 @@ class TelemetryManager {
         ...data,
         session_id: this.sessionId,
         agent_id: this.currentAgentId || undefined,
+        surface: this.surface,
       },
     };
 
@@ -212,6 +301,10 @@ class TelemetryManager {
    */
   setCurrentAgentId(agentId: string | null) {
     this.currentAgentId = agentId;
+  }
+
+  setSurface(surface: TelemetrySurface) {
+    this.surface = surface;
   }
 
   /**
@@ -409,6 +502,11 @@ class TelemetryManager {
       recentChunks?: Record<string, unknown>[];
     },
   ) {
+    // Skip error telemetry for self-hosted users to avoid spamming cloud analytics
+    if (!this.isCloudUser()) {
+      return;
+    }
+
     const data: ErrorData = {
       error_type: errorType,
       error_message: errorMessage,
@@ -443,6 +541,50 @@ class TelemetryManager {
   }
 
   /**
+   * Track reflection start events (manual and auto-triggered).
+   */
+  trackReflectionStart(
+    triggerSource: "manual" | "step-count" | "compaction-event",
+    options?: {
+      subagentId?: string;
+      conversationId?: string;
+      startMessageId?: string;
+      endMessageId?: string;
+    },
+  ) {
+    const data: ReflectionStartData = {
+      trigger_source: triggerSource,
+      subagent_id: options?.subagentId,
+      conversation_id: options?.conversationId,
+      start_message_id: options?.startMessageId,
+      end_message_id: options?.endMessageId,
+    };
+    this.track("reflection_start", data);
+  }
+
+  /**
+   * Track reflection completion events.
+   */
+  trackReflectionEnd(
+    triggerSource: "manual" | "step-count" | "compaction-event",
+    success: boolean,
+    options?: {
+      subagentId?: string;
+      conversationId?: string;
+      error?: string;
+    },
+  ) {
+    const data: ReflectionEndData = {
+      trigger_source: triggerSource,
+      success,
+      subagent_id: options?.subagentId,
+      conversation_id: options?.conversationId,
+      error: options?.error,
+    };
+    this.track("reflection_end", data);
+  }
+
+  /**
    * Flush events to the server
    */
   async flush(): Promise<void> {
@@ -453,7 +595,7 @@ class TelemetryManager {
     const eventsToSend = [...this.events];
     this.events = [];
 
-    const apiKey = process.env.LETTA_API_KEY;
+    const apiKey = await this.resolveTelemetryApiKey();
 
     try {
       // Add 5 second timeout to prevent telemetry from blocking shutdown
@@ -499,6 +641,7 @@ class TelemetryManager {
       clearInterval(this.flushInterval);
       this.flushInterval = null;
     }
+    this.initialized = false;
   }
 }
 

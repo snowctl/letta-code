@@ -6,9 +6,10 @@
  * action. No network calls, no React, no stream-json output.
  */
 
+import { randomUUID } from "node:crypto";
 import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
-import { isCloudflareEdge52xHtmlError } from "../cli/helpers/errorFormatter";
+import { isCloudflareEdge52xErrorText } from "../cli/helpers/errorFormatter";
 import { isZaiNonRetryableError } from "../cli/helpers/zaiErrors";
 
 // ── Error fragment constants ────────────────────────────────────────
@@ -71,7 +72,15 @@ const EMPTY_RESPONSE_RETRY_BASE_DELAY_MS = 500;
 
 function isCloudflareEdge52xDetail(detail: unknown): boolean {
   if (typeof detail !== "string") return false;
-  return isCloudflareEdge52xHtmlError(detail);
+  return isCloudflareEdge52xErrorText(detail);
+}
+
+/**
+ * Explicit classifier for quota-limit style errors that should not use
+ * transient retry logic. Used by client-side fallback paths.
+ */
+export function isQuotaLimitErrorDetail(detail: unknown): boolean {
+  return hasNonRetryableQuotaDetail(detail);
 }
 
 function hasNonRetryableQuotaDetail(detail: unknown): boolean {
@@ -368,7 +377,10 @@ export function rebuildInputWithFreshDenials(
   serverApprovals: PendingApprovalInfo[],
   denialReason: string,
 ): Array<MessageCreate | ApprovalCreate> {
-  const stripped = currentInput.filter((item) => item?.type !== "approval");
+  // Refresh OTIDs on all stripped messages — this is a new request, not a retry
+  const stripped = currentInput
+    .filter((item) => item?.type !== "approval")
+    .map((item) => ({ ...item, otid: randomUUID() }));
 
   if (serverApprovals.length > 0) {
     const denials: ApprovalCreate = {
@@ -379,6 +391,7 @@ export function rebuildInputWithFreshDenials(
         approve: false,
         reason: denialReason,
       })),
+      otid: randomUUID(),
     };
     return [denials, ...stripped];
   }

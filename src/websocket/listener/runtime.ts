@@ -1,3 +1,5 @@
+import { createContextTracker } from "../../cli/helpers/contextTracker";
+import { createSharedReminderState } from "../../reminders/state";
 import type { PendingControlRequest } from "../../types/protocol_v2";
 import {
   normalizeConversationId,
@@ -148,9 +150,13 @@ export function createConversationRuntime(
 ): ConversationRuntime {
   const normalizedAgentId = normalizeCwdAgentId(agentId);
   const normalizedConversationId = normalizeConversationId(conversationId);
+  const runtimeKey = getConversationRuntimeKey(
+    normalizedAgentId,
+    normalizedConversationId,
+  );
   const conversationRuntime: ConversationRuntime = {
     listener,
-    key: getConversationRuntimeKey(normalizedAgentId, normalizedConversationId),
+    key: runtimeKey,
     agentId: normalizedAgentId,
     conversationId: normalizedConversationId,
     messageQueue: Promise.resolve(),
@@ -170,12 +176,29 @@ export function createConversationRuntime(
     pendingTurns: 0,
     isRecoveringApprovals: false,
     loopStatus: "WAITING_ON_INPUT",
+    currentToolset: null,
+    currentToolsetPreference: "auto",
+    currentLoadedTools: [],
     pendingApprovalBatchByToolCallId: new Map(),
     pendingInterruptedResults: null,
     pendingInterruptedContext: null,
     continuationEpoch: 0,
     activeExecutingToolCallIds: [],
     pendingInterruptedToolCallIds: null,
+    reminderState:
+      listener.reminderStateByConversation.get(runtimeKey) ??
+      (() => {
+        const state = createSharedReminderState();
+        listener.reminderStateByConversation.set(runtimeKey, state);
+        return state;
+      })(),
+    contextTracker:
+      listener.contextTrackerByConversation.get(runtimeKey) ??
+      (() => {
+        const tracker = createContextTracker();
+        listener.contextTrackerByConversation.set(runtimeKey, tracker);
+        return tracker;
+      })(),
   };
   listener.conversationRuntimes.set(
     conversationRuntime.key,
@@ -335,6 +358,37 @@ export function getPendingControlRequests(
   }
 
   return requests;
+}
+
+export function hasInterruptedCacheForScope(
+  runtime: ListenerRuntime,
+  params?: {
+    agent_id?: string | null;
+    conversation_id?: string | null;
+  },
+): boolean {
+  const scopedAgentId = resolveScopedAgentId(runtime, params);
+  const scopedConversationId = resolveScopedConversationId(runtime, params);
+  const conversationRuntime = getConversationRuntime(
+    runtime,
+    scopedAgentId,
+    scopedConversationId,
+  );
+  if (!conversationRuntime) {
+    return false;
+  }
+
+  const context = conversationRuntime.pendingInterruptedContext;
+  if (
+    context &&
+    context.agentId === (scopedAgentId ?? "") &&
+    context.conversationId === scopedConversationId &&
+    context.continuationEpoch === conversationRuntime.continuationEpoch
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 export function getPendingControlRequestCount(

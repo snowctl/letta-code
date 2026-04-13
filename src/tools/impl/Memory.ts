@@ -14,6 +14,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { getClient } from "../../agent/client";
 import { getCurrentAgentId } from "../../agent/context";
+import { maybeUpdateMemoryRemoteOrigin } from "../../agent/memoryGit";
 import { validateRequiredParams } from "./validation";
 
 const execFile = promisify(execFileCb);
@@ -29,7 +30,7 @@ type MemoryCommand =
 interface MemoryArgs {
   command: MemoryCommand;
   reason: string;
-  path?: string;
+  file_path?: string;
   old_path?: string;
   new_path?: string;
   old_string?: string;
@@ -105,13 +106,13 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
   const command = args.command;
 
   if (command === "create") {
-    const pathArg = requireString(args.path, "path", "create");
+    const pathArg = requireString(args.file_path, "file_path", "create");
     const description = requireString(
       args.description,
       "description",
       "create",
     );
-    const label = normalizeMemoryLabel(memoryDir, pathArg, "path");
+    const label = normalizeMemoryLabel(memoryDir, pathArg, "file_path");
     const filePath = resolveMemoryFilePath(memoryDir, label);
     const relPath = toRepoRelative(memoryDir, filePath);
 
@@ -131,7 +132,7 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
     await writeFile(filePath, rendered, "utf8");
     affectedPaths = [relPath];
   } else if (command === "str_replace") {
-    const pathArg = requireString(args.path, "path", "str_replace");
+    const pathArg = requireString(args.file_path, "file_path", "str_replace");
     const oldString = requireString(
       args.old_string,
       "old_string",
@@ -143,7 +144,7 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
       "str_replace",
     );
 
-    const label = normalizeMemoryLabel(memoryDir, pathArg, "path");
+    const label = normalizeMemoryLabel(memoryDir, pathArg, "file_path");
     const filePath = resolveMemoryFilePath(memoryDir, label);
     const relPath = toRepoRelative(memoryDir, filePath);
     const file = await loadEditableMemoryFile(filePath, pathArg);
@@ -160,7 +161,7 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
     await writeFile(filePath, rendered, "utf8");
     affectedPaths = [relPath];
   } else if (command === "insert") {
-    const pathArg = requireString(args.path, "path", "insert");
+    const pathArg = requireString(args.file_path, "file_path", "insert");
     const insertText = requireString(args.insert_text, "insert_text", "insert");
 
     if (
@@ -170,7 +171,7 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
       throw new Error("memory insert: 'insert_line' must be a number");
     }
 
-    const label = normalizeMemoryLabel(memoryDir, pathArg, "path");
+    const label = normalizeMemoryLabel(memoryDir, pathArg, "file_path");
     const filePath = resolveMemoryFilePath(memoryDir, label);
     const relPath = toRepoRelative(memoryDir, filePath);
     const file = await loadEditableMemoryFile(filePath, pathArg);
@@ -190,8 +191,8 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
     await writeFile(filePath, rendered, "utf8");
     affectedPaths = [relPath];
   } else if (command === "delete") {
-    const pathArg = requireString(args.path, "path", "delete");
-    const label = normalizeMemoryLabel(memoryDir, pathArg, "path");
+    const pathArg = requireString(args.file_path, "file_path", "delete");
+    const label = normalizeMemoryLabel(memoryDir, pathArg, "file_path");
     const targetPath = resolveMemoryPath(memoryDir, label);
 
     if (existsSync(targetPath) && (await stat(targetPath)).isDirectory()) {
@@ -230,14 +231,18 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
     await rename(oldFilePath, newFilePath);
     affectedPaths = [oldRelPath, newRelPath];
   } else if (command === "update_description") {
-    const pathArg = requireString(args.path, "path", "update_description");
+    const pathArg = requireString(
+      args.file_path,
+      "file_path",
+      "update_description",
+    );
     const newDescription = requireString(
       args.description,
       "description",
       "update_description",
     );
 
-    const label = normalizeMemoryLabel(memoryDir, pathArg, "path");
+    const label = normalizeMemoryLabel(memoryDir, pathArg, "file_path");
     const filePath = resolveMemoryFilePath(memoryDir, label);
     const relPath = toRepoRelative(memoryDir, filePath);
     const file = await loadEditableMemoryFile(filePath, pathArg);
@@ -268,6 +273,9 @@ export async function memory(args: MemoryArgs): Promise<MemoryResult> {
       message: `Memory ${command} made no effective changes; skipped commit and push.`,
     };
   }
+
+  // Emit memory_updated push event so web UI auto-refreshes
+  emitMemoryUpdated(affectedPaths);
 
   return {
     message: `Memory ${command} applied and pushed (${commitResult.sha?.slice(0, 7) ?? "unknown"}).`,
@@ -561,18 +569,28 @@ async function commitAndPush(
   const authorName = agentName.trim() || agentId;
   const authorEmail = `${agentId}@letta.com`;
 
-  await runGit(memoryDir, [
-    "-c",
-    `user.name=${authorName}`,
-    "-c",
-    `user.email=${authorEmail}`,
-    "commit",
-    "-m",
-    reason,
-  ]);
+  try {
+    await runGit(memoryDir, [
+      "-c",
+      `user.name=${authorName}`,
+      "-c",
+      `user.email=${authorEmail}`,
+      "commit",
+      "-m",
+      reason,
+    ]);
+  } catch (error) {
+    // If commit fails (e.g. pre-commit hook rejects staged changes),
+    // unstage just the paths this memory operation added so future memory
+    // commands do not inherit stale staged entries.
+    await unstagePaths(memoryDir, pathspecs);
+    throw error;
+  }
 
   const head = await runGit(memoryDir, ["rev-parse", "HEAD"]);
   const sha = head.stdout.trim();
+
+  await maybeUpdateMemoryRemoteOrigin(memoryDir, agentId);
 
   try {
     await runGit(memoryDir, ["push"]);
@@ -589,6 +607,21 @@ async function commitAndPush(
   };
 }
 
+async function unstagePaths(
+  memoryDir: string,
+  pathspecs: string[],
+): Promise<void> {
+  if (pathspecs.length === 0) {
+    return;
+  }
+
+  try {
+    await runGit(memoryDir, ["reset", "HEAD", "--", ...pathspecs]);
+  } catch {
+    // Best-effort cleanup only — keep original error from commit path.
+  }
+}
+
 function requireString(
   value: string | undefined,
   field: string,
@@ -598,4 +631,37 @@ function requireString(
     throw new Error(`memory ${command}: '${field}' must be a non-empty string`);
   }
   return value;
+}
+
+/**
+ * Emit a `memory_updated` push event over the WebSocket so the web UI
+ * can auto-refresh its memory index without polling.
+ */
+function emitMemoryUpdated(affectedPaths: string[]): void {
+  try {
+    // Lazy-import to avoid circular deps — this file is loaded before WS infra
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { getActiveRuntime } =
+      require("../../websocket/listener/runtime") as {
+        getActiveRuntime: () => {
+          socket: { readyState: number; send: (data: string) => void } | null;
+        } | null;
+      };
+
+    const runtime = getActiveRuntime();
+    const socket = runtime?.socket;
+    if (!socket || socket.readyState !== 1 /* WebSocket.OPEN */) {
+      return;
+    }
+
+    socket.send(
+      JSON.stringify({
+        type: "memory_updated",
+        affected_paths: affectedPaths,
+        timestamp: Date.now(),
+      }),
+    );
+  } catch {
+    // Best-effort — never break tool execution for a push event
+  }
 }

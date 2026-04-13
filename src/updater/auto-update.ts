@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { trackBoundaryError } from "../telemetry/errorReporting";
 import { getVersion } from "../version";
 
 const execFileAsync = promisify(execFile);
@@ -39,6 +40,7 @@ const INSTALL_ARG_PREFIX: Record<PackageManager, string[]> = {
 };
 
 const VALID_PACKAGE_MANAGERS = new Set<string>(Object.keys(INSTALL_ARG_PREFIX));
+type FetchImpl = typeof fetch;
 
 function normalizeUpdatePackageName(raw: string | undefined): string | null {
   if (!raw) return null;
@@ -180,7 +182,9 @@ function isRunningLocally(): boolean {
   return !resolvedPath.includes("node_modules");
 }
 
-export async function checkForUpdate(): Promise<UpdateCheckResult> {
+export async function checkForUpdate(
+  fetchImpl: FetchImpl = fetch,
+): Promise<UpdateCheckResult> {
   const currentVersion = getVersion();
   debugLog("Current version:", currentVersion);
 
@@ -197,7 +201,7 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 
   try {
     debugLog("Checking registry for latest version:", latestUrl);
-    const res = await fetch(latestUrl, {
+    const res = await fetchImpl(latestUrl, {
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) {
@@ -220,6 +224,11 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
     }
     debugLog("Already on latest version");
   } catch (error) {
+    trackBoundaryError({
+      errorType: "auto_update_check_failed",
+      error,
+      context: "updater_check",
+    });
     debugLog("Failed to check for updates:", error);
     return {
       updateAvailable: false,
@@ -296,6 +305,11 @@ async function performUpdate(): Promise<{
     debugLog("Update completed successfully");
     return { success: true };
   } catch (error) {
+    trackBoundaryError({
+      errorType: "auto_update_install_failed",
+      error,
+      context: "updater_install",
+    });
     const errorMsg = error instanceof Error ? error.message : String(error);
 
     // ENOTEMPTY retry is npm-specific
@@ -308,6 +322,11 @@ async function performUpdate(): Promise<{
         debugLog("Update succeeded after cleanup retry");
         return { success: true };
       } catch (retryError) {
+        trackBoundaryError({
+          errorType: "auto_update_install_retry_failed",
+          error: retryError,
+          context: "updater_install_retry",
+        });
         const retryMsg =
           retryError instanceof Error ? retryError.message : String(retryError);
         debugLog("Update failed after retry:", retryMsg);
@@ -342,6 +361,11 @@ async function performUpdate(): Promise<{
         debugLog("Update succeeded after race condition retry");
         return { success: true };
       } catch (retryError) {
+        trackBoundaryError({
+          errorType: "auto_update_race_retry_failed",
+          error: retryError,
+          context: "updater_install_race_retry",
+        });
         const retryMsg =
           retryError instanceof Error ? retryError.message : String(retryError);
         debugLog("Update failed after race condition retry:", retryMsg);

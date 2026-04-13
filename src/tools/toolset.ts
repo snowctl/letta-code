@@ -1,9 +1,13 @@
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
 import { getClient } from "../agent/client";
 import { resolveModel } from "../agent/model";
+import { getActiveChannelIds } from "../channels/registry";
+import { settingsManager } from "../settings-manager";
 import { toolFilter } from "./filter";
 import {
+  ANTHROPIC_DEFAULT_TOOLS,
   clearToolsWithLock,
+  GEMINI_DEFAULT_TOOLS,
   GEMINI_PASCAL_TOOLS,
   getToolNames,
   isGeminiModel,
@@ -12,7 +16,12 @@ import {
   loadTools,
   OPENAI_DEFAULT_TOOLS,
   OPENAI_PASCAL_TOOLS,
+  type PermissionModeState,
+  type PreparedToolExecutionContext,
+  prepareToolExecutionContextForModel,
+  prepareToolExecutionContextForSpecificTools,
 } from "./manager";
+import type { ToolName } from "./toolDefinitions";
 
 // Toolset definitions from manager.ts (single source of truth)
 // Keep these as direct references at call-sites (not top-level aliases) to avoid
@@ -47,6 +56,184 @@ export function deriveToolsetFromModel(
     : isGeminiModel(resolvedModel)
       ? "gemini"
       : "default";
+}
+
+type ScopeModelCarrier = Pick<AgentState, "model" | "llm_config">;
+
+export type PreparedScopeToolContext = {
+  preparedToolContext: PreparedToolExecutionContext;
+  toolset: ToolsetName;
+  toolsetPreference: ToolsetPreference;
+  effectiveModel: string | null;
+};
+
+function buildModelHandleFromLlmConfig(
+  llmConfig:
+    | {
+        model?: string | null;
+        model_endpoint_type?: string | null;
+      }
+    | null
+    | undefined,
+): string | null {
+  if (!llmConfig) return null;
+  if (llmConfig.model_endpoint_type && llmConfig.model) {
+    return `${llmConfig.model_endpoint_type}/${llmConfig.model}`;
+  }
+  return llmConfig.model ?? null;
+}
+
+function getPreferredAgentModelHandle(
+  agent: ScopeModelCarrier | null | undefined,
+): string | null {
+  if (!agent) return null;
+  if (typeof agent.model === "string" && agent.model.length > 0) {
+    return agent.model;
+  }
+  return buildModelHandleFromLlmConfig(agent.llm_config);
+}
+
+function getToolNamesForToolset(toolsetName: ToolsetName): ToolName[] {
+  let tools: ToolName[];
+  switch (toolsetName) {
+    case "codex":
+      tools = [...OPENAI_PASCAL_TOOLS];
+      break;
+    case "codex_snake":
+      tools = [...OPENAI_DEFAULT_TOOLS];
+      break;
+    case "gemini":
+      tools = [...GEMINI_PASCAL_TOOLS];
+      break;
+    case "gemini_snake":
+      tools = [...GEMINI_DEFAULT_TOOLS];
+      break;
+    case "none":
+      return [];
+    default:
+      tools = [...ANTHROPIC_DEFAULT_TOOLS];
+      break;
+  }
+
+  // Append channel tool if channels are active (covers ALL pinned toolsets)
+  if (
+    getActiveChannelIds().length > 0 &&
+    !tools.includes("MessageChannel" as ToolName)
+  ) {
+    tools.push("MessageChannel" as ToolName);
+  }
+
+  return tools;
+}
+
+export async function prepareToolExecutionContextForResolvedTarget(params: {
+  modelIdentifier?: string | null;
+  toolsetPreference: ToolsetPreference;
+  exclude?: ToolName[];
+  workingDirectory?: string;
+  permissionModeState?: PermissionModeState;
+}): Promise<PreparedScopeToolContext> {
+  const {
+    modelIdentifier,
+    toolsetPreference,
+    exclude,
+    workingDirectory,
+    permissionModeState,
+  } = params;
+  const effectiveModel =
+    modelIdentifier && modelIdentifier.length > 0
+      ? (resolveModel(modelIdentifier) ?? modelIdentifier)
+      : null;
+
+  if (toolsetPreference === "auto") {
+    const preparedToolContext = await prepareToolExecutionContextForModel(
+      effectiveModel ?? undefined,
+      {
+        exclude,
+        workingDirectory,
+        permissionModeState,
+      },
+    );
+
+    return {
+      preparedToolContext,
+      toolset: effectiveModel
+        ? deriveToolsetFromModel(effectiveModel)
+        : "default",
+      toolsetPreference,
+      effectiveModel,
+    };
+  }
+
+  const preparedToolContext = await prepareToolExecutionContextForSpecificTools(
+    getToolNamesForToolset(toolsetPreference).filter((toolName) =>
+      exclude ? !exclude.includes(toolName) : true,
+    ),
+    {
+      workingDirectory,
+      permissionModeState,
+    },
+  );
+
+  return {
+    preparedToolContext,
+    toolset: toolsetPreference,
+    toolsetPreference,
+    effectiveModel,
+  };
+}
+
+export async function prepareToolExecutionContextForScope(params: {
+  agentId: string;
+  conversationId?: string | null;
+  overrideModel?: string | null;
+  exclude?: ToolName[];
+  workingDirectory?: string;
+  permissionModeState?: PermissionModeState;
+}): Promise<PreparedScopeToolContext> {
+  const {
+    agentId,
+    conversationId,
+    overrideModel,
+    exclude,
+    workingDirectory,
+    permissionModeState,
+  } = params;
+
+  const client = await getClient();
+  const agent = (await client.agents.retrieve(agentId)) as ScopeModelCarrier;
+  let effectiveModel =
+    overrideModel && overrideModel.length > 0
+      ? (resolveModel(overrideModel) ?? overrideModel)
+      : null;
+
+  if (!effectiveModel && conversationId && conversationId !== "default") {
+    const conversation = await client.conversations.retrieve(conversationId);
+    const conversationModel = (conversation as { model?: string | null }).model;
+    if (typeof conversationModel === "string" && conversationModel.length > 0) {
+      effectiveModel = conversationModel;
+    }
+  }
+
+  if (!effectiveModel) {
+    effectiveModel = getPreferredAgentModelHandle(agent);
+  }
+
+  const toolsetPreference = (() => {
+    try {
+      return settingsManager.getToolsetPreference(agentId);
+    } catch {
+      return "auto" as const;
+    }
+  })();
+
+  return prepareToolExecutionContextForResolvedTarget({
+    modelIdentifier: effectiveModel,
+    toolsetPreference,
+    exclude,
+    workingDirectory,
+    permissionModeState,
+  });
 }
 
 /**

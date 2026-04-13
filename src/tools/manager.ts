@@ -1,6 +1,7 @@
 import { getDisplayableToolReturn } from "../agent/approval-execution";
 import { getModelInfo } from "../agent/model";
 import { getAllSubagentConfigs } from "../agent/subagents";
+import { getActiveChannelIds } from "../channels/registry";
 import { refreshFileIndex } from "../cli/helpers/fileIndex";
 import { INTERRUPTED_BY_USER } from "../constants";
 import {
@@ -15,37 +16,48 @@ import {
 import { OPENAI_CODEX_PROVIDER_NAME } from "../providers/openai-codex-provider";
 import { telemetry } from "../telemetry";
 import { debugLog } from "../utils/debug";
+import {
+  scrubSecretsFromString,
+  substituteSecretsInArgs,
+} from "./secret-substitution";
 import { TOOL_DEFINITIONS, type ToolName } from "./toolDefinitions";
 
-/**
- * Tools that may create, modify, or delete files on disk.
- * After any of these complete successfully, the file index is refreshed
- * in the background so subsequent @ searches reflect the latest state.
- */
-const FILE_MODIFYING_TOOLS = new Set([
-  // Anthropic toolset
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "Bash",
-  "ApplyPatch",
-  // Codex toolset
-  "Shell",
-  "shell",
-  "ShellCommand",
-  "shell_command",
-  "apply_patch",
-  "memory_apply_patch",
-  // Gemini toolset
-  "Replace",
-  "replace",
-  "WriteFileGemini",
-  "write_file_gemini",
-  "RunShellCommand",
-  "run_shell_command",
-]);
-
 export const TOOL_NAMES = Object.keys(TOOL_DEFINITIONS) as ToolName[];
+
+/**
+ * Append MessageChannel tool if any channels are active.
+ * Used by both resolveBaseToolNamesForModel() and getToolNamesForToolset().
+ */
+function maybeAppendChannelTools(toolNames: ToolName[]): ToolName[] {
+  if (
+    getActiveChannelIds().length > 0 &&
+    !toolNames.includes("MessageChannel" as ToolName)
+  ) {
+    return [...toolNames, "MessageChannel" as ToolName];
+  }
+  return toolNames;
+}
+
+/**
+ * Inject channel enum into MessageChannel schema if channels are active.
+ * Used by both buildRegistryForModel() and buildSpecificToolRegistry().
+ */
+function maybeInjectChannelEnum(
+  name: string,
+  schema: Record<string, unknown>,
+): Record<string, unknown> {
+  if (name !== "MessageChannel") return schema;
+  const activeChannels = getActiveChannelIds();
+  if (activeChannels.length === 0) return schema;
+  const injected = structuredClone(schema);
+  const props = injected.properties as
+    | Record<string, Record<string, unknown>>
+    | undefined;
+  if (props?.channel) {
+    props.channel.enum = activeChannels;
+  }
+  return injected;
+}
 const STREAMING_SHELL_TOOLS = new Set([
   "Bash",
   "BashOutput",
@@ -193,8 +205,9 @@ const TOOL_PERMISSIONS: Record<ToolName, { requiresApproval: boolean }> = {
   KillBash: { requiresApproval: true },
   TaskStop: { requiresApproval: true },
   LS: { requiresApproval: false },
-  memory: { requiresApproval: true },
-  memory_apply_patch: { requiresApproval: true },
+  memory: { requiresApproval: false },
+  memory_apply_patch: { requiresApproval: false },
+  MessageChannel: { requiresApproval: false },
   MultiEdit: { requiresApproval: true },
   Read: { requiresApproval: false },
   view_image: { requiresApproval: false },
@@ -338,6 +351,10 @@ type ToolExecutionContextSnapshot = {
 export type CapturedToolExecutionContext = {
   contextId: string;
   clientTools: ClientTool[];
+};
+
+export type PreparedToolExecutionContext = CapturedToolExecutionContext & {
+  loadedToolNames: string[];
 };
 
 function getExecutionContexts(): Map<string, ToolExecutionContextSnapshot> {
@@ -629,36 +646,35 @@ export async function executeExternalTool(
  * Includes both built-in tools and external tools.
  */
 export function getClientToolsFromRegistry(): ClientTool[] {
-  // Get built-in tools
-  const builtInTools = Array.from(toolRegistry.entries()).map(
-    ([name, tool]) => {
-      const serverName = getServerToolName(name);
-      return {
-        name: serverName,
-        description: tool.schema.description,
-        parameters: tool.schema.input_schema,
-      };
-    },
-  );
-
-  // Add external tools
-  const externalTools = getExternalToolsAsClientTools();
-
-  return [...builtInTools, ...externalTools];
+  return buildClientToolsFromSnapshot(toolRegistry, getExternalToolsRegistry());
 }
 
-/**
- * Capture a turn-scoped tool snapshot and corresponding client_tools payload.
- * The returned context id can be used later to execute tool calls against this
- * exact snapshot even if the global registry changes between dispatch and execute.
- */
-export function captureToolExecutionContext(
-  workingDirectory: string = process.env.USER_CWD || process.cwd(),
+function buildClientToolsFromSnapshot(
+  registry: ToolRegistry,
+  externalTools: Map<string, ExternalToolDefinition>,
+): ClientTool[] {
+  const builtInTools = Array.from(registry.entries()).map(([name, tool]) => ({
+    name: getServerToolName(name),
+    description: tool.schema.description,
+    parameters: tool.schema.input_schema,
+  }));
+  const externalClientTools = Array.from(externalTools.values()).map(
+    (tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    }),
+  );
+
+  return [...builtInTools, ...externalClientTools];
+}
+
+function getEffectivePermissionModeState(
   permissionModeState?: PermissionModeState,
-): CapturedToolExecutionContext {
+): PermissionModeState {
   // When no scoped state is provided (local/CLI mode), create a live proxy to
   // the global singleton so EnterPlanMode/ExitPlanMode still work correctly.
-  const effectivePermissionModeState: PermissionModeState =
+  return (
     permissionModeState ?? {
       get mode() {
         return globalPermissionMode.getMode();
@@ -678,35 +694,103 @@ export function captureToolExecutionContext(
       set modeBeforePlan(_value: PermissionMode | null) {
         // managed internally by globalPermissionMode
       },
-    };
-  const snapshot: ToolExecutionContextSnapshot = {
-    toolRegistry: new Map(toolRegistry),
-    externalTools: new Map(getExternalToolsRegistry()),
-    externalExecutor: getExternalToolExecutor(),
-    workingDirectory,
-    permissionModeState: effectivePermissionModeState,
-  };
-  const contextId = saveExecutionContext(snapshot);
+    }
+  );
+}
 
-  const builtInTools = Array.from(snapshot.toolRegistry.entries()).map(
-    ([name, tool]) => ({
-      name: getServerToolName(name),
-      description: tool.schema.description,
-      parameters: tool.schema.input_schema,
-    }),
-  );
-  const externalTools = Array.from(snapshot.externalTools.values()).map(
-    (tool) => ({
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-    }),
-  );
+function capturePreparedToolExecutionContext(
+  snapshot: {
+    toolRegistry: ToolRegistry;
+    externalTools: Map<string, ExternalToolDefinition>;
+    externalExecutor?: ExternalToolExecutor;
+  },
+  options?: {
+    workingDirectory?: string;
+    permissionModeState?: PermissionModeState;
+  },
+): PreparedToolExecutionContext {
+  const executionSnapshot: ToolExecutionContextSnapshot = {
+    toolRegistry: new Map(snapshot.toolRegistry),
+    externalTools: new Map(snapshot.externalTools),
+    externalExecutor: snapshot.externalExecutor,
+    workingDirectory:
+      options?.workingDirectory ?? process.env.USER_CWD ?? process.cwd(),
+    permissionModeState: getEffectivePermissionModeState(
+      options?.permissionModeState,
+    ),
+  };
+  const contextId = saveExecutionContext(executionSnapshot);
 
   return {
     contextId,
-    clientTools: [...builtInTools, ...externalTools],
+    clientTools: buildClientToolsFromSnapshot(
+      executionSnapshot.toolRegistry,
+      executionSnapshot.externalTools,
+    ),
+    loadedToolNames: Array.from(executionSnapshot.toolRegistry.keys()),
   };
+}
+
+/**
+ * Capture a turn-scoped tool snapshot and corresponding client_tools payload.
+ * The returned context id can be used later to execute tool calls against this
+ * exact snapshot even if the global registry changes between dispatch and execute.
+ */
+export function captureToolExecutionContext(
+  workingDirectory: string = process.env.USER_CWD || process.cwd(),
+  permissionModeState?: PermissionModeState,
+): CapturedToolExecutionContext {
+  return capturePreparedToolExecutionContext(
+    {
+      toolRegistry: new Map(toolRegistry),
+      externalTools: new Map(getExternalToolsRegistry()),
+      externalExecutor: getExternalToolExecutor(),
+    },
+    {
+      workingDirectory,
+      permissionModeState,
+    },
+  );
+}
+
+export async function prepareToolExecutionContextForSpecificTools(
+  toolNames: string[],
+  options?: {
+    workingDirectory?: string;
+    permissionModeState?: PermissionModeState;
+  },
+): Promise<PreparedToolExecutionContext> {
+  const toolRegistrySnapshot = await buildSpecificToolRegistry(toolNames);
+  return capturePreparedToolExecutionContext(
+    {
+      toolRegistry: toolRegistrySnapshot,
+      externalTools: new Map(getExternalToolsRegistry()),
+      externalExecutor: getExternalToolExecutor(),
+    },
+    options,
+  );
+}
+
+export async function prepareToolExecutionContextForModel(
+  modelIdentifier?: string,
+  options?: {
+    exclude?: ToolName[];
+    workingDirectory?: string;
+    permissionModeState?: PermissionModeState;
+  },
+): Promise<PreparedToolExecutionContext> {
+  const toolRegistrySnapshot = await buildRegistryForModel(
+    modelIdentifier,
+    options,
+  );
+  return capturePreparedToolExecutionContext(
+    {
+      toolRegistry: toolRegistrySnapshot,
+      externalTools: new Map(getExternalToolsRegistry()),
+      externalExecutor: getExternalToolExecutor(),
+    },
+    options,
+  );
 }
 
 async function withExecutionWorkingDirectory<T>(
@@ -834,6 +918,166 @@ function replaceRegistry(newTools: ToolRegistry): void {
   }
 }
 
+function maybeApplyLspReadOverride(registry: ToolRegistry): void {
+  if (!process.env.LETTA_ENABLE_LSP || !registry.has("Read")) {
+    return;
+  }
+
+  const lspDefinition = TOOL_DEFINITIONS.ReadLSP;
+  if (!lspDefinition) {
+    return;
+  }
+
+  registry.set("Read", {
+    schema: {
+      name: "Read",
+      description: lspDefinition.description,
+      input_schema: lspDefinition.schema,
+    },
+    fn: lspDefinition.impl,
+  });
+}
+
+async function buildSpecificToolRegistry(
+  toolNames: string[],
+): Promise<ToolRegistry> {
+  const { toolFilter } = await import("./filter");
+  const newRegistry: ToolRegistry = new Map();
+
+  for (const name of toolNames) {
+    if (!toolFilter.isEnabled(name)) {
+      continue;
+    }
+
+    const internalName = getInternalToolName(name);
+    const definition = TOOL_DEFINITIONS[internalName as ToolName];
+    if (!definition) {
+      console.warn(
+        `Tool ${name} (internal: ${internalName}) not found in definitions, skipping`,
+      );
+      continue;
+    }
+
+    if (!definition.impl) {
+      throw new Error(`Tool implementation not found for ${internalName}`);
+    }
+
+    const toolSchema: ToolSchema = {
+      name: internalName,
+      description: definition.description,
+      input_schema: maybeInjectChannelEnum(internalName, definition.schema),
+    };
+
+    newRegistry.set(internalName, {
+      schema: toolSchema,
+      fn: definition.impl,
+    });
+  }
+
+  maybeApplyLspReadOverride(newRegistry);
+  return newRegistry;
+}
+
+async function resolveBaseToolNamesForModel(
+  modelIdentifier?: string,
+  options?: { exclude?: ToolName[] },
+): Promise<ToolName[]> {
+  const { toolFilter } = await import("./filter");
+  let baseToolNames: ToolName[];
+  if (
+    !toolFilter.isActive() &&
+    modelIdentifier &&
+    isGeminiModel(modelIdentifier)
+  ) {
+    baseToolNames = GEMINI_PASCAL_TOOLS;
+  } else if (
+    !toolFilter.isActive() &&
+    modelIdentifier &&
+    isOpenAIModel(modelIdentifier)
+  ) {
+    baseToolNames = OPENAI_PASCAL_TOOLS;
+  } else if (!toolFilter.isActive()) {
+    baseToolNames = ANTHROPIC_DEFAULT_TOOLS;
+  } else {
+    baseToolNames = TOOL_NAMES;
+  }
+
+  if (options?.exclude && options.exclude.length > 0) {
+    const excludeSet = new Set(options.exclude);
+    baseToolNames = baseToolNames.filter((name) => !excludeSet.has(name));
+  }
+
+  // Append channel tool if channels are active
+  baseToolNames = maybeAppendChannelTools(baseToolNames);
+
+  return baseToolNames;
+}
+
+async function buildRegistryForModel(
+  modelIdentifier?: string,
+  options?: { exclude?: ToolName[] },
+): Promise<ToolRegistry> {
+  const { toolFilter } = await import("./filter");
+  const allSubagentConfigs = await getAllSubagentConfigs();
+  const discoveredSubagents = Object.entries(allSubagentConfigs).map(
+    ([name, config]) => ({
+      name,
+      description: config.description,
+      recommendedModel: config.recommendedModel,
+    }),
+  );
+  const baseToolNames = await resolveBaseToolNamesForModel(
+    modelIdentifier,
+    options,
+  );
+  const newRegistry: ToolRegistry = new Map();
+
+  for (const name of baseToolNames) {
+    if (!toolFilter.isEnabled(name)) {
+      continue;
+    }
+
+    try {
+      const definition = TOOL_DEFINITIONS[name];
+      if (!definition) {
+        throw new Error(`Missing tool definition for ${name}`);
+      }
+
+      if (!definition.impl) {
+        throw new Error(`Tool implementation not found for ${name}`);
+      }
+
+      let description = definition.description;
+      if (name === "Task" && discoveredSubagents.length > 0) {
+        description = injectSubagentsIntoTaskDescription(
+          description,
+          discoveredSubagents,
+        );
+      }
+
+      const toolSchema: ToolSchema = {
+        name,
+        description,
+        input_schema: maybeInjectChannelEnum(name, definition.schema),
+      };
+
+      newRegistry.set(name, {
+        schema: toolSchema,
+        fn: definition.impl,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : JSON.stringify(error);
+      throw new Error(
+        `Required tool "${name}" could not be loaded from bundled assets. ${message}`,
+      );
+    }
+  }
+
+  maybeApplyLspReadOverride(newRegistry);
+  return newRegistry;
+}
+
 /**
  * Loads specific tools by name into the registry.
  * Used when resuming an agent to load only the tools attached to that agent.
@@ -848,47 +1092,7 @@ export async function loadSpecificTools(toolNames: string[]): Promise<void> {
   acquireSwitchLock();
 
   try {
-    // Import filter once, outside the loop (avoids repeated async yields)
-    const { toolFilter } = await import("./filter");
-
-    // Build new registry in a temporary map (all async work happens here)
-    const newRegistry: ToolRegistry = new Map();
-
-    for (const name of toolNames) {
-      // Skip if tool filter is active and this tool is not enabled
-      if (!toolFilter.isEnabled(name)) {
-        continue;
-      }
-
-      // Map server-facing name to our internal tool name
-      const internalName = getInternalToolName(name);
-
-      const definition = TOOL_DEFINITIONS[internalName as ToolName];
-      if (!definition) {
-        console.warn(
-          `Tool ${name} (internal: ${internalName}) not found in definitions, skipping`,
-        );
-        continue;
-      }
-
-      if (!definition.impl) {
-        throw new Error(`Tool implementation not found for ${internalName}`);
-      }
-
-      const toolSchema: ToolSchema = {
-        name: internalName,
-        description: definition.description,
-        input_schema: definition.schema,
-      };
-
-      // Add to temporary registry
-      newRegistry.set(internalName, {
-        schema: toolSchema,
-        fn: definition.impl,
-      });
-    }
-
-    // Atomic swap - no yields between clear and populate
+    const newRegistry = await buildSpecificToolRegistry(toolNames);
     replaceRegistry(newRegistry);
   } finally {
     // Always release the lock, even if an error occurred
@@ -917,104 +1121,7 @@ export async function loadTools(
   acquireSwitchLock();
 
   try {
-    const { toolFilter } = await import("./filter");
-
-    // Get all subagents (built-in + custom) to inject into Task description
-    const allSubagentConfigs = await getAllSubagentConfigs();
-    const discoveredSubagents = Object.entries(allSubagentConfigs).map(
-      ([name, config]) => ({
-        name,
-        description: config.description,
-        recommendedModel: config.recommendedModel,
-      }),
-    );
-    const filterActive = toolFilter.isActive();
-
-    let baseToolNames: ToolName[];
-    if (!filterActive && modelIdentifier && isGeminiModel(modelIdentifier)) {
-      baseToolNames = GEMINI_PASCAL_TOOLS;
-    } else if (
-      !filterActive &&
-      modelIdentifier &&
-      isOpenAIModel(modelIdentifier)
-    ) {
-      baseToolNames = OPENAI_PASCAL_TOOLS;
-    } else if (!filterActive) {
-      baseToolNames = ANTHROPIC_DEFAULT_TOOLS;
-    } else {
-      // When user explicitly sets --tools, respect that and allow any tool name
-      baseToolNames = TOOL_NAMES;
-    }
-
-    // Apply exclusions (e.g. remove interactive-only tools in headless mode)
-    if (options?.exclude && options.exclude.length > 0) {
-      const excludeSet = new Set(options.exclude);
-      baseToolNames = baseToolNames.filter((name) => !excludeSet.has(name));
-    }
-
-    // Build new registry in a temporary map (all async work happens above)
-    const newRegistry: ToolRegistry = new Map();
-
-    for (const name of baseToolNames) {
-      if (!toolFilter.isEnabled(name)) {
-        continue;
-      }
-
-      try {
-        const definition = TOOL_DEFINITIONS[name];
-        if (!definition) {
-          throw new Error(`Missing tool definition for ${name}`);
-        }
-
-        if (!definition.impl) {
-          throw new Error(`Tool implementation not found for ${name}`);
-        }
-
-        // For Task tool, inject discovered subagent descriptions
-        let description = definition.description;
-        if (name === "Task" && discoveredSubagents.length > 0) {
-          description = injectSubagentsIntoTaskDescription(
-            description,
-            discoveredSubagents,
-          );
-        }
-
-        const toolSchema: ToolSchema = {
-          name,
-          description,
-          input_schema: definition.schema,
-        };
-
-        newRegistry.set(name, {
-          schema: toolSchema,
-          fn: definition.impl,
-        });
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : JSON.stringify(error);
-        throw new Error(
-          `Required tool "${name}" could not be loaded from bundled assets. ${message}`,
-        );
-      }
-    }
-
-    // If LSP is enabled, swap Read with LSP-enhanced version
-    if (process.env.LETTA_ENABLE_LSP && newRegistry.has("Read")) {
-      const lspDefinition = TOOL_DEFINITIONS.ReadLSP;
-      if (lspDefinition) {
-        // Replace Read with ReadLSP (but keep the name "Read" for the agent)
-        newRegistry.set("Read", {
-          schema: {
-            name: "Read", // Keep the tool name as "Read" for the agent
-            description: lspDefinition.description,
-            input_schema: lspDefinition.schema,
-          },
-          fn: lspDefinition.impl,
-        });
-      }
-    }
-
-    // Atomic swap - no yields between clear and populate
+    const newRegistry = await buildRegistryForModel(modelIdentifier, options);
     replaceRegistry(newRegistry);
   } finally {
     // Always release the lock, even if an error occurred
@@ -1259,6 +1366,7 @@ export async function executeTool(
     toolCallId?: string;
     onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
     toolContextId?: string;
+    parentScope?: { agentId: string; conversationId: string };
   },
 ): Promise<ToolExecutionResult> {
   const context = options?.toolContextId
@@ -1331,9 +1439,12 @@ export async function executeTool(
       if (options?.onOutput) {
         enhancedArgs = { ...enhancedArgs, onOutput: options.onOutput };
       }
+
+      // Substitute $SECRET_NAME patterns with actual secret values
+      enhancedArgs = substituteSecretsInArgs(enhancedArgs);
     }
 
-    // Inject toolCallId and abort signal for Task tool
+    // Inject toolCallId, abort signal, and parent scope for Task tool
     if (internalName === "Task") {
       if (options?.toolCallId) {
         enhancedArgs = { ...enhancedArgs, toolCallId: options.toolCallId };
@@ -1341,11 +1452,19 @@ export async function executeTool(
       if (options?.signal) {
         enhancedArgs = { ...enhancedArgs, signal: options.signal };
       }
+      if (options?.parentScope) {
+        enhancedArgs = { ...enhancedArgs, parentScope: options.parentScope };
+      }
     }
 
     // Inject toolCallId for Skill tool (used for skill content registry)
     if (internalName === "Skill" && options?.toolCallId) {
       enhancedArgs = { ...enhancedArgs, toolCallId: options.toolCallId };
+    }
+
+    // Inject parent scope for MessageChannel tool (per-execution, not global singleton)
+    if (internalName === "MessageChannel" && options?.parentScope) {
+      enhancedArgs = { ...enhancedArgs, parentScope: options.parentScope };
     }
 
     // Inject the execution context id for plan-mode tools so they can update
@@ -1368,11 +1487,11 @@ export async function executeTool(
     );
     const duration = Date.now() - startTime;
 
-    // Refresh the file index in the background after file-modifying tools
-    // so subsequent @ searches reflect newly created or deleted files.
-    if (FILE_MODIFYING_TOOLS.has(internalName)) {
-      void refreshFileIndex();
-    }
+    // Refresh the file index in the background after every tool execution
+    // so subsequent @ searches reflect externally created or deleted files.
+    // The incremental rebuild is cheap (metadata-based skip for unchanged
+    // subtrees), so running on every tool adds negligible overhead.
+    void refreshFileIndex();
 
     // Extract stdout/stderr if present (for bash tools)
     const recordResult = isRecord(result) ? result : undefined;
@@ -1385,7 +1504,36 @@ export async function executeTool(
     const toolStatus = recordResult?.status === "error" ? "error" : "success";
 
     // Flatten the response to plain text
-    const flattenedResponse = flattenToolResponse(result);
+    let flattenedResponse = flattenToolResponse(result);
+
+    // Scrub secret values from tool output so they don't leak into agent context
+    if (STREAMING_SHELL_TOOLS.has(internalName)) {
+      if (typeof flattenedResponse === "string") {
+        flattenedResponse = scrubSecretsFromString(flattenedResponse);
+      } else if (Array.isArray(flattenedResponse)) {
+        flattenedResponse = flattenedResponse.map((block) =>
+          block.type === "text"
+            ? { ...block, text: scrubSecretsFromString(block.text) }
+            : block,
+        );
+      }
+      if (stdout) {
+        for (let i = 0; i < stdout.length; i++) {
+          const line = stdout[i];
+          if (line !== undefined) {
+            stdout[i] = scrubSecretsFromString(line);
+          }
+        }
+      }
+      if (stderr) {
+        for (let i = 0; i < stderr.length; i++) {
+          const line = stderr[i];
+          if (line !== undefined) {
+            stderr[i] = scrubSecretsFromString(line);
+          }
+        }
+      }
+    }
 
     // Track tool usage (calculate size for multimodal content)
     const responseSize =
