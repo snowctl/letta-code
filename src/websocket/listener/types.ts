@@ -5,6 +5,7 @@ import type {
   ApprovalDecision,
   ApprovalResult,
 } from "../../agent/approval-execution";
+import type { ChannelTurnSource } from "../../channels/types";
 import type { ContextTracker } from "../../cli/helpers/contextTracker";
 import type { ApprovalRequest } from "../../cli/helpers/stream";
 import type { ApprovalContext } from "../../permissions/analyzer";
@@ -54,6 +55,7 @@ export interface IncomingMessage {
   type: "message";
   agentId?: string;
   conversationId?: string;
+  channelTurnSources?: ChannelTurnSource[];
   messages: Array<
     (MessageCreate & { client_message_id?: string }) | ApprovalCreate
   >;
@@ -110,6 +112,7 @@ export type ConversationRuntime = {
   key: string;
   agentId: string | null;
   conversationId: string;
+  activeChannelTurnSources: ChannelTurnSource[] | null;
   messageQueue: Promise<void>;
   pendingApprovalResolvers: Map<string, PendingApprovalResolver>;
   recoveredApprovalState: RecoveredApprovalState | null;
@@ -182,6 +185,11 @@ export type ListenerRuntime = {
   connectionName: string | null;
   conversationRuntimes: Map<string, ConversationRuntime>;
   approvalRuntimeKeyByRequestId: Map<string, string>;
+  /** Per-conversation worktree directory watchers for CWD auto-detection fallback. */
+  worktreeWatcherByConversation: Map<
+    string,
+    import("./worktree-watcher").WorktreeWatcherState
+  >;
   /** Agent IDs whose memfs repo has been cloned/pulled this session. Concurrent callers coalesce on the same promise. */
   memfsSyncedAgents: Map<string, Promise<void>>;
   lastEmittedStatus: "idle" | "receiving" | "processing" | null;
