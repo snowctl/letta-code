@@ -922,6 +922,7 @@ test("callback_query deny synthesizes deny text and edits the button message", a
   });
 
   const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
   if (!bot) throw new Error("bot not found");
   bot.api.sendMessage.mockClear();
 
@@ -980,6 +981,7 @@ test("callback_query option synthesizes the option label and edits the button me
   });
 
   const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
   if (!bot) throw new Error("bot not found");
   bot.api.sendMessage.mockClear();
 

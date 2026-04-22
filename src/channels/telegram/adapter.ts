@@ -391,6 +391,116 @@ export function createTelegramAdapter(
       }
     });
 
+    instance.on("callback_query", async (ctx) => {
+      const query = (
+        ctx as {
+          callbackQuery?: {
+            id: string;
+            data?: string;
+            from: {
+              id: string | number;
+              username?: string;
+              first_name?: string;
+            };
+            message?: {
+              chat: { id: string | number };
+              message_id: number;
+            };
+          };
+        }
+      ).callbackQuery;
+      if (!query) return;
+
+      try {
+        await instance.api.answerCallbackQuery(query.id);
+      } catch (error) {
+        console.error("[Telegram] Failed to answer callback query:", error);
+      }
+
+      type CallbackPayload =
+        | { requestId: string; action: "approve" | "deny" }
+        | { requestId: string; action: "option"; value: string }
+        | { requestId: string; action: "deny_reason" | "freeform" };
+
+      let payload: CallbackPayload;
+      try {
+        payload = JSON.parse(query.data ?? "") as CallbackPayload;
+      } catch {
+        console.error("[Telegram] Malformed callback_data:", query.data);
+        return;
+      }
+
+      const { requestId, action } = payload;
+      const buttonEntry = buttonMessages.get(requestId);
+      if (!buttonEntry) return;
+
+      const chatId = String(query.message?.chat.id ?? buttonEntry.chatId);
+      const senderId = String(query.from.id);
+      const senderName =
+        query.from.username ?? query.from.first_name ?? undefined;
+
+      if (action === "deny_reason" || action === "freeform") {
+        awaitingFeedback.set(chatId, { requestId, action });
+        const prompt =
+          action === "deny_reason"
+            ? "Please type your reason for denying."
+            : "Please type your answer.";
+        await instance.api.sendMessage(chatId, prompt, {});
+        return;
+      }
+
+      let syntheticText: string;
+      let confirmationText: string;
+
+      if (action === "approve") {
+        syntheticText = "approve";
+        confirmationText = "✅ Approved";
+      } else if (action === "deny") {
+        syntheticText = "deny";
+        confirmationText = "❌ Denied";
+      } else if (action === "option") {
+        const value = (
+          payload as { requestId: string; action: "option"; value: string }
+        ).value;
+        syntheticText = value;
+        confirmationText = `Selected: ${value}`;
+      } else {
+        console.error("[Telegram] Unknown callback action:", action);
+        return;
+      }
+
+      if (adapter.onMessage) {
+        const inbound: InboundChannelMessage = {
+          channel: "telegram",
+          accountId: config.accountId,
+          chatId,
+          senderId,
+          senderName,
+          text: syntheticText,
+          timestamp: Date.now(),
+          messageId: String(query.message?.message_id ?? ""),
+          chatType: "direct",
+        };
+        try {
+          await adapter.onMessage(inbound);
+        } catch (error) {
+          console.error("[Telegram] Error processing callback query:", error);
+        }
+      }
+
+      buttonMessages.delete(requestId);
+
+      try {
+        await instance.api.editMessageText(
+          chatId,
+          Number(buttonEntry.messageId),
+          confirmationText,
+        );
+      } catch {
+        await instance.api.sendMessage(chatId, confirmationText, {});
+      }
+    });
+
     instance.command("start", async (ctx) => {
       await ctx.reply(
         "Welcome! This bot is connected to Letta Code.\n\n" +
@@ -433,7 +543,7 @@ export function createTelegramAdapter(
 
         void telegramBot
           .start({
-            allowed_updates: ["message", "message_reaction"],
+            allowed_updates: ["message", "message_reaction", "callback_query"],
             onStart: () => {
               running = true;
               started = true;
