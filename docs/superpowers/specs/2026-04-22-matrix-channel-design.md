@@ -48,6 +48,7 @@ This produces a long-lived bearer token that works with the Matrix C-S API. The 
 - `allowedUserIds?: string[]` — used when `dmPolicy === "allowlist"`
 - `e2ee: boolean` — whether to attempt E2EE (best-effort)
 - `transcribeVoice?: boolean` — requires `OPENAI_API_KEY`
+- `maxMediaDownloadBytes?: number` — max file size to download (default: 52_428_800 = 50 MB)
 
 **Sync:** `matrix-bot-sdk` manages the sync loop internally via `MatrixClient.start()`. No manual long-polling needed.
 
@@ -60,8 +61,8 @@ E2EE is best-effort. During adapter startup:
 ```typescript
 let cryptoProvider: RustSdkCryptoStorageProvider | undefined;
 try {
-  const { RustSdkCryptoStorageProvider } = await loadMatrixBotSdkModule();
-  cryptoProvider = new RustSdkCryptoStorageProvider(cryptoStoragePath);
+  const { RustSdkCryptoStorageProvider, RustSdkCryptoStoreType } = await loadMatrixBotSdkModule();
+  cryptoProvider = new RustSdkCryptoStorageProvider(cryptoStoragePath, RustSdkCryptoStoreType.Sled);
 } catch (err) {
   log.warn("Matrix E2EE unavailable (Rust crypto addon failed to load); running unencrypted");
 }
@@ -86,7 +87,7 @@ The adapter registers a `room.invite` handler. All invites are auto-accepted via
 - `chatId`: Matrix room ID
 - `senderId`: sender's Matrix user ID
 - `senderName`: display name resolved via `client.getUserProfile(senderId)`
-- `chatType`: `"direct"` for 1:1 rooms, `"channel"` for multi-user rooms
+- `chatType`: `"direct"` for 1:1 rooms, `"channel"` for multi-user rooms. Detected via `await client.getJoinedRoomMembers(roomId)` — length of 2 means a DM. (`client.dms.isDm()` is account-data based and unreliable for rooms initiated by other parties.)
 - `messageId`: Matrix event ID
 
 ### Reactions
@@ -94,12 +95,12 @@ The adapter registers a `room.invite` handler. All invites are auto-accepted via
 
 **Control-request reactions** are intercepted before reaching the registry (see Control Requests section). All other reactions are emitted as `InboundChannelMessage` with `reaction: { action: "add", emoji, targetMessageId }` — matching the Telegram pattern.
 
-Reaction removal (`m.redaction` of an `m.reaction` event) is emitted with `reaction: { action: "remove", emoji, targetMessageId }`.
+Reaction removal: listen via `room.event` filtered to `event['type'] === 'm.room.redaction'`. The redacted event ID is in `event['redacts']` (top-level field). The adapter looks up `event['redacts']` in its `sentReactionEventIds` maps to determine if a pre-reaction was removed, then emits `reaction: { action: "remove", emoji, targetMessageId }`.
 
 ### Media / attachments
 Handled for `m.image`, `m.video`, `m.audio`, `m.file` content types. Download pipeline:
 1. Resolve MXC URL → authenticated download URL via `client.mxcToHttp(mxcUrl)` (or `client.mxcToHttpThumbnail` for images)
-2. Enforce 50 MB size limit (skip with warning if `info.size` exceeds limit)
+2. Enforce download size limit (skip with warning if `info.size` exceeds `account.maxMediaDownloadBytes ?? 52_428_800`)
 3. Download to `~/.letta/channels/matrix/inbound/<accountId>/<timestamp>-<uuid>-<filename>`
 4. Images ≤ 5 MB get `imageDataBase64` populated for vision model use
 5. Voice messages (`m.audio` with `voice: true`): transcribed via OpenAI Whisper if `transcribeVoice` is enabled and `OPENAI_API_KEY` is set
@@ -109,10 +110,16 @@ Handled for `m.image`, `m.video`, `m.audio`, `m.file` content types. Download pi
 ## Outbound Messages
 
 ### Text
-`client.sendMessage(roomId, { msgtype: "m.text", body: text, format: "org.matrix.custom.html", formatted_body: html })` — Markdown is converted to HTML for rich rendering in Element and other clients.
+A `"matrix"` entry is added to `CHANNEL_OUTBOUND_FORMATTERS` in `src/tools/impl/MessageChannel.ts`. It calls `markdownToMatrixHtml(text)` (using `marked` for Markdown → HTML conversion) and returns `{ text: strippedPlainText, parseMode: "HTML" }`. The plain-text value strips Markdown syntax so clients that ignore `formatted_body` don't show raw `**bold**` etc.
+
+The adapter checks `msg.parseMode`:
+- **Set (`"HTML"`):** `client.sendMessage(roomId, { msgtype: "m.text", body: msg.text, format: "org.matrix.custom.html", formatted_body: htmlFromParseMode })`
+- **Not set:** `client.sendMessage(roomId, { msgtype: "m.text", body: msg.text })`
+
+The `body` field is always the plain-text fallback as required by the Matrix spec.
 
 ### Media upload
-`client.uploadContent(buffer, { name, type })` returns an MXC URL. Then:
+`client.uploadContent(buffer, contentType, filename)` returns an MXC URL (positional args — not an options object). Then:
 - Images → `m.image`
 - Video → `m.video`
 - Audio → `m.audio`
@@ -200,7 +207,8 @@ Synthetic `InboundChannelMessage` events use the same `chatId`, `senderId`, `acc
 7. If `allowlist`: prompt for comma-separated Matrix user IDs
 8. Prompt for E2EE opt-in (explain best-effort caveat if Rust addon status is unknown; test-load the addon and report result)
 9. Prompt for voice transcription opt-in (requires `OPENAI_API_KEY`)
-10. Write `MatrixChannelAccount` via `upsertChannelAccount`
+10. Prompt for max media download size (default: 50 MB; accepts human-readable values like `100mb`)
+11. Write `MatrixChannelAccount` via `upsertChannelAccount`
 
 ---
 
@@ -208,17 +216,17 @@ Synthetic `InboundChannelMessage` events use the same `chatId`, `senderId`, `acc
 
 | Command | Response |
 |---|---|
-| `!letta start` | Welcome message + pairing instructions |
-| `!letta status` | Bot user ID and DM policy |
+| `!start` | Welcome message + pairing instructions |
+| `!status` | Bot user ID and DM policy |
 
-Matrix has no native `/command` bot API (unlike Telegram), so commands are plain text prefixed with `!letta`. The text handler checks for these before passing messages to the registry pipeline.
+Matrix has no native `/command` bot API (unlike Telegram), so commands are plain text prefixed with `!`. The text handler checks for a leading `!` before passing messages to the registry pipeline.
 
 ---
 
 ## Error Handling
 
 - **Token invalid / expired:** `start()` catches the 401 from `client.start()` and throws with a clear message directing the operator to reissue a compatibility token.
-- **Homeserver unreachable:** sync errors are caught via `client.on("sync.error", ...)` and logged; the adapter marks itself not running and attempts no automatic reconnect (matching Telegram behaviour — operator restarts).
+- **Homeserver unreachable:** `matrix-bot-sdk` handles transient sync failures internally with exponential backoff and no emitted event. Persistent failures (e.g. homeserver down for extended period) are caught by wrapping `client.start()` in a try/catch. A custom `ILogger` implementation can be injected via `LogService.setLogger()` to surface sync errors to the letta log system.
 - **Crypto addon failure:** logged as a warning; adapter continues unencrypted.
 - **Media download failure (size limit, timeout):** attachment is skipped with a warning; the message is still emitted with whatever text is present.
 - **Reaction to non-existent pending request:** silently ignored.
