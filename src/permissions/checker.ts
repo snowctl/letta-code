@@ -7,6 +7,7 @@ import { runPermissionRequestHooks } from "../hooks";
 import type { PermissionModeState } from "../tools/manager";
 import { canonicalToolName, isShellToolName } from "./canonical";
 import { cliPermissions } from "./cli";
+import { evaluateCrossAgentGuard, extractFilePath } from "./crossAgentGuard";
 import {
   type MatcherOptions,
   matchesBashPattern,
@@ -114,6 +115,9 @@ function shouldAttachTrace(result: PermissionCheckResult): boolean {
  * Check permission for a tool execution.
  *
  * Decision logic:
+ * 0. Cross-agent guard (unbypassable) → DENY any tool call targeting
+ *    another agent's memory dir unless that agent is in allowed_agents
+ *    (self ∪ LETTA_MEMORY_SCOPE ∪ --memory-scope)
  * 1. Check deny rules from settings (first match wins) → DENY
  * 2. Check CLI disallowedTools (--disallowedTools flag) → DENY
  * 3. Check permission mode (--permission-mode flag) → ALLOW or DENY
@@ -135,6 +139,7 @@ export function checkPermission(
   permissions: PermissionRules,
   workingDirectory: string = process.cwd(),
   modeState?: PermissionModeState,
+  agentId?: string,
 ): PermissionCheckResult {
   const engine: PermissionEngine = isPermissionsV2Enabled() ? "v2" : "v1";
   const primary = checkPermissionForEngine(
@@ -144,6 +149,7 @@ export function checkPermission(
     permissions,
     workingDirectory,
     modeState,
+    agentId,
   );
 
   let result: PermissionCheckResult = primary.result;
@@ -174,6 +180,7 @@ export function checkPermission(
       permissions,
       workingDirectory,
       modeState,
+      agentId,
     );
 
     const mismatch =
@@ -249,6 +256,7 @@ function checkPermissionForEngine(
   permissions: PermissionRules,
   workingDirectory: string,
   modeState?: PermissionModeState,
+  agentId?: string,
 ): { result: PermissionCheckResult; trace: PermissionCheckTrace } {
   const canonicalTool = canonicalToolName(toolName);
   const queryTool = engine === "v2" ? canonicalTool : toolName;
@@ -257,6 +265,27 @@ function checkPermissionForEngine(
   const sessionRules = sessionPermissions.getRules();
   const workingDirectoryTools =
     engine === "v2" ? WORKING_DIRECTORY_TOOLS_V2 : WORKING_DIRECTORY_TOOLS_V1;
+
+  // Cross-agent guard — denies any tool call targeting another agent's
+  // memory unless that agent is in the allowed set. Unbypassable by any
+  // mode, rule, or flag.
+  const guardResult = evaluateCrossAgentGuard(
+    toolName,
+    toolArgs,
+    workingDirectory,
+    { currentAgentId: agentId },
+  );
+  if (guardResult) {
+    traceEvent(trace, "cross-agent-guard", guardResult.reason);
+    return {
+      result: {
+        decision: "deny",
+        matchedRule: guardResult.matchedRule,
+        reason: guardResult.reason,
+      },
+      trace,
+    };
+  }
 
   if (permissions.deny) {
     for (const pattern of permissions.deny) {
@@ -395,8 +424,8 @@ function checkPermissionForEngine(
     }
     if (shellCommand) {
       try {
-        const agentId = getCurrentAgentId();
-        if (isMemoryDirCommand(shellCommand, agentId)) {
+        const resolvedAgentId = agentId ?? getCurrentAgentId();
+        if (isMemoryDirCommand(shellCommand, resolvedAgentId)) {
           traceEvent(
             trace,
             "memory-dir-auto-allow",
@@ -515,26 +544,6 @@ function checkPermissionForEngine(
     },
     trace,
   };
-}
-
-/**
- * Extract file path from tool arguments
- */
-function extractFilePath(toolArgs: ToolArgs): string | null {
-  // Different tools use different parameter names
-  if (typeof toolArgs.file_path === "string" && toolArgs.file_path.length > 0) {
-    return toolArgs.file_path;
-  }
-  if (typeof toolArgs.path === "string" && toolArgs.path.length > 0) {
-    return toolArgs.path;
-  }
-  if (
-    typeof toolArgs.notebook_path === "string" &&
-    toolArgs.notebook_path.length > 0
-  ) {
-    return toolArgs.notebook_path;
-  }
-  return null;
 }
 
 /**
@@ -803,6 +812,7 @@ export async function checkPermissionWithHooks(
   permissions: PermissionRules,
   workingDirectory: string = process.cwd(),
   modeState?: PermissionModeState,
+  agentId?: string,
 ): Promise<PermissionCheckResult> {
   // First, check permission using normal rules
   const result = checkPermission(
@@ -811,6 +821,7 @@ export async function checkPermissionWithHooks(
     permissions,
     workingDirectory,
     modeState,
+    agentId,
   );
 
   // If decision is "ask", run PermissionRequest hooks to see if they auto-allow/deny
@@ -821,6 +832,7 @@ export async function checkPermissionWithHooks(
       "ask",
       undefined,
       workingDirectory,
+      agentId,
     );
 
     // If hook blocked (exit code 2), deny the permission

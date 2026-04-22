@@ -141,7 +141,7 @@ EXAMPLES
   /profiles                # Open profile selector
   /pin                     # Pin current profile to project
   /unpin                   # Unpin profile from project
-  /logout                  # Clear credentials and exit
+  /logout                  # Clear saved credentials and exit
 
   # headless with JSON output (includes stats)
   letta -p "hello" --output-format json
@@ -917,13 +917,16 @@ async function main(): Promise<void> {
   }
 
   // Set CLI permission overrides if provided
-  if (values.allowedTools || values.disallowedTools) {
+  if (values.allowedTools || values.disallowedTools || values["memory-scope"]) {
     const { cliPermissions } = await import("./permissions/cli");
     if (values.allowedTools) {
       cliPermissions.setAllowedTools(values.allowedTools);
     }
     if (values.disallowedTools) {
       cliPermissions.setDisallowedTools(values.disallowedTools);
+    }
+    if (values["memory-scope"]) {
+      cliPermissions.setMemoryScope(values["memory-scope"]);
     }
   }
 
@@ -2123,7 +2126,7 @@ async function main(): Promise<void> {
         showCompactions: settings.showCompactions,
         agentProvenance,
         releaseNotes,
-        sessionContextReminderEnabled: !noSystemInfoReminderFlag,
+        systemInfoReminderEnabled: !noSystemInfoReminderFlag,
       });
     }
 
@@ -2143,7 +2146,7 @@ async function main(): Promise<void> {
       agentProvenance,
       releaseNotes,
       updateNotification,
-      sessionContextReminderEnabled: !noSystemInfoReminderFlag,
+      systemInfoReminderEnabled: !noSystemInfoReminderFlag,
     });
   }
 

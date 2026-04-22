@@ -63,6 +63,7 @@ import {
   createSharedReminderState,
   resetSharedReminderState,
 } from "../../reminders/state";
+import { getCurrentWorkingDirectory } from "../../runtime-context";
 import { settingsManager } from "../../settings-manager";
 import { telemetry } from "../../telemetry";
 import { trackBoundaryError } from "../../telemetry/errorReporting";
@@ -71,6 +72,7 @@ import {
   ensureCorrectMemoryTool,
   prepareToolExecutionContextForScope,
   type ToolsetName,
+  type ToolsetPreference,
 } from "../../tools/toolset";
 import { formatToolsetName } from "../../tools/toolset-labels";
 import type {
@@ -86,6 +88,7 @@ import type {
   ChannelAccountUnbindCommand,
   ChannelAccountUpdateCommand,
   ChannelGetConfigCommand,
+  ChannelId,
   ChannelPairingBindCommand,
   ChannelPairingsListCommand,
   ChannelRouteRemoveCommand,
@@ -112,6 +115,7 @@ import type {
   SkillDisableCommand,
   SkillEnableCommand,
   UpdateModelResponseMessage,
+  UpdateToolsetResponseMessage,
 } from "../../types/protocol_v2";
 import { isDebugEnabled } from "../../utils/debug";
 import {
@@ -140,6 +144,7 @@ import {
   loadPersistedCwdMap,
   setConversationWorkingDirectory,
 } from "./cwd";
+import { runGrepInFiles } from "./grepInFiles";
 import {
   consumeInterruptQueue,
   emitInterruptToolReturnMessage,
@@ -189,9 +194,11 @@ import {
   isFileOpsCommand,
   isGetReflectionSettingsCommand,
   isGetTreeCommand,
+  isGrepInFilesCommand,
   isListInDirectoryCommand,
   isListMemoryCommand,
   isListModelsCommand,
+  isMemoryCommitDiffCommand,
   isMemoryFileAtRefCommand,
   isMemoryHistoryCommand,
   isReadFileCommand,
@@ -202,6 +209,7 @@ import {
   isSkillEnableCommand,
   isUnwatchFileCommand,
   isUpdateModelCommand,
+  isUpdateToolsetCommand,
   isWatchFileCommand,
   isWriteFileCommand,
   parseServerMessage,
@@ -841,6 +849,88 @@ async function applyModelUpdateForRuntime(params: {
   };
 }
 
+async function applyToolsetUpdateForRuntime(params: {
+  socket: WebSocket;
+  listener: ListenerRuntime;
+  scopedRuntime: ConversationRuntime;
+  requestId: string;
+  toolsetPreference: ToolsetPreference;
+}): Promise<UpdateToolsetResponseMessage> {
+  const { socket, listener, scopedRuntime, requestId, toolsetPreference } =
+    params;
+  const agentId = scopedRuntime.agentId;
+  const conversationId = scopedRuntime.conversationId;
+
+  if (!agentId) {
+    return {
+      type: "update_toolset_response",
+      request_id: requestId,
+      success: false,
+      error: "Missing agent_id in runtime scope",
+    };
+  }
+
+  const previousToolNames = scopedRuntime.currentLoadedTools;
+  let nextToolset: ToolsetName;
+  const previousToolsetPreference = (() => {
+    try {
+      return settingsManager.getToolsetPreference(agentId);
+    } catch {
+      return scopedRuntime.currentToolsetPreference;
+    }
+  })();
+
+  try {
+    settingsManager.setToolsetPreference(agentId, toolsetPreference);
+    const preparedToolContext = await prepareToolExecutionContextForScope({
+      agentId,
+      conversationId,
+    });
+    nextToolset = preparedToolContext.toolset;
+    scopedRuntime.currentToolset = preparedToolContext.toolset;
+    scopedRuntime.currentToolsetPreference =
+      preparedToolContext.toolsetPreference;
+    scopedRuntime.currentLoadedTools =
+      preparedToolContext.preparedToolContext.loadedToolNames;
+  } catch (error) {
+    settingsManager.setToolsetPreference(agentId, previousToolsetPreference);
+    throw error;
+  }
+
+  const toolsChanged =
+    JSON.stringify(previousToolNames) !==
+    JSON.stringify(scopedRuntime.currentLoadedTools);
+
+  const statusMessage =
+    toolsetPreference === "auto"
+      ? `Toolset mode set to auto (currently ${formatToolsetName(nextToolset)}).`
+      : `Switched toolset to ${formatToolsetName(nextToolset)} (manual override).`;
+
+  emitStatusDelta(socket, scopedRuntime, {
+    message: statusMessage,
+    level: toolsChanged ? "info" : "info",
+    agentId,
+    conversationId,
+  });
+
+  emitRuntimeStateUpdates(listener, {
+    agent_id: agentId,
+    conversation_id: conversationId,
+  });
+
+  return {
+    type: "update_toolset_response",
+    request_id: requestId,
+    success: true,
+    runtime: {
+      agent_id: agentId,
+      conversation_id: conversationId,
+    },
+    current_toolset: nextToolset,
+    current_toolset_preference: toolsetPreference,
+  };
+}
+
 function buildListModelsEntries(): ListModelsResponseModelEntry[] {
   return models.map((model) => ({
     id: model.id,
@@ -964,10 +1054,7 @@ function emitCronsUpdated(
   );
 }
 
-function emitChannelsUpdated(
-  socket: WebSocket,
-  channelId?: "telegram" | "slack",
-): void {
+function emitChannelsUpdated(socket: WebSocket, channelId?: ChannelId): void {
   safeSocketSend(
     socket,
     {
@@ -982,7 +1069,7 @@ function emitChannelsUpdated(
 
 function emitChannelAccountsUpdated(
   socket: WebSocket,
-  params: { channelId: "telegram" | "slack"; accountId?: string },
+  params: { channelId: ChannelId; accountId?: string },
 ): void {
   safeSocketSend(
     socket,
@@ -999,7 +1086,7 @@ function emitChannelAccountsUpdated(
 
 function emitChannelPairingsUpdated(
   socket: WebSocket,
-  channelId: "telegram" | "slack",
+  channelId: ChannelId,
 ): void {
   safeSocketSend(
     socket,
@@ -1016,7 +1103,7 @@ function emitChannelPairingsUpdated(
 function emitChannelRoutesUpdated(
   socket: WebSocket,
   params: {
-    channelId: "telegram" | "slack";
+    channelId: ChannelId;
     agentId?: string;
     conversationId?: string | null;
   },
@@ -1039,7 +1126,7 @@ function emitChannelRoutesUpdated(
 
 function emitChannelTargetsUpdated(
   socket: WebSocket,
-  channelId: "telegram" | "slack",
+  channelId: ChannelId,
 ): void {
   safeSocketSend(
     socket,
@@ -1575,6 +1662,17 @@ async function handleChannelsProtocolCommand(
         has_token: snapshot.hasToken,
       };
     }
+    if (snapshot.channelId === "discord") {
+      return {
+        channel_id: snapshot.channelId,
+        account_id: snapshot.accountId,
+        display_name: snapshot.displayName,
+        enabled: snapshot.enabled,
+        dm_policy: snapshot.dmPolicy,
+        allowed_users: snapshot.allowedUsers,
+        has_token: snapshot.hasToken,
+      };
+    }
     return {
       channel_id: snapshot.channelId,
       account_id: snapshot.accountId,
@@ -1606,6 +1704,23 @@ async function handleChannelsProtocolCommand(
           agent_id: snapshot.binding.agentId,
           conversation_id: snapshot.binding.conversationId,
         },
+        created_at: snapshot.createdAt,
+        updated_at: snapshot.updatedAt,
+      };
+    }
+
+    if (snapshot.channelId === "discord") {
+      return {
+        channel_id: snapshot.channelId,
+        account_id: snapshot.accountId,
+        display_name: snapshot.displayName,
+        enabled: snapshot.enabled,
+        configured: snapshot.configured,
+        running: snapshot.running,
+        dm_policy: snapshot.dmPolicy,
+        allowed_users: snapshot.allowedUsers,
+        has_token: snapshot.hasToken,
+        agent_id: snapshot.agentId,
         created_at: snapshot.createdAt,
         updated_at: snapshot.updatedAt,
       };
@@ -3148,14 +3263,14 @@ function handleChannelRegistryEvent(
   runtime: ListenerRuntime,
 ): void {
   if (event.type === "pairings_updated") {
-    emitChannelPairingsUpdated(socket, event.channelId as "telegram" | "slack");
-    emitChannelsUpdated(socket, event.channelId as "telegram" | "slack");
+    emitChannelPairingsUpdated(socket, event.channelId as ChannelId);
+    emitChannelsUpdated(socket, event.channelId as ChannelId);
     return;
   }
 
   if (event.type === "targets_updated") {
-    emitChannelTargetsUpdated(socket, event.channelId as "telegram" | "slack");
-    emitChannelsUpdated(socket, event.channelId as "telegram" | "slack");
+    emitChannelTargetsUpdated(socket, event.channelId as ChannelId);
+    emitChannelsUpdated(socket, event.channelId as ChannelId);
     return;
   }
 
@@ -3836,7 +3951,7 @@ async function handleCwdChange(
 }
 
 function createRuntime(): ListenerRuntime {
-  const bootWorkingDirectory = process.env.USER_CWD || process.cwd();
+  const bootWorkingDirectory = getCurrentWorkingDirectory();
   return {
     socket: null,
     heartbeatInterval: null,
@@ -4539,6 +4654,78 @@ async function connectWithRetry(
         return;
       }
 
+      // ── Find-in-files content search (no runtime scope required) ──────
+      if (isGrepInFilesCommand(parsed)) {
+        runDetachedListenerTask("grep_in_files", async () => {
+          try {
+            // Re-root the index if the requested cwd lives outside it, so
+            // "search root" matches what the user expects in the UI.
+            if (parsed.cwd) {
+              const currentRoot = getIndexRoot();
+              if (
+                !parsed.cwd.startsWith(currentRoot + path.sep) &&
+                parsed.cwd !== currentRoot
+              ) {
+                setIndexRoot(parsed.cwd);
+              }
+            }
+
+            const searchRoot = parsed.cwd ?? getIndexRoot();
+            const { matches, totalMatches, totalFiles, truncated } =
+              await runGrepInFiles({
+                searchRoot,
+                query: parsed.query,
+                isRegex: parsed.is_regex ?? false,
+                caseSensitive: parsed.case_sensitive ?? false,
+                wholeWord: parsed.whole_word ?? false,
+                glob: parsed.glob,
+                maxResults: parsed.max_results ?? 500,
+                contextLines: parsed.context_lines ?? 2,
+              });
+
+            safeSocketSend(
+              socket,
+              {
+                type: "grep_in_files_response",
+                request_id: parsed.request_id,
+                success: true,
+                matches,
+                total_matches: totalMatches,
+                total_files: totalFiles,
+                truncated,
+              },
+              "listener_grep_in_files_send_failed",
+              "listener_grep_in_files",
+            );
+          } catch (error) {
+            trackListenerError(
+              "listener_grep_in_files_failed",
+              error,
+              "listener_grep_in_files",
+            );
+            safeSocketSend(
+              socket,
+              {
+                type: "grep_in_files_response",
+                request_id: parsed.request_id,
+                success: false,
+                matches: [],
+                total_matches: 0,
+                total_files: 0,
+                truncated: false,
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : "Failed to search file contents",
+              },
+              "listener_grep_in_files_send_failed",
+              "listener_grep_in_files",
+            );
+          }
+        });
+        return;
+      }
+
       // ── Directory listing (no runtime scope required) ──────────────────
       if (isListInDirectoryCommand(parsed)) {
         console.log(
@@ -5229,6 +5416,54 @@ async function connectWithRetry(
         return;
       }
 
+      // ── Toolset update command (runtime scoped) ──────────────────────
+      if (isUpdateToolsetCommand(parsed)) {
+        runDetachedListenerTask("update_toolset", async () => {
+          const scopedRuntime = getOrCreateScopedRuntime(
+            runtime,
+            parsed.runtime.agent_id,
+            parsed.runtime.conversation_id,
+          );
+
+          try {
+            const response = await applyToolsetUpdateForRuntime({
+              socket,
+              listener: runtime,
+              scopedRuntime,
+              requestId: parsed.request_id,
+              toolsetPreference: parsed.toolset_preference,
+            });
+            safeSocketSend(
+              socket,
+              response,
+              "listener_update_toolset_send_failed",
+              "listener_update_toolset",
+            );
+          } catch (error) {
+            const failure: UpdateToolsetResponseMessage = {
+              type: "update_toolset_response",
+              request_id: parsed.request_id,
+              success: false,
+              runtime: {
+                agent_id: parsed.runtime.agent_id,
+                conversation_id: parsed.runtime.conversation_id,
+              },
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to update toolset",
+            };
+            safeSocketSend(
+              socket,
+              failure,
+              "listener_update_toolset_send_failed",
+              "listener_update_toolset",
+            );
+          }
+        });
+        return;
+      }
+
       // ── Memory history (git log for a specific file) ─────────────────
       if (isMemoryHistoryCommand(parsed)) {
         runDetachedListenerTask("memory_history", async () => {
@@ -5242,17 +5477,20 @@ async function connectWithRetry(
           const memoryRoot = getMemoryFilesystemRoot(parsed.agent_id);
           const limit = parsed.limit ?? 50;
 
-          const { stdout } = await execFileAsync(
-            "git",
-            [
-              "log",
-              `--max-count=${limit}`,
-              "--format=%H|%s|%aI|%an",
-              "--",
-              parsed.file_path,
-            ],
-            { cwd: memoryRoot, timeout: 10000 },
-          );
+          const gitArgs = [
+            "log",
+            `--max-count=${limit}`,
+            "--format=%H|%s|%aI|%an",
+          ];
+          // When file_path is provided, scope to that file
+          if (parsed.file_path) {
+            gitArgs.push("--", parsed.file_path);
+          }
+
+          const { stdout } = await execFileAsync("git", gitArgs, {
+            cwd: memoryRoot,
+            timeout: 10000,
+          });
 
           const commits = stdout
             .trim()
@@ -5273,7 +5511,7 @@ async function connectWithRetry(
             {
               type: "memory_history_response",
               request_id: parsed.request_id,
-              file_path: parsed.file_path,
+              file_path: parsed.file_path ?? "",
               commits,
               success: true,
             },
@@ -5333,6 +5571,59 @@ async function connectWithRetry(
               },
               "listener_memory_file_at_ref_send_failed",
               "listener_memory_file_at_ref",
+            );
+          }
+        });
+        return;
+      }
+
+      // ── Memory commit diff (git show for full commit patch) ────────────
+      if (isMemoryCommitDiffCommand(parsed)) {
+        runDetachedListenerTask("memory_commit_diff", async () => {
+          const { getMemoryFilesystemRoot } = await import(
+            "../../agent/memoryFilesystem"
+          );
+          const { execFile: execFileCb } = await import("node:child_process");
+          const { promisify } = await import("node:util");
+          const execFileAsync = promisify(execFileCb);
+
+          const memoryRoot = getMemoryFilesystemRoot(parsed.agent_id);
+
+          try {
+            const { stdout } = await execFileAsync(
+              "git",
+              ["show", parsed.sha, "--format=", "--no-color"],
+              { cwd: memoryRoot, timeout: 10000 },
+            );
+
+            safeSocketSend(
+              socket,
+              {
+                type: "memory_commit_diff_response",
+                request_id: parsed.request_id,
+                sha: parsed.sha,
+                diff: stdout,
+                success: true,
+              },
+              "listener_memory_commit_diff_send_failed",
+              "listener_memory_commit_diff",
+            );
+          } catch (err) {
+            safeSocketSend(
+              socket,
+              {
+                type: "memory_commit_diff_response",
+                request_id: parsed.request_id,
+                sha: parsed.sha,
+                diff: null,
+                success: false,
+                error:
+                  err instanceof Error
+                    ? err.message
+                    : "Failed to get commit diff",
+              },
+              "listener_memory_commit_diff_send_failed",
+              "listener_memory_commit_diff",
             );
           }
         });

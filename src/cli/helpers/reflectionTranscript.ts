@@ -27,7 +27,8 @@ type TranscriptEntry =
       kind: "user" | "assistant" | "reasoning" | "error";
       text: string;
       captured_at: string;
-      source_line_id?: string;
+      source_line_id?: string; // local transcript row id; may be synthetic
+      source_message_id?: string; // canonical backend message.id when known
     }
   | {
       kind: "tool_call";
@@ -36,7 +37,8 @@ type TranscriptEntry =
       resultText?: string;
       resultOk?: boolean;
       captured_at: string;
-      source_line_id?: string;
+      source_line_id?: string; // local transcript row id; may be synthetic
+      source_message_id?: string; // canonical backend message.id when known
     };
 
 export interface ReflectionTranscriptPaths {
@@ -447,6 +449,7 @@ function lineToTranscriptEntry(
         text: line.text,
         captured_at: capturedAt,
         source_line_id: line.id,
+        source_message_id: line.messageId,
       };
     case "assistant":
       return {
@@ -454,6 +457,7 @@ function lineToTranscriptEntry(
         text: line.text,
         captured_at: capturedAt,
         source_line_id: line.id,
+        source_message_id: line.messageId,
       };
     case "reasoning":
       return {
@@ -461,6 +465,7 @@ function lineToTranscriptEntry(
         text: line.text,
         captured_at: capturedAt,
         source_line_id: line.id,
+        source_message_id: line.messageId,
       };
     case "error":
       return {
@@ -651,8 +656,13 @@ export async function buildAutoReflectionPayload(
   const entries = snapshotLines
     .map((line) => parseJsonLine<TranscriptEntry>(line))
     .filter((entry): entry is TranscriptEntry => entry !== null);
+  // Reflection telemetry boundaries must use canonical backend message ids from
+  // user/assistant entries only. Tool rows use local transcript ids, and
+  // reasoning rows can share an assistant message id while still being a
+  // separate transcript row.
   const messageIds = entries
-    .map((entry) => entry.source_line_id)
+    .filter((entry) => entry.kind === "user" || entry.kind === "assistant")
+    .map((entry) => entry.source_message_id)
     .filter((id): id is string => typeof id === "string" && id.length > 0);
   const startMessageId = messageIds[0];
   const endMessageId = messageIds[messageIds.length - 1];

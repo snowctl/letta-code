@@ -73,6 +73,13 @@ export function buildChannelReminderText(msg: InboundChannelMessage): string {
       'On Telegram, MessageChannel also supports action="react" with emoji + messageId, and action="upload-file" with media.',
     );
   }
+  if (msg.channel === "discord") {
+    lines.splice(
+      lines.length - 2,
+      0,
+      'On Discord, MessageChannel also supports action="react" with emoji + messageId, and action="upload-file" with media. Discord reactions accept native Unicode emoji and custom emoji syntax like <:name:id>.',
+    );
+  }
   if (msg.attachments?.length) {
     lines.splice(
       lines.length - 2,
@@ -101,6 +108,11 @@ function buildAttachmentXml(attachment: ChannelMessageAttachment): string {
   }
   if (typeof attachment.sizeBytes === "number") {
     attrs.push(`size_bytes="${attachment.sizeBytes}"`);
+  }
+
+  if (attachment.transcription) {
+    const escapedTranscription = escapeXmlText(attachment.transcription);
+    return `<attachment ${attrs.join(" ")}>\n  <attempted_transcription>${escapedTranscription}</attempted_transcription>\n</attachment>`;
   }
 
   return `<attachment ${attrs.join(" ")} />`;

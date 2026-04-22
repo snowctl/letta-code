@@ -7,7 +7,7 @@
  * platform chat IDs to agent+conversation pairs.
  */
 
-export const SUPPORTED_CHANNEL_IDS = ["telegram", "slack"] as const;
+export const SUPPORTED_CHANNEL_IDS = ["telegram", "slack", "discord"] as const;
 export type SupportedChannelId = (typeof SUPPORTED_CHANNEL_IDS)[number];
 export type ChannelChatType = "direct" | "channel";
 export type SlackDefaultPermissionMode =
@@ -23,6 +23,8 @@ export interface ChannelMessageAttachment {
   kind: "image" | "file" | "audio" | "video";
   localPath: string;
   imageDataBase64?: string;
+  /** Best-effort speech-to-text transcription (voice memos only). */
+  transcription?: string;
 }
 
 export interface ChannelReactionNotification {
@@ -270,6 +272,8 @@ export interface TelegramChannelConfig {
   token: string;
   dmPolicy: DmPolicy;
   allowedUsers: string[];
+  /** When true and OPENAI_API_KEY is set, voice memos are auto-transcribed. */
+  transcribeVoice?: boolean;
 }
 
 export interface SlackChannelConfig {
@@ -282,12 +286,25 @@ export interface SlackChannelConfig {
   allowedUsers: string[];
 }
 
-export type ChannelConfig = TelegramChannelConfig | SlackChannelConfig;
+export interface DiscordChannelConfig {
+  channel: "discord";
+  enabled: boolean;
+  token: string;
+  dmPolicy: DmPolicy;
+  allowedUsers: string[];
+}
+
+export type ChannelConfig =
+  | TelegramChannelConfig
+  | SlackChannelConfig
+  | DiscordChannelConfig;
 
 export interface TelegramChannelAccount extends ChannelAccountBase {
   channel: "telegram";
   token: string;
   binding: ChannelAccountBinding;
+  /** When true and OPENAI_API_KEY is set, voice memos are auto-transcribed. */
+  transcribeVoice?: boolean;
 }
 
 export interface SlackChannelAccount extends ChannelAccountBase {
@@ -299,7 +316,17 @@ export interface SlackChannelAccount extends ChannelAccountBase {
   defaultPermissionMode: SlackDefaultPermissionMode;
 }
 
-export type ChannelAccount = TelegramChannelAccount | SlackChannelAccount;
+export interface DiscordChannelAccount extends ChannelAccountBase {
+  channel: "discord";
+  token: string;
+  /** Agent ID used for guild auto-routing (like Slack's agentId). */
+  agentId: string | null;
+}
+
+export type ChannelAccount =
+  | TelegramChannelAccount
+  | SlackChannelAccount
+  | DiscordChannelAccount;
 
 // ── Pairing ───────────────────────────────────────────────────────
 

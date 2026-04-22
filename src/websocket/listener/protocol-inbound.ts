@@ -35,10 +35,12 @@ import type {
   FileOpsCommand,
   GetReflectionSettingsCommand,
   GetTreeCommand,
+  GrepInFilesCommand,
   InputCommand,
   ListInDirectoryCommand,
   ListMemoryCommand,
   ListModelsCommand,
+  MemoryCommitDiffCommand,
   MemoryFileAtRefCommand,
   MemoryHistoryCommand,
   ReadFileCommand,
@@ -55,6 +57,7 @@ import type {
   TerminalSpawnCommand,
   UnwatchFileCommand,
   UpdateModelCommand,
+  UpdateToolsetCommand,
   WatchFileCommand,
   WriteFileCommand,
   WsProtocolCommand,
@@ -300,6 +303,18 @@ export function isSearchFilesCommand(
   );
 }
 
+export function isGrepInFilesCommand(
+  value: unknown,
+): value is GrepInFilesCommand {
+  if (!value || typeof value !== "object") return false;
+  const c = value as { type?: unknown; query?: unknown; request_id?: unknown };
+  return (
+    c.type === "grep_in_files" &&
+    typeof c.query === "string" &&
+    typeof c.request_id === "string"
+  );
+}
+
 export function isListInDirectoryCommand(
   value: unknown,
 ): value is ListInDirectoryCommand {
@@ -448,7 +463,25 @@ export function isMemoryHistoryCommand(
     c.type === "memory_history" &&
     typeof c.request_id === "string" &&
     typeof c.agent_id === "string" &&
-    typeof c.file_path === "string"
+    (c.file_path === undefined || typeof c.file_path === "string")
+  );
+}
+
+export function isMemoryCommitDiffCommand(
+  value: unknown,
+): value is MemoryCommitDiffCommand {
+  if (!value || typeof value !== "object") return false;
+  const c = value as {
+    type?: unknown;
+    request_id?: unknown;
+    agent_id?: unknown;
+    sha?: unknown;
+  };
+  return (
+    c.type === "memory_commit_diff" &&
+    typeof c.request_id === "string" &&
+    typeof c.agent_id === "string" &&
+    typeof c.sha === "string"
   );
 }
 
@@ -534,6 +567,24 @@ export function isUpdateModelCommand(
     typeof payload.model_handle === "string";
 
   return hasModelId && hasModelHandle && hasAtLeastOne;
+}
+
+export function isUpdateToolsetCommand(
+  value: unknown,
+): value is UpdateToolsetCommand {
+  if (!value || typeof value !== "object") return false;
+  const c = value as {
+    type?: unknown;
+    request_id?: unknown;
+    runtime?: unknown;
+    toolset_preference?: unknown;
+  };
+  return (
+    c.type === "update_toolset" &&
+    typeof c.request_id === "string" &&
+    isRuntimeScope(c.runtime) &&
+    typeof c.toolset_preference === "string"
+  );
 }
 
 export function isCronListCommand(value: unknown): value is CronListCommand {
@@ -739,8 +790,10 @@ export function isSetReflectionSettingsCommand(
   );
 }
 
-function isChannelId(value: unknown): value is "telegram" | "slack" {
-  return value === "telegram" || value === "slack";
+function isChannelId(
+  value: unknown,
+): value is "telegram" | "slack" | "discord" {
+  return value === "telegram" || value === "slack" || value === "discord";
 }
 
 function hasValidChannelPolicyFields(config: Record<string, unknown>): boolean {
@@ -824,6 +877,15 @@ export function isChannelAccountCreateCommand(
     return account.token === undefined || typeof account.token === "string";
   }
 
+  if (c.channel_id === "discord") {
+    return (
+      (account.token === undefined || typeof account.token === "string") &&
+      (account.agent_id === undefined ||
+        account.agent_id === null ||
+        typeof account.agent_id === "string")
+    );
+  }
+
   return (
     (account.bot_token === undefined ||
       typeof account.bot_token === "string") &&
@@ -865,6 +927,15 @@ export function isChannelAccountUpdateCommand(
 
   if (c.channel_id === "telegram") {
     return patch.token === undefined || typeof patch.token === "string";
+  }
+
+  if (c.channel_id === "discord") {
+    return (
+      (patch.token === undefined || typeof patch.token === "string") &&
+      (patch.agent_id === undefined ||
+        patch.agent_id === null ||
+        typeof patch.agent_id === "string")
+    );
   }
 
   return (
@@ -1014,6 +1085,10 @@ export function isChannelSetConfigCommand(
   }
 
   if (c.channel_id === "telegram") {
+    return config.token === undefined || typeof config.token === "string";
+  }
+
+  if (c.channel_id === "discord") {
     return config.token === undefined || typeof config.token === "string";
   }
 
@@ -1277,6 +1352,7 @@ export function parseServerMessage(
       isTerminalResizeCommand(parsed) ||
       isTerminalKillCommand(parsed) ||
       isSearchFilesCommand(parsed) ||
+      isGrepInFilesCommand(parsed) ||
       isListInDirectoryCommand(parsed) ||
       isGetTreeCommand(parsed) ||
       isReadFileCommand(parsed) ||
@@ -1288,9 +1364,11 @@ export function parseServerMessage(
       isListMemoryCommand(parsed) ||
       isMemoryHistoryCommand(parsed) ||
       isMemoryFileAtRefCommand(parsed) ||
+      isMemoryCommitDiffCommand(parsed) ||
       isEnableMemfsCommand(parsed) ||
       isListModelsCommand(parsed) ||
       isUpdateModelCommand(parsed) ||
+      isUpdateToolsetCommand(parsed) ||
       isCronListCommand(parsed) ||
       isCronAddCommand(parsed) ||
       isCronGetCommand(parsed) ||

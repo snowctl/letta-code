@@ -12,13 +12,6 @@ const pollForTokenMock = mock(async (): Promise<TokenResponse> => {
   throw new Error("pollForToken not mocked");
 });
 
-mock.module("../../auth/oauth", () => ({
-  LETTA_CLOUD_API_URL: "https://api.letta.com",
-  refreshAccessToken: refreshAccessTokenMock,
-  requestDeviceCode: requestDeviceCodeMock,
-  pollForToken: pollForTokenMock,
-}));
-
 const { __listenSubcommandTestUtils } = await import(
   "../../cli/subcommands/listen"
 );
@@ -37,6 +30,12 @@ describe("listen subcommand auth resolution", () => {
     refreshAccessTokenMock.mockReset();
     requestDeviceCodeMock.mockReset();
     pollForTokenMock.mockReset();
+    __listenSubcommandTestUtils.setOAuthDepsForTests({
+      LETTA_CLOUD_API_URL: "https://api.letta.com",
+      refreshAccessToken: refreshAccessTokenMock,
+      requestDeviceCode: requestDeviceCodeMock,
+      pollForToken: pollForTokenMock,
+    });
 
     delete process.env.LETTA_API_KEY;
     delete process.env.LETTA_BASE_URL;
@@ -75,6 +74,7 @@ describe("listen subcommand auth resolution", () => {
     } else {
       process.env.LETTA_BASE_URL = originalBaseUrl;
     }
+    __listenSubcommandTestUtils.setOAuthDepsForTests(null);
   });
 
   test("prefers explicit LETTA_API_KEY over saved OAuth credentials", async () => {

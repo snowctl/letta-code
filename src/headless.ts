@@ -7,11 +7,9 @@ import type {
 } from "@letta-ai/letta-client/resources/agents/agents";
 import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
 import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs";
-import type {
-  ApprovalDecision,
-  ApprovalResult,
-} from "./agent/approval-execution";
+import type { ApprovalResult } from "./agent/approval-execution";
 import {
+  buildFreshDenialApprovals,
   extractConflictDetail,
   fetchRunErrorDetail,
   getPreStreamErrorAction,
@@ -20,6 +18,7 @@ import {
   isEmptyResponseRetryable,
   isInvalidToolCallIdsError,
   parseRetryAfterHeaderMs,
+  STALE_APPROVAL_RECOVERY_DENIAL_REASON,
   shouldRetryRunMetadataError,
 } from "./agent/approval-recovery";
 import { handleBootstrapSessionState } from "./agent/bootstrapHandler";
@@ -94,6 +93,7 @@ import {
 } from "./reminders/state";
 import { getCurrentWorkingDirectory } from "./runtime-context";
 import { settingsManager, shouldPersistSessionState } from "./settings-manager";
+import { writeWireMessage } from "./streamJsonWriter";
 import { telemetry } from "./telemetry";
 import { trackBoundaryError } from "./telemetry/errorReporting";
 import { extractTelemetryInputText } from "./telemetry/input";
@@ -386,6 +386,27 @@ async function prepareHeadlessToolExecutionContext(params: {
   };
 }
 
+async function sendScopedApprovalMessages(params: {
+  agentId: string;
+  conversationId: string;
+  approvalMessages: Array<MessageCreate | ApprovalCreate>;
+}): Promise<Awaited<ReturnType<typeof sendMessageStream>>> {
+  const approvalToolContext = await prepareHeadlessToolExecutionContext({
+    agentId: params.agentId,
+    conversationId: params.conversationId,
+  });
+
+  return await sendMessageStream(
+    params.conversationId,
+    params.approvalMessages,
+    {
+      agentId: params.agentId,
+      preparedToolContext:
+        approvalToolContext.preparedToolContext.preparedToolContext,
+    },
+  );
+}
+
 async function flushAndExit(code: number): Promise<never> {
   const flushWritable = (stream: NodeJS.WriteStream): Promise<void> =>
     new Promise((resolve) => {
@@ -448,13 +469,16 @@ export async function handleHeadlessCommand(
   }
 
   // Set CLI permission overrides if provided (inherited from parent agent)
-  if (values.allowedTools || values.disallowedTools) {
+  if (values.allowedTools || values.disallowedTools || values["memory-scope"]) {
     const { cliPermissions } = await import("./permissions/cli");
     if (values.allowedTools) {
       cliPermissions.setAllowedTools(values.allowedTools);
     }
     if (values.disallowedTools) {
       cliPermissions.setDisallowedTools(values.disallowedTools);
+    }
+    if (values["memory-scope"]) {
+      cliPermissions.setMemoryScope(values["memory-scope"]);
     }
   }
 
@@ -1304,11 +1328,21 @@ export async function handleHeadlessCommand(
       }
     }
   } else if (forceNewConversation) {
-    // --new flag: create a new conversation (for concurrent sessions)
-    const conversation = await client.conversations.create({
+    // --new flag: create a new conversation (for concurrent sessions).
+    // When --from-agent is set (agent-to-agent messaging), mark the new
+    // conversation as hidden so it doesn't clutter the target agent's
+    // default conversation list in the ADE. The `hidden` field is still
+    // missing from @letta-ai/letta-client@1.10.1 types, but the core
+    // endpoint accepts it and the SDK's create impl forwards unknown
+    // body fields unchanged — remove the cast once the SDK is bumped.
+    const createParams: Parameters<typeof client.conversations.create>[0] = {
       agent_id: agent.id,
       isolated_block_labels: isolatedBlockLabels,
-    });
+    };
+    if (fromAgentId) {
+      (createParams as { hidden?: boolean }).hidden = true;
+    }
+    const conversation = await client.conversations.create(createParams);
     conversationId = conversation.id;
   } else if (isSubagent) {
     // Freshly created subagents have no concurrency risk — use the default
@@ -1425,14 +1459,17 @@ export async function handleHeadlessCommand(
       reflection_step_count: effectiveReflectionSettings.stepCount,
       uuid: `init-${agent.id}`,
     };
-    console.log(JSON.stringify(initEvent));
+    writeWireMessage(initEvent);
   }
 
   const reminderContextTracker = createContextTracker();
   const sharedReminderState = createSharedReminderState();
+  let queuedRecoveredApprovalResults: ApprovalResult[] | null = null;
 
   // Helper to resolve any pending approvals before sending user input
-  const resolveAllPendingApprovals = async () => {
+  const resolveAllPendingApprovals = async (
+    mode: "queue_for_next_turn" | "send_immediately" = "send_immediately",
+  ) => {
     const { getResumeData } = await import("./agent/check-approval");
     while (true) {
       // Re-fetch agent to get latest in-context messages (source of truth for backend)
@@ -1456,104 +1493,23 @@ export async function handleHeadlessCommand(
       const pendingApprovals = resume.pendingApprovals || [];
       if (pendingApprovals.length === 0) break;
 
-      // Phase 1: Collect decisions for all approvals
-      type Decision =
-        | {
-            type: "approve";
-            approval: {
-              toolCallId: string;
-              toolName: string;
-              toolArgs: string;
-            };
-            reason: string;
-            matchedRule: string;
-          }
-        | {
-            type: "deny";
-            approval: {
-              toolCallId: string;
-              toolName: string;
-              toolArgs: string;
-            };
-            reason: string;
-          };
-
-      const { autoAllowed, autoDenied } = await classifyApprovals(
+      const denialResults = buildFreshDenialApprovals(
         pendingApprovals,
-        {
-          alwaysRequiresUserInput: isInteractiveApprovalTool,
-          treatAskAsDeny: true,
-          denyReasonForAsk: "Tool requires approval (headless mode)",
-          requireArgsForAutoApprove: true,
-          missingNameReason: "Tool call incomplete - missing name",
-        },
-      );
-
-      const decisions: Decision[] = [
-        ...autoAllowed.map((ac) => ({
-          type: "approve" as const,
-          approval: ac.approval,
-          reason: ac.permission.reason || "Allowed by permission rule",
-          matchedRule:
-            "matchedRule" in ac.permission && ac.permission.matchedRule
-              ? ac.permission.matchedRule
-              : "auto-approved",
-        })),
-        ...autoDenied.map((ac) => {
-          const fallback =
-            "matchedRule" in ac.permission && ac.permission.matchedRule
-              ? `Permission denied: ${ac.permission.matchedRule}`
-              : ac.permission.reason
-                ? `Permission denied: ${ac.permission.reason}`
-                : "Permission denied: Unknown reason";
-          return {
-            type: "deny" as const,
-            approval: ac.approval,
-            reason: ac.denyReason ?? fallback,
-          };
-        }),
-      ];
-
-      // Phase 2: Execute approved tools and format results using shared function
-      const { executeApprovalBatch } = await import(
-        "./agent/approval-execution"
-      );
-
-      // Emit auto_approval events for stream-json format
-      if (outputFormat === "stream-json") {
-        for (const decision of decisions) {
-          if (decision.type === "approve") {
-            const autoApprovalMsg: AutoApprovalMessage = {
-              type: "auto_approval",
-              tool_call: {
-                name: decision.approval.toolName,
-                tool_call_id: decision.approval.toolCallId,
-                arguments: decision.approval.toolArgs,
-              },
-              reason: decision.reason,
-              matched_rule: decision.matchedRule,
-              session_id: sessionId,
-              uuid: `auto-approval-${decision.approval.toolCallId}`,
-            };
-            console.log(JSON.stringify(autoApprovalMsg));
-          }
-        }
+        STALE_APPROVAL_RECOVERY_DENIAL_REASON,
+      ) as ApprovalResult[];
+      if (denialResults.length === 0) {
+        break;
       }
 
-      const recoveryToolContext = await prepareHeadlessToolExecutionContext({
-        agentId: agent.id,
-        conversationId,
-      });
-      availableTools = recoveryToolContext.availableTools;
-      const executedResults = await executeApprovalBatch(decisions, undefined, {
-        toolContextId:
-          recoveryToolContext.preparedToolContext.preparedToolContext.contextId,
-      });
+      if (mode === "queue_for_next_turn") {
+        queuedRecoveredApprovalResults = denialResults;
+        break;
+      }
 
       // Send all results in one batch
       const approvalInput: ApprovalCreate = {
         type: "approval",
-        approvals: executedResults as ApprovalResult[],
+        approvals: denialResults,
         otid: randomUUID(),
       };
 
@@ -1580,15 +1536,11 @@ export async function handleHeadlessCommand(
       }
 
       // Send the approval to clear the pending state; drain the stream without output
-      const approvalStream = await sendMessageStream(
+      const approvalStream = await sendScopedApprovalMessages({
+        agentId: agent.id,
         conversationId,
         approvalMessages,
-        {
-          agentId: agent.id,
-          preparedToolContext:
-            recoveryToolContext.preparedToolContext.preparedToolContext,
-        },
-      );
+      });
       const drainResult = await drainStreamWithResume(
         approvalStream,
         createBuffers(agent.id),
@@ -1615,7 +1567,7 @@ export async function handleHeadlessCommand(
   // For new agents/conversations, lazy recovery handles any edge cases
   if (isResumingAgent) {
     try {
-      await resolveAllPendingApprovals();
+      await resolveAllPendingApprovals("queue_for_next_turn");
     } catch (approvalError) {
       // Don't crash on pre-loop approval resolution (e.g., 409 from server-side
       // sleeptime run holding the conversation lock). The main loop's own
@@ -1628,7 +1580,7 @@ export async function handleHeadlessCommand(
           session_id: sessionId,
           uuid: `error-pre-loop-approval-${randomUUID()}`,
         };
-        console.log(JSON.stringify(errorMsg));
+        writeWireMessage(errorMsg);
       } else {
         console.error(
           `Warning: Failed to resolve pending approvals on resume: ${approvalError instanceof Error ? approvalError.message : String(approvalError)}`,
@@ -1674,7 +1626,7 @@ ${SYSTEM_REMINDER_CLOSE}
       conversationId,
     },
     state: sharedReminderState,
-    sessionContextReminderEnabled: systemInfoReminderEnabled,
+    systemInfoReminderEnabled,
     workingDirectory: getCurrentWorkingDirectory(),
     reflectionSettings: effectiveReflectionSettings,
     skillSources: resolvedSkillSources,
@@ -1738,6 +1690,19 @@ ${SYSTEM_REMINDER_CLOSE}
       otid: randomUUID(),
     },
   ];
+  const recoveredApprovalResults: ApprovalResult[] =
+    queuedRecoveredApprovalResults ?? [];
+  if (recoveredApprovalResults.length > 0) {
+    currentInput = [
+      {
+        type: "approval",
+        approvals: recoveredApprovalResults,
+        otid: randomUUID(),
+      },
+      ...currentInput,
+    ];
+    queuedRecoveredApprovalResults = null;
+  }
   const refreshCurrentInputOtids = () => {
     // Terminal stop-reason retries are NEW requests and must not reuse OTIDs.
     currentInput = currentInput.map((item) => ({
@@ -1767,7 +1732,7 @@ ${SYSTEM_REMINDER_CLOSE}
           session_id: sessionId,
           uuid: `error-max-turns-${randomUUID()}`,
         };
-        console.log(JSON.stringify(errorMsg));
+        writeWireMessage(errorMsg);
       } else {
         console.error(
           `Maximum turns limit reached (${buffers.usage.stepCount}/${maxTurns} steps)`,
@@ -1860,7 +1825,7 @@ ${SYSTEM_REMINDER_CLOSE}
               session_id: sessionId,
               uuid: `recovery-pre-stream-${randomUUID()}`,
             };
-            console.log(JSON.stringify(recoveryMsg));
+            writeWireMessage(recoveryMsg);
           } else {
             console.error(
               "Pending approval detected, resolving before retry...",
@@ -1916,7 +1881,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 session_id: sessionId,
                 uuid: `retry-conversation-busy-${randomUUID()}`,
               };
-              console.log(JSON.stringify(retryMsg));
+              writeWireMessage(retryMsg);
             } else {
               console.error(
                 `Conversation is busy, waiting ${Math.round(retryDelayMs / 1000)}s and retrying...`,
@@ -1983,7 +1948,7 @@ ${SYSTEM_REMINDER_CLOSE}
               session_id: sessionId,
               uuid: `retry-pre-stream-${randomUUID()}`,
             };
-            console.log(JSON.stringify(retryMsg));
+            writeWireMessage(retryMsg);
           } else {
             const delaySeconds = Math.round(delayMs / 1000);
             console.error(
@@ -2045,7 +2010,7 @@ ${SYSTEM_REMINDER_CLOSE}
                   },
                 }),
             };
-            console.log(JSON.stringify(errorEvent));
+            writeWireMessage(errorEvent);
             shouldOutputChunk = false;
           }
 
@@ -2065,7 +2030,7 @@ ${SYSTEM_REMINDER_CLOSE}
               session_id: sessionId,
               uuid: `recovery-${recoveryRunId || randomUUID()}`,
             };
-            console.log(JSON.stringify(recoveryMsg));
+            writeWireMessage(recoveryMsg);
             approvalPendingRecovery = true;
             return { stopReason: "error", shouldAccumulate: true };
           }
@@ -2100,7 +2065,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 session_id: sessionId,
                 uuid: `auto-approval-${approval.approval.toolCallId}`,
               };
-              console.log(JSON.stringify(autoApprovalMsg));
+              writeWireMessage(autoApprovalMsg);
               autoApprovalEmitted.add(approval.approval.toolCallId);
             }
           }
@@ -2119,7 +2084,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 session_id: sessionId,
                 uuid: uuid || randomUUID(),
               };
-              console.log(JSON.stringify(streamEvent));
+              writeWireMessage(streamEvent);
             } else {
               const msg: MessageWire = {
                 type: "message",
@@ -2127,7 +2092,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 session_id: sessionId,
                 uuid: uuid || randomUUID(),
               };
-              console.log(JSON.stringify(msg));
+              writeWireMessage(msg);
             }
           }
 
@@ -2352,7 +2317,7 @@ ${SYSTEM_REMINDER_CLOSE}
               session_id: sessionId,
               uuid: `retry-${lastRunId || randomUUID()}`,
             };
-            console.log(JSON.stringify(retryMsg));
+            writeWireMessage(retryMsg);
           } else {
             const delaySeconds = Math.round(delayMs / 1000);
             console.error(
@@ -2386,7 +2351,7 @@ ${SYSTEM_REMINDER_CLOSE}
             session_id: sessionId,
             uuid: `recovery-${lastRunId || randomUUID()}`,
           };
-          console.log(JSON.stringify(recoveryMsg));
+          writeWireMessage(recoveryMsg);
         } else {
           console.error(
             "Tool call ID mismatch; fetching actual pending approvals...",
@@ -2409,7 +2374,7 @@ ${SYSTEM_REMINDER_CLOSE}
               session_id: sessionId,
               uuid: `error-${lastRunId || randomUUID()}`,
             };
-            console.log(JSON.stringify(errorMsg));
+            writeWireMessage(errorMsg);
           } else {
             console.error("Failed to fetch pending approvals for resync");
           }
@@ -2497,7 +2462,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 session_id: sessionId,
                 uuid: `retry-empty-${lastRunId || randomUUID()}`,
               };
-              console.log(JSON.stringify(retryMsg));
+              writeWireMessage(retryMsg);
             } else {
               console.error(
                 `Empty LLM response, retrying (attempt ${attempt} of ${EMPTY_RESPONSE_MAX_RETRIES})...`,
@@ -2531,7 +2496,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 session_id: sessionId,
                 uuid: `retry-${lastRunId || randomUUID()}`,
               };
-              console.log(JSON.stringify(retryMsg));
+              writeWireMessage(retryMsg);
             } else {
               const delaySeconds = Math.round(delayMs / 1000);
               console.error(
@@ -2572,7 +2537,7 @@ ${SYSTEM_REMINDER_CLOSE}
                 session_id: sessionId,
                 uuid: `retry-${lastRunId || randomUUID()}`,
               };
-              console.log(JSON.stringify(retryMsg));
+              writeWireMessage(retryMsg);
             } else {
               const delaySeconds = Math.round(delayMs / 1000);
               console.error(
@@ -2646,7 +2611,7 @@ ${SYSTEM_REMINDER_CLOSE}
           session_id: sessionId,
           uuid: `error-${lastRunId || randomUUID()}`,
         };
-        console.log(JSON.stringify(errorMsg));
+        writeWireMessage(errorMsg);
       } else {
         console.error(`Error: ${errorMessage}`);
       }
@@ -2673,7 +2638,7 @@ ${SYSTEM_REMINDER_CLOSE}
         session_id: sessionId,
         uuid: `error-${lastKnownRunId || randomUUID()}`,
       };
-      console.log(JSON.stringify(errorMsg));
+      writeWireMessage(errorMsg);
     } else {
       console.error(`Error: ${errorDetails}`);
     }
@@ -2779,7 +2744,7 @@ ${SYSTEM_REMINDER_CLOSE}
       usage,
       uuid: resultUuid,
     };
-    console.log(JSON.stringify(resultEvent));
+    writeWireMessage(resultEvent);
   } else {
     // text format (default)
     if (!resultText || resultText === "No assistant response found") {
@@ -2824,15 +2789,18 @@ async function runBidirectionalMode(
   };
 
   // Emit init event
-  const initEvent = {
+  const initEvent: SystemInitMessage = {
     type: "system",
     subtype: "init",
     session_id: sessionId,
     agent_id: agent.id,
     conversation_id: conversationId,
-    model: agent.llm_config?.model,
+    model: agent.llm_config?.model ?? "",
     tools: availableTools,
     cwd: getCurrentWorkingDirectory(),
+    mcp_servers: [],
+    permission_mode: "",
+    slash_commands: [],
     memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
     skill_sources: skillSources,
     system_info_reminder_enabled: systemInfoReminderEnabled,
@@ -2840,7 +2808,7 @@ async function runBidirectionalMode(
     reflection_step_count: reflectionSettings.stepCount,
     uuid: `init-${agent.id}`,
   };
-  console.log(JSON.stringify(initEvent));
+  writeWireMessage(initEvent);
 
   // Track current operation for interrupt support
   let currentAbortController: AbortController | null = null;
@@ -2872,78 +2840,17 @@ async function runBidirectionalMode(
       const pendingApprovals = resume.pendingApprovals || [];
       if (pendingApprovals.length === 0) break;
 
-      type Decision =
-        | {
-            type: "approve";
-            approval: {
-              toolCallId: string;
-              toolName: string;
-              toolArgs: string;
-            };
-            reason: string;
-            matchedRule: string;
-          }
-        | {
-            type: "deny";
-            approval: {
-              toolCallId: string;
-              toolName: string;
-              toolArgs: string;
-            };
-            reason: string;
-          };
-
-      const { autoAllowed, autoDenied } = await classifyApprovals(
+      const denialResults = buildFreshDenialApprovals(
         pendingApprovals,
-        {
-          treatAskAsDeny: true,
-          denyReasonForAsk: "Tool requires approval (headless mode)",
-          requireArgsForAutoApprove: true,
-          missingNameReason: "Tool call incomplete - missing name",
-        },
-      );
-
-      const decisions: Decision[] = [
-        ...autoAllowed.map((ac) => ({
-          type: "approve" as const,
-          approval: ac.approval,
-          reason: ac.permission.reason || "Allowed by permission rule",
-          matchedRule:
-            "matchedRule" in ac.permission && ac.permission.matchedRule
-              ? ac.permission.matchedRule
-              : "auto-approved",
-        })),
-        ...autoDenied.map((ac) => {
-          const fallback =
-            "matchedRule" in ac.permission && ac.permission.matchedRule
-              ? `Permission denied: ${ac.permission.matchedRule}`
-              : ac.permission.reason
-                ? `Permission denied: ${ac.permission.reason}`
-                : "Permission denied: Unknown reason";
-          return {
-            type: "deny" as const,
-            approval: ac.approval,
-            reason: ac.denyReason ?? fallback,
-          };
-        }),
-      ];
-
-      const { executeApprovalBatch } = await import(
-        "./agent/approval-execution"
-      );
-      const recoveryToolContext = await prepareHeadlessToolExecutionContext({
-        agentId: agent.id,
-        conversationId,
-      });
-      availableTools = recoveryToolContext.availableTools;
-      const executedResults = await executeApprovalBatch(decisions, undefined, {
-        toolContextId:
-          recoveryToolContext.preparedToolContext.preparedToolContext.contextId,
-      });
+        STALE_APPROVAL_RECOVERY_DENIAL_REASON,
+      ) as ApprovalResult[];
+      if (denialResults.length === 0) {
+        break;
+      }
 
       const approvalInput: ApprovalCreate = {
         type: "approval",
-        approvals: executedResults as ApprovalResult[],
+        approvals: denialResults,
         otid: randomUUID(),
       };
 
@@ -2969,15 +2876,11 @@ async function runBidirectionalMode(
         }
       }
 
-      const approvalStream = await sendMessageStream(
+      const approvalStream = await sendScopedApprovalMessages({
+        agentId: agent.id,
         conversationId,
         approvalMessages,
-        {
-          agentId: agent.id,
-          preparedToolContext:
-            recoveryToolContext.preparedToolContext.preparedToolContext,
-        },
-      );
+      });
       const drainResult = await drainStreamWithResume(
         approvalStream,
         createBuffers(agent.id),
@@ -3013,7 +2916,7 @@ async function runBidirectionalMode(
   // events are always emitted here. emitQueueEvent is a no-op guard retained
   // for clarity and future-proofing against non-stream-json callers.
   const emitQueueEvent = (e: QueueLifecycleEvent): void => {
-    console.log(JSON.stringify(e));
+    writeWireMessage(e);
   };
 
   let turnInProgress = false;
@@ -3214,7 +3117,7 @@ async function runBidirectionalMode(
       request: canUseToolRequest,
     };
 
-    console.log(JSON.stringify(controlRequest));
+    writeWireMessage(controlRequest);
 
     const deferredLines: string[] = [];
 
@@ -3295,7 +3198,6 @@ async function runBidirectionalMode(
     }
 
     const { getResumeData } = await import("./agent/check-approval");
-    const { executeApprovalBatch } = await import("./agent/approval-execution");
 
     let approvalsProcessed = 0;
     const MAX_RECOVERY_PASSES = 8;
@@ -3331,71 +3233,29 @@ async function runBidirectionalMode(
         };
       }
 
-      const { autoAllowed, autoDenied, needsUserInput } =
-        await classifyApprovals(pendingApprovals, {
-          alwaysRequiresUserInput: isInteractiveApprovalTool,
-          requireArgsForAutoApprove: true,
-          missingNameReason: "Tool call incomplete - missing name",
-        });
-
-      const decisions: ApprovalDecision[] = [
-        ...autoAllowed.map((ac) => ({
-          type: "approve" as const,
-          approval: ac.approval,
-        })),
-        ...autoDenied.map((ac) => ({
-          type: "deny" as const,
-          approval: ac.approval,
-          reason: ac.denyReason || ac.permission.reason || "Permission denied",
-        })),
-      ];
-
-      // In headless recovery mode, auto-deny approvals that would require user
-      // input. Calling requestPermission() here would block waiting for a
-      // response that will never come, causing a timeout.
-      for (const ac of needsUserInput) {
-        decisions.push({
-          type: "deny",
-          approval: ac.approval,
-          reason:
-            ac.denyReason ||
-            "Auto-denied during recovery - tool requires interactive approval",
-        });
-      }
-
-      if (decisions.length === 0) {
+      const denialResults = buildFreshDenialApprovals(
+        pendingApprovals,
+        STALE_APPROVAL_RECOVERY_DENIAL_REASON,
+      ) as ApprovalResult[];
+      if (denialResults.length === 0) {
         return {
           recovered: false,
           pending_approval: true,
           approvals_processed: approvalsProcessed,
         };
       }
-
-      const recoveryToolContext = await prepareHeadlessToolExecutionContext({
-        agentId: agent.id,
-        conversationId: targetConversationId,
-      });
-      availableTools = recoveryToolContext.availableTools;
-      const executedResults = await executeApprovalBatch(decisions, undefined, {
-        toolContextId:
-          recoveryToolContext.preparedToolContext.preparedToolContext.contextId,
-      });
-      approvalsProcessed += executedResults.length;
+      approvalsProcessed += denialResults.length;
 
       const approvalInput: ApprovalCreate = {
         type: "approval",
-        approvals: executedResults as ApprovalResult[],
+        approvals: denialResults,
         otid: randomUUID(),
       };
-      const approvalStream = await sendMessageStream(
-        targetConversationId,
-        [approvalInput],
-        {
-          agentId: agent.id,
-          preparedToolContext:
-            recoveryToolContext.preparedToolContext.preparedToolContext,
-        },
-      );
+      const approvalStream = await sendScopedApprovalMessages({
+        agentId: agent.id,
+        conversationId: targetConversationId,
+        approvalMessages: [approvalInput],
+      });
 
       const drainResult = await drainStreamWithResume(
         approvalStream,
@@ -3447,7 +3307,7 @@ async function runBidirectionalMode(
         session_id: sessionId,
         uuid: randomUUID(),
       };
-      console.log(JSON.stringify(errorMsg));
+      writeWireMessage(errorMsg);
       continue;
     }
 
@@ -3477,7 +3337,7 @@ async function runBidirectionalMode(
           session_id: sessionId,
           uuid: randomUUID(),
         };
-        console.log(JSON.stringify(initResponse));
+        writeWireMessage(initResponse);
       } else if (subtype === "interrupt") {
         // Abort current operation if any
         if (currentAbortController !== null) {
@@ -3493,7 +3353,7 @@ async function runBidirectionalMode(
           session_id: sessionId,
           uuid: randomUUID(),
         };
-        console.log(JSON.stringify(interruptResponse));
+        writeWireMessage(interruptResponse);
       } else if (subtype === "register_external_tools") {
         // Register external tools from SDK
         const toolsRequest = message.request as {
@@ -3516,7 +3376,7 @@ async function runBidirectionalMode(
               input,
             } as unknown as CanUseToolControlRequest, // Type cast for compatibility
           };
-          console.log(JSON.stringify(execRequest));
+          writeWireMessage(execRequest);
 
           // Wait for external_tool_result response
           while (true) {
@@ -3557,7 +3417,7 @@ async function runBidirectionalMode(
           session_id: sessionId,
           uuid: randomUUID(),
         };
-        console.log(JSON.stringify(registerResponse));
+        writeWireMessage(registerResponse);
       } else if (subtype === "bootstrap_session_state") {
         const bootstrapReq = message.request as BootstrapSessionStateRequest;
         const { getResumeData } = await import("./agent/check-approval");
@@ -3601,7 +3461,7 @@ async function runBidirectionalMode(
           client,
           hasPendingApproval,
         });
-        console.log(JSON.stringify(bootstrapResp));
+        writeWireMessage(bootstrapResp);
       } else if (subtype === "list_messages") {
         const listReq = message.request as ListMessagesControlRequest;
         const listResp = await handleListMessages({
@@ -3612,7 +3472,7 @@ async function runBidirectionalMode(
           requestId: requestId ?? "",
           client,
         });
-        console.log(JSON.stringify(listResp));
+        writeWireMessage(listResp);
       } else if (subtype === "recover_pending_approvals") {
         const recoverReq =
           message.request as RecoverPendingApprovalsControlRequest;
@@ -3629,7 +3489,7 @@ async function runBidirectionalMode(
             session_id: sessionId,
             uuid: randomUUID(),
           };
-          console.log(JSON.stringify(recoveryResponse));
+          writeWireMessage(recoveryResponse);
         } catch (error) {
           const recoveryError: ControlResponse = {
             type: "control_response",
@@ -3641,7 +3501,7 @@ async function runBidirectionalMode(
             session_id: sessionId,
             uuid: randomUUID(),
           };
-          console.log(JSON.stringify(recoveryError));
+          writeWireMessage(recoveryError);
         }
       } else {
         const errorResponse: ControlResponse = {
@@ -3654,7 +3514,7 @@ async function runBidirectionalMode(
           session_id: sessionId,
           uuid: randomUUID(),
         };
-        console.log(JSON.stringify(errorResponse));
+        writeWireMessage(errorResponse);
       }
       continue;
     }
@@ -3770,7 +3630,7 @@ async function runBidirectionalMode(
             conversationId,
           },
           state: sharedReminderState,
-          sessionContextReminderEnabled: systemInfoReminderEnabled,
+          systemInfoReminderEnabled,
           workingDirectory: getCurrentWorkingDirectory(),
           reflectionSettings,
           skillSources,
@@ -3858,7 +3718,7 @@ async function runBidirectionalMode(
                 session_id: sessionId,
                 uuid: `recovery-bidir-${randomUUID()}`,
               };
-              console.log(JSON.stringify(recoveryMsg));
+              writeWireMessage(recoveryMsg);
               await resolveAllPendingApprovals();
               continue;
             }
@@ -3888,7 +3748,7 @@ async function runBidirectionalMode(
                 session_id: sessionId,
                 uuid: `retry-bidir-${randomUUID()}`,
               };
-              console.log(JSON.stringify(retryMsg));
+              writeWireMessage(retryMsg);
 
               await new Promise((resolve) => setTimeout(resolve, delayMs));
               continue;
@@ -3923,7 +3783,7 @@ async function runBidirectionalMode(
                     },
                   }),
               };
-              console.log(JSON.stringify(errorEvent));
+              writeWireMessage(errorEvent);
               return { shouldAccumulate: true };
             }
 
@@ -3944,7 +3804,7 @@ async function runBidirectionalMode(
                 session_id: sessionId,
                 uuid: uuid || randomUUID(),
               };
-              console.log(JSON.stringify(streamEvent));
+              writeWireMessage(streamEvent);
             } else {
               const msg: MessageWire = {
                 type: "message",
@@ -3952,7 +3812,7 @@ async function runBidirectionalMode(
                 session_id: sessionId,
                 uuid: uuid || randomUUID(),
               };
-              console.log(JSON.stringify(msg));
+              writeWireMessage(msg);
             }
 
             return { shouldAccumulate: true };
@@ -4062,7 +3922,7 @@ async function runBidirectionalMode(
                 session_id: sessionId,
                 uuid: `auto-approval-${approvalItem.approval.toolCallId}`,
               };
-              console.log(JSON.stringify(autoApprovalMsg));
+              writeWireMessage(autoApprovalMsg);
             }
 
             for (const ac of needsUserInput) {
@@ -4102,7 +3962,7 @@ async function runBidirectionalMode(
                   session_id: sessionId,
                   uuid: `auto-approval-${ac.approval.toolCallId}`,
                 };
-                console.log(JSON.stringify(autoApprovalMsg));
+                writeWireMessage(autoApprovalMsg);
               } else {
                 decisions.push({
                   type: "deny",
@@ -4207,7 +4067,7 @@ async function runBidirectionalMode(
                 : "error", // Use "error" if sawStreamError but lastStopReason was end_turn
           }),
         };
-        console.log(JSON.stringify(resultMsg));
+        writeWireMessage(resultMsg);
       } catch (error) {
         // Use formatErrorDetails for comprehensive error formatting (same as one-shot mode)
         const errorDetails = formatErrorDetails(error, agent.id);
@@ -4223,7 +4083,7 @@ async function runBidirectionalMode(
           session_id: sessionId,
           uuid: randomUUID(),
         };
-        console.log(JSON.stringify(errorMsg));
+        writeWireMessage(errorMsg);
 
         // Also emit a result message with subtype: "error" so SDK knows the turn failed
         const errorResultMsg: ResultMessage = {
@@ -4241,7 +4101,7 @@ async function runBidirectionalMode(
           uuid: `result-error-${agent.id}-${Date.now()}`,
           stop_reason: "error",
         };
-        console.log(JSON.stringify(errorResultMsg));
+        writeWireMessage(errorResultMsg);
       } finally {
         turnInProgress = false;
         blockedEmittedThisTurn = false;
@@ -4258,7 +4118,7 @@ async function runBidirectionalMode(
       session_id: sessionId,
       uuid: randomUUID(),
     };
-    console.log(JSON.stringify(errorMsg));
+    writeWireMessage(errorMsg);
   }
 
   // Stdin closed, exit gracefully

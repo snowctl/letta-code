@@ -141,7 +141,7 @@ export interface ReflectionSettingsSnapshot {
   step_count: number;
 }
 
-export type ChannelId = "telegram" | "slack";
+export type ChannelId = "telegram" | "slack" | "discord";
 
 export interface ChannelSummary {
   channel_id: ChannelId;
@@ -175,6 +175,15 @@ export type ChannelConfigSnapshot =
       allowed_users: string[];
       has_bot_token: boolean;
       has_app_token: boolean;
+    }
+  | {
+      channel_id: "discord";
+      account_id: string;
+      display_name?: string;
+      enabled: boolean;
+      dm_policy: DmPolicy;
+      allowed_users: string[];
+      has_token: boolean;
     };
 
 export type ChannelAccountSnapshot =
@@ -209,6 +218,20 @@ export type ChannelAccountSnapshot =
       has_app_token: boolean;
       agent_id: string | null;
       default_permission_mode: SlackDefaultPermissionMode;
+      created_at: string;
+      updated_at: string;
+    }
+  | {
+      channel_id: "discord";
+      account_id: string;
+      display_name?: string;
+      enabled: boolean;
+      configured: boolean;
+      running: boolean;
+      dm_policy: DmPolicy;
+      allowed_users: string[];
+      has_token: boolean;
+      agent_id: string | null;
       created_at: string;
       updated_at: string;
     };
@@ -596,6 +619,51 @@ export interface SearchFilesCommand {
   cwd?: string;
 }
 
+/**
+ * Listener command — IntelliJ-style "find in files" content search.
+ * Returns line-level matches (text + line/column range) instead of
+ * just the file list so the client can render an IDE-grade results
+ * pane with snippet previews.
+ */
+export interface GrepInFilesCommand {
+  type: "grep_in_files";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Literal or regex pattern depending on `is_regex`. */
+  query: string;
+  /** When true, `query` is treated as a regex. Defaults to false. */
+  is_regex?: boolean;
+  /** Case-sensitive match. Defaults to false. */
+  case_sensitive?: boolean;
+  /** Whole-word match. Defaults to false. */
+  whole_word?: boolean;
+  /** Glob filter (e.g. "*.tsx" or "src/** /*.ts"). Empty = no filter. */
+  glob?: string;
+  /** Scope search to this absolute dir. Falls back to the index root. */
+  cwd?: string;
+  /** Max match lines returned (not files). Defaults to 500. */
+  max_results?: number;
+  /** Lines of context before/after each match. Defaults to 2. */
+  context_lines?: number;
+}
+
+export interface GrepInFilesMatch {
+  /** Path relative to the search root. */
+  path: string;
+  /** 1-based line number of the matched line. */
+  line: number;
+  /** 1-based column (character offset of match start, inclusive). */
+  column: number;
+  /** 1-based column of match end (exclusive). */
+  column_end: number;
+  /** The full matched line's text (no trailing newline). */
+  text: string;
+  /** Lines immediately before the match (up to context_lines). */
+  before?: string[];
+  /** Lines immediately after the match (up to context_lines). */
+  after?: string[];
+}
+
 export interface ListInDirectoryCommand {
   type: "list_in_directory";
   /** Absolute path to list entries in. */
@@ -708,8 +776,8 @@ export interface MemoryHistoryCommand {
   request_id: string;
   /** The agent whose memory history to fetch. */
   agent_id: string;
-  /** Relative path within the memory directory (e.g. "system/persona.md"). */
-  file_path: string;
+  /** Relative path within the memory directory (e.g. "system/persona.md"). Omit for global history across all files. */
+  file_path?: string;
   /** Max commits to return (default 50). */
   limit?: number;
 }
@@ -724,6 +792,16 @@ export interface MemoryFileAtRefCommand {
   file_path: string;
   /** Git SHA to read the file at. */
   ref: string;
+}
+
+export interface MemoryCommitDiffCommand {
+  type: "memory_commit_diff";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** The agent whose memory to read. */
+  agent_id: string;
+  /** Git SHA of the commit to show. */
+  sha: string;
 }
 
 export interface EnableMemfsCommand {
@@ -788,6 +866,26 @@ export interface UpdateModelResponseMessage {
   model_id?: string;
   model_handle?: string;
   model_settings?: Record<string, unknown> | null;
+  error?: string;
+}
+
+export interface UpdateToolsetCommand {
+  type: "update_toolset";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Runtime scope — identifies which agent + conversation this targets */
+  runtime: RuntimeScope;
+  /** The toolset preference to apply (e.g. "auto", "default", "codex", "gemini") */
+  toolset_preference: ToolsetPreference;
+}
+
+export interface UpdateToolsetResponseMessage {
+  type: "update_toolset_response";
+  request_id: string;
+  success: boolean;
+  runtime?: RuntimeScope;
+  current_toolset?: ToolsetName;
+  current_toolset_preference?: ToolsetPreference;
   error?: string;
 }
 
@@ -1455,6 +1553,7 @@ export type WsProtocolCommand =
   | TerminalResizeCommand
   | TerminalKillCommand
   | SearchFilesCommand
+  | GrepInFilesCommand
   | ListInDirectoryCommand
   | GetTreeCommand
   | ReadFileCommand
@@ -1466,9 +1565,11 @@ export type WsProtocolCommand =
   | ListMemoryCommand
   | MemoryHistoryCommand
   | MemoryFileAtRefCommand
+  | MemoryCommitDiffCommand
   | EnableMemfsCommand
   | ListModelsCommand
   | UpdateModelCommand
+  | UpdateToolsetCommand
   | CronListCommand
   | CronAddCommand
   | CronGetCommand
@@ -1511,6 +1612,7 @@ export type WsProtocolMessage =
   | SubagentStateUpdateMessage
   | ListModelsResponseMessage
   | UpdateModelResponseMessage
+  | UpdateToolsetResponseMessage
   | ChannelsListResponseMessage
   | ChannelAccountsListResponseMessage
   | ChannelAccountCreateResponseMessage

@@ -178,6 +178,81 @@ function normalizeSlackText(text: string): string {
   return text.replace(/^(?:\s*<@[A-Z0-9]+>\s*)+/, "").trim();
 }
 
+const IGNORED_SLACK_MESSAGE_SUBTYPES = new Set([
+  "assistant_app_thread",
+  "bot_message",
+  "channel_archive",
+  "channel_convert_to_private",
+  "channel_convert_to_public",
+  "channel_join",
+  "channel_leave",
+  "channel_name",
+  "channel_posting_permissions",
+  "channel_purpose",
+  "channel_topic",
+  "channel_unarchive",
+  "document_mention",
+  "ekm_access_denied",
+  "file_comment",
+  "group_archive",
+  "group_join",
+  "group_leave",
+  "group_name",
+  "group_purpose",
+  "group_topic",
+  "group_unarchive",
+  "pinned_item",
+  "reminder_add",
+  "unpinned_item",
+]);
+
+const WRAPPER_SLACK_MESSAGE_SUBTYPES = new Set([
+  "message_changed",
+  "message_deleted",
+  "message_replied",
+]);
+
+type SlackProcessableInboundMessage = Record<string, unknown> & {
+  user: string;
+  ts: string;
+};
+
+function isProcessableSlackInboundMessage(
+  rawMessage: Record<string, unknown>,
+): rawMessage is SlackProcessableInboundMessage {
+  if (isNonEmptyString(rawMessage.bot_id)) {
+    return false;
+  }
+
+  if (!isNonEmptyString(rawMessage.user) || !isNonEmptyString(rawMessage.ts)) {
+    return false;
+  }
+
+  // Slack uses subtypes for both real user-authored messages (for example
+  // thread broadcasts and file shares) and bookkeeping/admin wrappers. Don't
+  // blanket-drop all subtype messages; instead ignore the known non-user
+  // variants and let genuine user messages keep flowing into the routed thread.
+  if (rawMessage.hidden === true) {
+    return false;
+  }
+
+  const subtype = isNonEmptyString(rawMessage.subtype)
+    ? rawMessage.subtype
+    : null;
+  if (!subtype) {
+    return true;
+  }
+
+  if (IGNORED_SLACK_MESSAGE_SUBTYPES.has(subtype)) {
+    return false;
+  }
+
+  return !(
+    WRAPPER_SLACK_MESSAGE_SUBTYPES.has(subtype) &&
+    asRecord(rawMessage.message) !== null
+  );
+}
+
 function slackTimestampToMillis(timestamp: string): number {
   return Math.round(Number.parseFloat(timestamp) * 1000);
 }
@@ -629,13 +704,7 @@ export function createSlackAdapter(
         return;
       }
 
-      if (
-        (isNonEmptyString(rawMessage.subtype) &&
-          rawMessage.subtype !== "file_share") ||
-        isNonEmptyString(rawMessage.bot_id) ||
-        !isNonEmptyString(rawMessage.user) ||
-        !isNonEmptyString(rawMessage.ts)
-      ) {
+      if (!isProcessableSlackInboundMessage(rawMessage)) {
         return;
       }
 

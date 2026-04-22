@@ -9,7 +9,12 @@ import type { ApprovalResult } from "../../agent/approval-execution";
 import { fetchRunErrorInfo } from "../../agent/approval-recovery";
 import { getResumeData } from "../../agent/check-approval";
 import { getClient } from "../../agent/client";
-import { setConversationId, setCurrentAgentId } from "../../agent/context";
+import {
+  getConversationId,
+  getCurrentAgentId,
+  setConversationId,
+  setCurrentAgentId,
+} from "../../agent/context";
 import { getMemoryFilesystemRoot } from "../../agent/memoryFilesystem";
 import {
   getStreamToolContextId,
@@ -219,18 +224,17 @@ function buildMaybeLaunchReflectionSubagent(params: {
         parentMemory,
       });
 
-      const { spawnBackgroundSubagentTask } = await import(
-        "../../tools/impl/Task"
-      );
+      const { spawnBackgroundSubagentTask, waitForBackgroundSubagentAgentId } =
+        await import("../../tools/impl/Task");
       const { subagentId } = spawnBackgroundSubagentTask({
         subagentType: "reflection",
         prompt: reflectionPrompt,
         description: AUTO_REFLECTION_DESCRIPTION,
         silentCompletion: true,
         parentScope: { agentId, conversationId },
-        onComplete: async ({ success, error }) => {
+        onComplete: async ({ success, error, agentId: reflectionAgentId }) => {
           telemetry.trackReflectionEnd(triggerSource, success, {
-            subagentId,
+            subagentId: reflectionAgentId ?? undefined,
             conversationId,
             error,
           });
@@ -278,8 +282,12 @@ function buildMaybeLaunchReflectionSubagent(params: {
           );
         },
       });
-      telemetry.trackReflectionStart(triggerSource, {
+      const reflectionAgentId = await waitForBackgroundSubagentAgentId(
         subagentId,
+        1000,
+      );
+      telemetry.trackReflectionStart(triggerSource, {
+        subagentId: reflectionAgentId ?? undefined,
         conversationId,
         startMessageId: autoPayload.startMessageId,
         endMessageId: autoPayload.endMessageId,
@@ -455,6 +463,9 @@ export async function handleIncomingMessage(
         "content" in m && !m.otid
           ? {
               ...m,
+              // Ensure every client-originated message carries an OTID so the
+              // echoed user_message can reconcile optimistic local transcript
+              // rows with the later canonical backend message.id.
               otid:
                 "client_message_id" in m &&
                 typeof m.client_message_id === "string"
@@ -1159,6 +1170,26 @@ export async function handleIncomingMessage(
       agent_id: agentId || null,
       conversation_id: conversationId,
     });
+
+    try {
+      const currentConversationId = getConversationId();
+      let currentAgentId: string | null = null;
+      try {
+        currentAgentId = getCurrentAgentId();
+      } catch {
+        currentAgentId = null;
+      }
+
+      if (
+        currentAgentId === (agentId ?? null) &&
+        currentConversationId === conversationId
+      ) {
+        setCurrentAgentId(null);
+        setConversationId(null);
+      }
+    } catch {
+      // Best-effort cleanup only. Never let teardown obscure the turn result.
+    }
 
     runtime.activeAbortController = null;
     runtime.cancelRequested = false;

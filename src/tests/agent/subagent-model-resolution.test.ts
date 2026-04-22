@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import type { SubagentConfig } from "../../agent/subagents";
 import {
   buildSubagentArgs,
@@ -55,6 +56,45 @@ describe("resolveSubagentLauncher", () => {
     expect(launcher).toEqual({
       command: "/opt/homebrew/bin/bun",
       args: ["/tmp/custom-runner.ts", "--output-format", "stream-json"],
+    });
+  });
+
+  test("resolves relative dev entrypoint against launcher cwd", () => {
+    const cwd =
+      process.platform === "win32"
+        ? path.win32.join("C:\\", "Users", "example", "dev", "letta-code-prod")
+        : path.posix.join("/", "Users", "example", "dev", "letta-code-prod");
+    const expectedScriptPath =
+      process.platform === "win32"
+        ? path.win32.join(cwd, "src", "index.ts")
+        : path.posix.join(cwd, "src", "index.ts");
+    const execPath =
+      process.platform === "win32"
+        ? "C:\\bun\\bun.exe"
+        : "/opt/homebrew/bin/bun";
+
+    const launcher = resolveSubagentLauncher(
+      ["--output-format", "stream-json"],
+      {
+        env: {} as NodeJS.ProcessEnv,
+        argv: ["bun", "src/index.ts"],
+        execPath,
+        platform: process.platform,
+        cwd,
+      },
+    );
+
+    expect(launcher).toEqual({
+      command: execPath,
+      args: [
+        "--loader:.md=text",
+        "--loader:.mdx=text",
+        "--loader:.txt=text",
+        "run",
+        expectedScriptPath,
+        "--output-format",
+        "stream-json",
+      ],
     });
   });
 

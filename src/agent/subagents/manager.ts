@@ -8,7 +8,6 @@
  */
 
 import { spawn } from "node:child_process";
-import { createInterface } from "node:readline";
 import { buildChatUrl } from "../../cli/helpers/appUrls";
 import {
   addToolCall,
@@ -21,11 +20,18 @@ import {
   SYSTEM_REMINDER_OPEN,
 } from "../../constants";
 import { cliPermissions } from "../../permissions/cli";
-import { resolveAllowedMemoryRoots } from "../../permissions/memoryScope";
+import {
+  parseScopeList,
+  resolveAllowedMemoryRoots,
+} from "../../permissions/memoryScope";
 import { permissionMode } from "../../permissions/mode";
 import { sessionPermissions } from "../../permissions/session";
+import { getCurrentWorkingDirectory } from "../../runtime-context";
 import { settingsManager } from "../../settings-manager";
-import { resolveLettaInvocation } from "../../tools/impl/shellEnv";
+import {
+  resolveEntryScriptPath,
+  resolveLettaInvocation,
+} from "../../tools/impl/shellEnv";
 import { getErrorMessage } from "../../utils/error";
 import { getAvailableModelHandles } from "../available-models";
 import { getClient } from "../client";
@@ -293,7 +299,7 @@ function handleInitEvent(
     const agentURL = buildChatUrl(event.agent_id, {
       conversationId: event.conversation_id,
     });
-    updateSubagent(subagentId, { agentURL });
+    updateSubagent(subagentId, { agentId: event.agent_id, agentURL });
   }
   if (event.conversation_id) {
     state.conversationId = event.conversation_id;
@@ -486,6 +492,7 @@ interface ResolveSubagentLauncherOptions {
   argv?: string[];
   execPath?: string;
   platform?: NodeJS.Platform;
+  cwd?: string;
 }
 
 interface SubagentLauncher {
@@ -495,7 +502,7 @@ interface SubagentLauncher {
 
 export function resolveSubagentWorkingDirectory(
   env: NodeJS.ProcessEnv = process.env,
-  fallbackCwd: string = process.cwd(),
+  fallbackCwd: string = getCurrentWorkingDirectory(),
 ): string {
   return env.USER_CWD || fallbackCwd;
 }
@@ -508,8 +515,9 @@ export function resolveSubagentLauncher(
   const argv = options.argv ?? process.argv;
   const execPath = options.execPath ?? process.execPath;
   const platform = options.platform ?? process.platform;
+  const cwd = options.cwd ?? process.cwd();
 
-  const invocation = resolveLettaInvocation(env, argv, execPath);
+  const invocation = resolveLettaInvocation(env, argv, execPath, cwd);
   if (invocation) {
     return {
       command: invocation.command,
@@ -518,12 +526,13 @@ export function resolveSubagentLauncher(
   }
 
   const currentScript = argv[1] || "";
+  const resolvedCurrentScript = resolveEntryScriptPath(currentScript, cwd);
 
   // Preserve historical subagent behavior: any .ts entrypoint uses runtime binary.
   if (currentScript.endsWith(".ts")) {
     return {
       command: execPath,
-      args: [currentScript, ...cliArgs],
+      args: [resolvedCurrentScript, ...cliArgs],
     };
   }
 
@@ -531,13 +540,13 @@ export function resolveSubagentLauncher(
   if (currentScript.endsWith(".js") && platform === "win32") {
     return {
       command: execPath,
-      args: [currentScript, ...cliArgs],
+      args: [resolvedCurrentScript, ...cliArgs],
     };
   }
 
   if (currentScript.endsWith(".js")) {
     return {
-      command: currentScript,
+      command: resolvedCurrentScript,
       args: cliArgs,
     };
   }
@@ -724,6 +733,7 @@ async function executeSubagent(
       ...(inheritedApiKey && { LETTA_API_KEY: inheritedApiKey }),
       ...(inheritedBaseUrl && { LETTA_BASE_URL: inheritedBaseUrl }),
       LETTA_CODE_AGENT_ROLE: "subagent",
+      USER_CWD: subagentWorkingDirectory,
       ...(parentAgentId && { LETTA_PARENT_AGENT_ID: parentAgentId }),
     };
 
@@ -736,12 +746,17 @@ async function executeSubagent(
         delete childEnv.LETTA_MEMORY_DIR;
       }
 
-      const parentMemoryDir =
-        process.env.MEMORY_DIR || process.env.LETTA_MEMORY_DIR;
-      if (parentMemoryDir && parentMemoryDir.trim().length > 0) {
-        childEnv.PARENT_MEMORY_DIR = parentMemoryDir;
+      // Authorize the child to write the parent's memory via the
+      // cross-agent guard. Compose the scope transitively so that
+      // grandchildren also see the full ancestor chain.
+      const nextScope = new Set(parseScopeList(process.env.LETTA_MEMORY_SCOPE));
+      if (parentAgentId) {
+        nextScope.add(parentAgentId);
+      }
+      if (nextScope.size > 0) {
+        childEnv.LETTA_MEMORY_SCOPE = [...nextScope].join(",");
       } else {
-        delete childEnv.PARENT_MEMORY_DIR;
+        delete childEnv.LETTA_MEMORY_SCOPE;
       }
     }
 
@@ -778,23 +793,21 @@ async function executeSubagent(
       pendingToolCalls: new Map(),
     };
 
-    // Create readline interface to parse JSON events line by line
-    const rl = createInterface({
-      input: proc.stdout,
-      crlfDelay: Number.POSITIVE_INFINITY,
-    });
+    // Parse child stdout manually instead of using readline. This keeps the
+    // stream handling simple and avoids Bun/runtime-specific instability in
+    // nested child-process line readers.
+    let stdoutBuffer = "";
+    proc.stdout.on("data", (data: Buffer | string) => {
+      const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      stdoutChunks.push(chunk);
+      stdoutBuffer += chunk.toString("utf-8");
 
-    let rlClosed = false;
-    const rlClosedPromise = new Promise<void>((resolve) => {
-      rl.once("close", () => {
-        rlClosed = true;
-        resolve();
-      });
-    });
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() ?? "";
 
-    rl.on("line", (line: string) => {
-      stdoutChunks.push(Buffer.from(`${line}\n`));
-      processStreamEvent(line, state, subagentId);
+      for (const line of lines) {
+        processStreamEvent(line, state, subagentId);
+      }
     });
 
     proc.stderr.on("data", (data: Buffer) => {
@@ -807,12 +820,11 @@ async function executeSubagent(
       proc.on("error", () => resolve(null));
     });
 
-    // Ensure all stdout lines have been processed before completing.
+    // Ensure the trailing partial line is processed before completing.
     // Without this, late tool events can be dropped before Task marks completion.
-    if (!rlClosed) {
-      rl.close();
+    if (stdoutBuffer.length > 0) {
+      processStreamEvent(stdoutBuffer, state, subagentId);
     }
-    await rlClosedPromise;
 
     // Clean up abort listener
     signal?.removeEventListener("abort", abortHandler);
@@ -946,8 +958,13 @@ ${SYSTEM_REMINDER_CLOSE}
 function buildForkSystemReminder(subagentType?: string): string {
   if (subagentType === "recall") {
     return `${SYSTEM_REMINDER_OPEN}
-You have been forked from the primary conversational thread to run as an independent subagent.
-You CANNOT ask questions mid-execution - all instructions are provided upfront.
+You have been forked from the primary conversational thread to run as an independent subagent. The fork only exists so you can see the parent agent's conversation trajectory in-context as reference — you are NOT the primary agent and do not share its tools.
+
+**Your sole task is now to search previous conversation history and provide a report. Ignore any existing ongoing tasks.** Do not attempt to continue, finish, or act on anything the primary agent was in the middle of doing.
+
+Your toolset is limited to Bash, Read, and TaskOutput. You cannot edit files, run skills, dispatch further tasks, or take any action beyond searching messages and returning a report.
+
+You CANNOT ask questions mid-execution — all instructions are provided upfront.
 Your final message will be returned to the caller.
 
 ${recallSubagentPrompt}
@@ -957,8 +974,13 @@ ${SYSTEM_REMINDER_CLOSE}
   }
 
   return `${SYSTEM_REMINDER_OPEN}
-You have been forked from the primary conversational thread to run as an independent subagent.
-You CANNOT ask questions mid-execution - all instructions are provided upfront.
+You have been forked from the primary conversational thread to run as an independent subagent. The fork only exists so you can see the parent agent's conversation trajectory in-context as reference — you are NOT the primary agent and do not share its full toolset.
+
+**Your sole task is the one described in the user message below. Ignore any existing ongoing tasks from the inherited trajectory.** Do not attempt to continue, finish, or act on anything the primary agent was in the middle of doing.
+
+You have a scoped toolset that may differ from the primary agent's. Stay within it; don't assume you have the primary's full tool access.
+
+You CANNOT ask questions mid-execution — all instructions are provided upfront.
 Your final message will be returned to the caller.
 ${SYSTEM_REMINDER_CLOSE}
 
