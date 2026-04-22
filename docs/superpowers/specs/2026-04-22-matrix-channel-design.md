@@ -71,6 +71,10 @@ const client = new MatrixClient(homeserverUrl, accessToken, storageProvider, cry
 
 The `RustSdkCryptoStorageProvider` wraps `@matrix-org/matrix-sdk-crypto-nodejs` (Rust OlmMachine bindings). Tested under Bun 1.3.9: all crypto operations work; a Tokio-runtime panic occurs only on process exit (Bun teardown quirk) and does not affect runtime correctness or storage integrity.
 
+**Device identity:** On first start with an empty crypto store the SDK calls `whoami` to obtain the server-assigned `device_id` and persists it. On subsequent starts the stored `device_id` is reused — the bot is the same Matrix device across restarts. If the crypto store is lost or the access token changes, a new device is created and previously encrypted messages become undecryptable.
+
+**Trust model:** The SDK has no TOFU, cross-signing, or device verification API. It encrypts outgoing messages for all known devices in a room without verification, and decrypts incoming messages transparently. In rooms where a user has "never send to unverified devices" enabled, the bot will be silently excluded from receiving room keys — messages in those rooms will fail to decrypt. This is an uncommon strict setting and is an accepted limitation of the best-effort stance.
+
 Storage paths:
 - `~/.letta/channels/matrix/<accountId>/storage.json` — bot sync state
 - `~/.letta/channels/matrix/<accountId>/crypto/` — E2EE key store (if enabled)
