@@ -307,6 +307,62 @@ export function createTelegramAdapter(
         return;
       }
 
+      const chatId = String(msg.chat.id);
+      const feedbackEntry = awaitingFeedback.get(chatId);
+      if (feedbackEntry) {
+        const text = typeof msg.text === "string" ? msg.text.trim() : "";
+        if (!text) {
+          await instance.api.sendMessage(
+            chatId,
+            "Please type a non-empty reply.",
+            {},
+          );
+          return;
+        }
+
+        awaitingFeedback.delete(chatId);
+
+        const inbound: InboundChannelMessage = {
+          channel: "telegram",
+          accountId: config.accountId,
+          chatId,
+          senderId: String(msg.from.id),
+          senderName: getTelegramSenderName(msg),
+          text,
+          timestamp: msg.date * 1000,
+          messageId: String(msg.message_id),
+          chatType: "direct",
+        };
+
+        if (adapter.onMessage) {
+          try {
+            await adapter.onMessage(inbound);
+          } catch (error) {
+            console.error("[Telegram] Error handling feedback message:", error);
+          }
+        }
+
+        const buttonEntry = buttonMessages.get(feedbackEntry.requestId);
+        if (buttonEntry) {
+          buttonMessages.delete(feedbackEntry.requestId);
+          const confirmationText =
+            feedbackEntry.action === "deny_reason"
+              ? `❌ Denied: ${text}`
+              : `Selected: ${text}`;
+          try {
+            await instance.api.editMessageText(
+              chatId,
+              Number(buttonEntry.messageId),
+              confirmationText,
+            );
+          } catch {
+            await instance.api.sendMessage(chatId, confirmationText, {});
+          }
+        }
+
+        return;
+      }
+
       const mediaGroupId =
         typeof msg.media_group_id === "string" ? msg.media_group_id : null;
       if (mediaGroupId) {
@@ -571,6 +627,8 @@ export function createTelegramAdapter(
         clearTimeout(entry.timer);
       }
       bufferedMediaGroups.clear();
+      buttonMessages.clear();
+      awaitingFeedback.clear();
 
       if (!running || !bot) return;
       await bot.stop();
