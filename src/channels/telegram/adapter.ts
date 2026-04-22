@@ -652,6 +652,55 @@ export function createTelegramAdapter(
         return;
       }
 
+      if (event.kind === "ask_user_question") {
+        const input = event.input as {
+          questions?: Array<{
+            question?: string;
+            options?: Array<{ label?: string }>;
+          }>;
+        };
+        const firstQuestion = (input.questions ?? [])[0];
+        const options = firstQuestion?.options ?? [];
+
+        if (options.length > 0) {
+          const text = formatChannelControlRequestPrompt(event);
+          const optionButtons = options.map((option) => ({
+            text: option.label ?? "Option",
+            callback_data: JSON.stringify({
+              requestId: event.requestId,
+              action: "option",
+              value: option.label ?? "",
+            }),
+          }));
+          const result = await telegramBot.api.sendMessage(
+            event.source.chatId,
+            text,
+            {
+              ...(reply_parameters ? { reply_parameters } : {}),
+              reply_markup: {
+                inline_keyboard: [
+                  optionButtons,
+                  [
+                    {
+                      text: "✏️ Something else",
+                      callback_data: JSON.stringify({
+                        requestId: event.requestId,
+                        action: "freeform",
+                      }),
+                    },
+                  ],
+                ],
+              },
+            },
+          );
+          buttonMessages.set(event.requestId, {
+            chatId: event.source.chatId,
+            messageId: String(result.message_id),
+          });
+          return;
+        }
+      }
+
       await telegramBot.api.sendMessage(
         event.source.chatId,
         formatChannelControlRequestPrompt(event),
