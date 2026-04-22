@@ -58,6 +58,8 @@ class FakeBot {
     sendVoice: mock(async () => ({ message_id: 1005 })),
     sendAnimation: mock(async () => ({ message_id: 1006 })),
     getFile: mock(async (fileId: string) => FakeBot.nextGetFileImpl(fileId)),
+    answerCallbackQuery: mock(async () => true),
+    editMessageText: mock(async () => ({ message_id: 999 })),
   };
   catchHandler:
     | ((error: {
@@ -153,6 +155,11 @@ beforeEach(() => {
     file_path: `photos/${fileId}.jpg`,
   });
   consoleErrorSpy.mockClear();
+  for (const instance of FakeBot.instances) {
+    instance.api.sendMessage.mockClear();
+    instance.api.answerCallbackQuery.mockClear();
+    instance.api.editMessageText.mockClear();
+  }
   console.error = consoleErrorSpy as typeof console.error;
   globalThis.fetch = originalFetch;
   delete process.env.OPENAI_API_KEY;
@@ -677,4 +684,50 @@ test("telegram adapter batches media groups and downloads inbound images", async
     rmSync(channelRoot, { recursive: true, force: true });
     channelRoot = mkdtempSync(join(tmpdir(), "letta-telegram-root-"));
   }
+});
+
+test("handleControlRequestEvent sends inline keyboard for generic_tool_approval", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  await adapter.start();
+
+  const event = {
+    requestId: "req-1",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "123",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: { command: "rm -rf /tmp/foo" },
+  };
+
+  await adapter.handleControlRequestEvent!(event);
+
+  const bot = FakeBot.instances[0];
+  expect(bot?.api.sendMessage).toHaveBeenCalledWith(
+    "123",
+    expect.stringContaining("Bash"),
+    expect.objectContaining({
+      reply_markup: {
+        inline_keyboard: [
+          [
+            expect.objectContaining({ text: "✅ Approve" }),
+            expect.objectContaining({ text: "❌ Deny" }),
+            expect.objectContaining({ text: "📝 Deny with Reason" }),
+          ],
+        ],
+      },
+    }),
+  );
 });
