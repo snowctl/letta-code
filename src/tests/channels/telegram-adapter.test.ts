@@ -729,3 +729,100 @@ test("handleControlRequestEvent sends inline keyboard for generic_tool_approval"
     }),
   );
 });
+
+test("handleControlRequestEvent sends option buttons for ask_user_question with options", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  await adapter.start();
+
+  const event = {
+    requestId: "req-2",
+    kind: "ask_user_question" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "123",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "AskUserQuestion",
+    input: {
+      questions: [
+        {
+          question: "Which environment?",
+          options: [{ label: "Staging" }, { label: "Production" }],
+        },
+      ],
+    },
+  };
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent(event);
+
+  const bot = FakeBot.instances[0];
+  expect(bot?.api.sendMessage).toHaveBeenCalledWith(
+    "123",
+    expect.stringContaining("Which environment"),
+    expect.objectContaining({
+      reply_markup: expect.objectContaining({
+        inline_keyboard: expect.arrayContaining([
+          expect.arrayContaining([
+            expect.objectContaining({ text: "Staging" }),
+            expect.objectContaining({ text: "Production" }),
+          ]),
+          [expect.objectContaining({ text: "✏️ Something else" })],
+        ]),
+      }),
+    }),
+  );
+});
+
+test("handleControlRequestEvent sends plain text for ask_user_question without options", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  await adapter.start();
+
+  const event = {
+    requestId: "req-3",
+    kind: "ask_user_question" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "123",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "AskUserQuestion",
+    input: {
+      questions: [{ question: "What is your name?" }],
+    },
+  };
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent(event);
+
+  const bot = FakeBot.instances[0];
+  expect(bot?.api.sendMessage).toHaveBeenCalledWith(
+    "123",
+    expect.stringContaining("What is your name"),
+    expect.not.objectContaining({ reply_markup: expect.anything() }),
+  );
+});
