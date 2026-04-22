@@ -155,11 +155,6 @@ beforeEach(() => {
     file_path: `photos/${fileId}.jpg`,
   });
   consoleErrorSpy.mockClear();
-  for (const instance of FakeBot.instances) {
-    instance.api.sendMessage.mockClear();
-    instance.api.answerCallbackQuery.mockClear();
-    instance.api.editMessageText.mockClear();
-  }
   console.error = consoleErrorSpy as typeof console.error;
   globalThis.fetch = originalFetch;
   delete process.env.OPENAI_API_KEY;
@@ -712,7 +707,10 @@ test("handleControlRequestEvent sends inline keyboard for generic_tool_approval"
     input: { command: "rm -rf /tmp/foo" },
   };
 
-  await adapter.handleControlRequestEvent!(event);
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent(event);
 
   const bot = FakeBot.instances[0];
   expect(bot?.api.sendMessage).toHaveBeenCalledWith(
