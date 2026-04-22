@@ -198,6 +198,14 @@ export function createTelegramAdapter(
   let botModule: GrammYModule | null = null;
   let running = false;
   const bufferedMediaGroups = new Map<string, BufferedMediaGroup>();
+  const buttonMessages = new Map<
+    string,
+    { chatId: string; messageId: string }
+  >();
+  const awaitingFeedback = new Map<
+    string,
+    { requestId: string; action: "deny_reason" | "freeform" }
+  >();
 
   async function ensureModule(): Promise<GrammYModule> {
     if (!botModule) {
@@ -600,6 +608,50 @@ export function createTelegramAdapter(
               ),
             }
           : undefined;
+
+      if (event.kind === "generic_tool_approval") {
+        const text = formatChannelControlRequestPrompt(event);
+        const result = await telegramBot.api.sendMessage(
+          event.source.chatId,
+          text,
+          {
+            ...(reply_parameters ? { reply_parameters } : {}),
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: "✅ Approve",
+                    callback_data: JSON.stringify({
+                      requestId: event.requestId,
+                      action: "approve",
+                    }),
+                  },
+                  {
+                    text: "❌ Deny",
+                    callback_data: JSON.stringify({
+                      requestId: event.requestId,
+                      action: "deny",
+                    }),
+                  },
+                  {
+                    text: "📝 Deny with Reason",
+                    callback_data: JSON.stringify({
+                      requestId: event.requestId,
+                      action: "deny_reason",
+                    }),
+                  },
+                ],
+              ],
+            },
+          },
+        );
+        buttonMessages.set(event.requestId, {
+          chatId: event.source.chatId,
+          messageId: String(result.message_id),
+        });
+        return;
+      }
+
       await telegramBot.api.sendMessage(
         event.source.chatId,
         formatChannelControlRequestPrompt(event),
