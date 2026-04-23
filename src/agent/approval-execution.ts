@@ -201,6 +201,7 @@ async function executeSingleDecision(
     toolContextId?: string;
     parentScope?: { agentId: string; conversationId: string };
     onFileWrite?: (filePath: string, content: string) => void;
+    onToolCall?: (toolName: string, description?: string) => void;
   },
 ): Promise<ApprovalResult> {
   // If aborted, record an interrupted result
@@ -269,6 +270,7 @@ async function executeSingleDecision(
                 )
             : undefined,
           onFileWrite: options?.onFileWrite,
+          onToolCall: options?.onToolCall,
         },
       );
 
@@ -379,6 +381,7 @@ export async function executeApprovalBatch(
     workingDirectory?: string;
     parentScope?: { agentId: string; conversationId: string };
     onFileWrite?: (filePath: string, content: string) => void;
+    onToolCall?: (toolName: string, description?: string) => void;
   },
 ): Promise<ApprovalResult[]> {
   const toolContextId =
@@ -447,6 +450,7 @@ export async function executeApprovalBatch(
       results[i] = await executeSingleDecision(decision, onChunk, {
         ...options,
         toolContextId,
+        onToolCall: options?.onToolCall,
       });
     }
   };
