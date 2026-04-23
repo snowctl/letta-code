@@ -7,7 +7,12 @@
  * platform chat IDs to agent+conversation pairs.
  */
 
-export const SUPPORTED_CHANNEL_IDS = ["telegram", "slack", "discord"] as const;
+export const SUPPORTED_CHANNEL_IDS = [
+  "telegram",
+  "slack",
+  "discord",
+  "matrix",
+] as const;
 export type SupportedChannelId = (typeof SUPPORTED_CHANNEL_IDS)[number];
 export type ChannelChatType = "direct" | "channel";
 export type SlackDefaultPermissionMode =
@@ -323,10 +328,21 @@ export interface DiscordChannelAccount extends ChannelAccountBase {
   agentId: string | null;
 }
 
+export interface MatrixChannelAccount extends ChannelAccountBase {
+  channel: "matrix";
+  homeserverUrl: string;
+  accessToken: string;
+  userId: string;
+  e2ee: boolean;
+  transcribeVoice?: boolean;
+  maxMediaDownloadBytes?: number;
+}
+
 export type ChannelAccount =
   | TelegramChannelAccount
   | SlackChannelAccount
-  | DiscordChannelAccount;
+  | DiscordChannelAccount
+  | MatrixChannelAccount;
 
 // ── Pairing ───────────────────────────────────────────────────────
 

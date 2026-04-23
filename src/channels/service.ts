@@ -95,6 +95,18 @@ export type ChannelConfigSnapshot =
       dmPolicy: DmPolicy;
       allowedUsers: string[];
       hasToken: boolean;
+    }
+  | {
+      channelId: "matrix";
+      accountId: string;
+      displayName?: string;
+      enabled: boolean;
+      dmPolicy: DmPolicy;
+      allowedUsers: string[];
+      hasHomeserverUrl: boolean;
+      hasAccessToken: boolean;
+      userId: string;
+      e2ee: boolean;
     };
 
 export interface PendingPairingSnapshot {
@@ -185,6 +197,24 @@ export type ChannelAccountSnapshot =
       agentId: string | null;
       createdAt: string;
       updatedAt: string;
+    }
+  | {
+      channelId: "matrix";
+      accountId: string;
+      displayName?: string;
+      enabled: boolean;
+      configured: boolean;
+      running: boolean;
+      dmPolicy: DmPolicy;
+      allowedUsers: string[];
+      hasHomeserverUrl: boolean;
+      hasAccessToken: boolean;
+      userId: string;
+      e2ee: boolean;
+      transcribeVoice: boolean;
+      maxMediaDownloadBytes?: number;
+      createdAt: string;
+      updatedAt: string;
     };
 
 export interface ChannelConfigPatch {
@@ -192,6 +222,10 @@ export interface ChannelConfigPatch {
   botToken?: string;
   appToken?: string;
   mode?: SlackChannelMode;
+  homeserverUrl?: string;
+  accessToken?: string;
+  userId?: string;
+  e2ee?: boolean;
   dmPolicy?: DmPolicy;
   allowedUsers?: string[];
 }
@@ -203,11 +237,16 @@ export interface ChannelAccountPatch {
   botToken?: string;
   appToken?: string;
   mode?: SlackChannelMode;
+  homeserverUrl?: string;
+  accessToken?: string;
+  userId?: string;
+  e2ee?: boolean;
   agentId?: string | null;
   defaultPermissionMode?: SlackDefaultPermissionMode;
   dmPolicy?: DmPolicy;
   allowedUsers?: string[];
   transcribeVoice?: boolean;
+  maxMediaDownloadBytes?: number;
 }
 
 let resolveChannelAccountDisplayNameOverride:
@@ -262,13 +301,24 @@ async function resolveChannelAccountDisplayName(
       );
     }
 
-    if (!account.botToken.trim() || !account.appToken.trim()) {
-      return undefined;
+    if (account.channel === "matrix") {
+      return normalizeDisplayName(account.userId);
     }
 
-    return normalizeDisplayName(
-      await resolveSlackAccountDisplayName(account.botToken, account.appToken),
-    );
+    if (account.channel === "slack") {
+      if (!account.botToken.trim() || !account.appToken.trim()) {
+        return undefined;
+      }
+
+      return normalizeDisplayName(
+        await resolveSlackAccountDisplayName(
+          account.botToken,
+          account.appToken,
+        ),
+      );
+    }
+
+    return undefined;
   } catch {
     return undefined;
   }
@@ -403,6 +453,14 @@ function isAccountConfigured(account: ChannelAccount): boolean {
     return account.token.trim().length > 0;
   }
 
+  if (account.channel === "matrix") {
+    return (
+      account.homeserverUrl.trim().length > 0 &&
+      account.accessToken.trim().length > 0 &&
+      account.userId.trim().length > 0
+    );
+  }
+
   return (
     account.botToken.trim().length > 0 && account.appToken.trim().length > 0
   );
@@ -459,6 +517,26 @@ function toAccountSnapshot(account: ChannelAccount): ChannelAccountSnapshot {
       allowedUsers: [...account.allowedUsers],
       hasToken: account.token.trim().length > 0,
       agentId: account.agentId,
+      createdAt: account.createdAt,
+      updatedAt: account.updatedAt,
+    };
+  }
+
+  if (account.channel === "matrix") {
+    return {
+      channelId: "matrix",
+      accountId: account.accountId,
+      displayName: account.displayName,
+      enabled: account.enabled,
+      configured: isAccountConfigured(account),
+      running,
+      dmPolicy: account.dmPolicy,
+      allowedUsers: [...account.allowedUsers],
+      hasHomeserverUrl: account.homeserverUrl.trim().length > 0,
+      hasAccessToken: account.accessToken.trim().length > 0,
+      userId: account.userId,
+      e2ee: account.e2ee,
+      transcribeVoice: account.transcribeVoice === true,
       createdAt: account.createdAt,
       updatedAt: account.updatedAt,
     };
@@ -578,6 +656,28 @@ function mergeAccountPatch(
     };
   }
 
+  if (existing.channel === "matrix") {
+    return {
+      ...existing,
+      displayName:
+        patch.displayName !== undefined
+          ? normalizeDisplayName(patch.displayName)
+          : existing.displayName,
+      enabled: patch.enabled ?? existing.enabled,
+      homeserverUrl: patch.homeserverUrl ?? existing.homeserverUrl,
+      accessToken: patch.accessToken ?? existing.accessToken,
+      userId: patch.userId ?? existing.userId,
+      e2ee: patch.e2ee ?? existing.e2ee,
+      transcribeVoice:
+        patch.transcribeVoice ?? existing.transcribeVoice ?? false,
+      maxMediaDownloadBytes:
+        patch.maxMediaDownloadBytes ?? existing.maxMediaDownloadBytes,
+      dmPolicy: patch.dmPolicy ?? existing.dmPolicy,
+      allowedUsers: patch.allowedUsers ?? existing.allowedUsers,
+      updatedAt: nextUpdatedAt,
+    };
+  }
+
   return {
     ...existing,
     displayName:
@@ -674,6 +774,21 @@ export function getChannelConfigSnapshot(
     };
   }
 
+  if (account.channel === "matrix") {
+    return {
+      channelId: "matrix",
+      accountId: account.accountId,
+      displayName: account.displayName,
+      enabled: account.enabled,
+      dmPolicy: account.dmPolicy,
+      allowedUsers: [...account.allowedUsers],
+      hasHomeserverUrl: account.homeserverUrl.trim().length > 0,
+      hasAccessToken: account.accessToken.trim().length > 0,
+      userId: account.userId,
+      e2ee: account.e2ee,
+    };
+  }
+
   return {
     channelId: "slack",
     accountId: account.accountId,
@@ -703,6 +818,10 @@ export async function setChannelConfigLive(
       botToken: patch.botToken,
       appToken: patch.appToken,
       mode: patch.mode,
+      homeserverUrl: patch.homeserverUrl,
+      accessToken: patch.accessToken,
+      userId: patch.userId,
+      e2ee: patch.e2ee,
       dmPolicy: patch.dmPolicy,
       allowedUsers: patch.allowedUsers,
       displayName: existing.displayName,
@@ -710,7 +829,11 @@ export async function setChannelConfigLive(
     shouldRefreshDisplayName =
       channelId === "telegram" || channelId === "discord"
         ? patch.token !== undefined
-        : patch.botToken !== undefined || patch.appToken !== undefined;
+        : channelId === "matrix"
+          ? patch.homeserverUrl !== undefined ||
+            patch.accessToken !== undefined ||
+            patch.userId !== undefined
+          : patch.botToken !== undefined || patch.appToken !== undefined;
   } else {
     const created = createChannelAccountLive(
       channelId,
@@ -720,6 +843,10 @@ export async function setChannelConfigLive(
         botToken: patch.botToken,
         appToken: patch.appToken,
         mode: patch.mode,
+        homeserverUrl: patch.homeserverUrl,
+        accessToken: patch.accessToken,
+        userId: patch.userId,
+        e2ee: patch.e2ee,
         dmPolicy: patch.dmPolicy,
         allowedUsers: patch.allowedUsers,
       },
@@ -960,6 +1087,9 @@ export function bindChannelAccountLive(
       binding: { agentId, conversationId },
       updatedAt: new Date().toISOString(),
     });
+  } else if (existing.channel === "matrix") {
+    // Matrix doesn't support binding - just return the existing account
+    updated = existing;
   } else {
     // Slack and Discord both use a top-level agentId
     updated = upsertChannelAccount(channelId, {
@@ -991,6 +1121,9 @@ export function unbindChannelAccountLive(
       binding: { agentId: null, conversationId: null },
       updatedAt: new Date().toISOString(),
     });
+  } else if (existing.channel === "matrix") {
+    // Matrix doesn't support binding - just return the existing account
+    updated = existing;
   } else {
     // Slack and Discord both use a top-level agentId
     updated = upsertChannelAccount(channelId, {

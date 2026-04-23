@@ -47,6 +47,18 @@ const CHANNEL_PLUGIN_REGISTRATIONS: Record<
       return discordChannelPlugin;
     },
   },
+  matrix: {
+    metadata: {
+      id: "matrix",
+      displayName: "Matrix",
+      runtimePackages: ["matrix-bot-sdk@0.8.0"],
+      runtimeModules: ["matrix-bot-sdk"],
+    },
+    load: async () => {
+      const { matrixChannelPlugin } = await import("./matrix/plugin");
+      return matrixChannelPlugin;
+    },
+  },
 };
 
 export function isSupportedChannelId(
