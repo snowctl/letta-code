@@ -58,6 +58,8 @@ class FakeBot {
     sendVoice: mock(async () => ({ message_id: 1005 })),
     sendAnimation: mock(async () => ({ message_id: 1006 })),
     getFile: mock(async (fileId: string) => FakeBot.nextGetFileImpl(fileId)),
+    answerCallbackQuery: mock(async () => true),
+    editMessageText: mock(async () => ({ message_id: 999 })),
   };
   catchHandler:
     | ((error: {
@@ -677,4 +679,589 @@ test("telegram adapter batches media groups and downloads inbound images", async
     rmSync(channelRoot, { recursive: true, force: true });
     channelRoot = mkdtempSync(join(tmpdir(), "letta-telegram-root-"));
   }
+});
+
+test("handleControlRequestEvent sends inline keyboard for generic_tool_approval", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  await adapter.start();
+
+  const event = {
+    requestId: "req-1",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "123",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: { command: "rm -rf /tmp/foo" },
+  };
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent(event);
+
+  const bot = FakeBot.instances[0];
+  expect(bot?.api.sendMessage).toHaveBeenCalledWith(
+    "123",
+    expect.stringContaining("Bash"),
+    expect.objectContaining({
+      reply_markup: {
+        inline_keyboard: [
+          [
+            expect.objectContaining({ text: "✅ Approve" }),
+            expect.objectContaining({ text: "❌ Deny" }),
+            expect.objectContaining({ text: "📝 Deny with Reason" }),
+          ],
+        ],
+      },
+    }),
+  );
+});
+
+test("handleControlRequestEvent sends option buttons for ask_user_question with options", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  await adapter.start();
+
+  const event = {
+    requestId: "req-2",
+    kind: "ask_user_question" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "123",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "AskUserQuestion",
+    input: {
+      questions: [
+        {
+          question: "Which environment?",
+          options: [{ label: "Staging" }, { label: "Production" }],
+        },
+      ],
+    },
+  };
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent(event);
+
+  const bot = FakeBot.instances[0];
+  expect(bot?.api.sendMessage).toHaveBeenCalledWith(
+    "123",
+    expect.stringContaining("Which environment"),
+    expect.objectContaining({
+      reply_markup: expect.objectContaining({
+        inline_keyboard: expect.arrayContaining([
+          expect.arrayContaining([
+            expect.objectContaining({ text: "Staging" }),
+            expect.objectContaining({ text: "Production" }),
+          ]),
+          [expect.objectContaining({ text: "✏️ Something else" })],
+        ]),
+      }),
+    }),
+  );
+});
+
+test("handleControlRequestEvent sends plain text for ask_user_question without options", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  await adapter.start();
+
+  const event = {
+    requestId: "req-3",
+    kind: "ask_user_question" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "123",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "AskUserQuestion",
+    input: {
+      questions: [{ question: "What is your name?" }],
+    },
+  };
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent(event);
+
+  const bot = FakeBot.instances[0];
+  expect(bot?.api.sendMessage).toHaveBeenCalledWith(
+    "123",
+    expect.stringContaining("What is your name"),
+    expect.not.objectContaining({ reply_markup: expect.anything() }),
+  );
+});
+
+test("callback_query approve synthesizes approve text and edits the button message", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  const onMessage = mock(async () => {});
+  adapter.onMessage = onMessage;
+
+  await adapter.start();
+
+  // Register the button message by sending an approval prompt first
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent({
+    requestId: "req-approve",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "500",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: { command: "echo hi" },
+  });
+
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+  if (!bot) throw new Error("bot not found");
+  bot.api.sendMessage.mockClear();
+
+  await bot.emit("callback_query", {
+    callbackQuery: {
+      id: "cq-1",
+      data: JSON.stringify({ k: "0", a: "approve" }),
+      from: { id: 456, username: "alice" },
+      message: { chat: { id: 500 }, message_id: 999 },
+    },
+  });
+
+  expect(bot.api.answerCallbackQuery).toHaveBeenCalledWith("cq-1");
+  expect(onMessage).toHaveBeenCalledWith(
+    expect.objectContaining({
+      channel: "telegram",
+      chatId: "500",
+      text: "approve",
+    }),
+  );
+  expect(bot.api.editMessageText).toHaveBeenCalledWith(
+    "500",
+    999,
+    "✅ Approved",
+  );
+});
+
+test("callback_query deny synthesizes deny text and edits the button message", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  const onMessage = mock(async () => {});
+  adapter.onMessage = onMessage;
+
+  await adapter.start();
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent({
+    requestId: "req-deny",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "500",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: { command: "echo hi" },
+  });
+
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+  if (!bot) throw new Error("bot not found");
+  bot.api.sendMessage.mockClear();
+
+  await bot.emit("callback_query", {
+    callbackQuery: {
+      id: "cq-2",
+      data: JSON.stringify({ k: "0", a: "deny" }),
+      from: { id: 456, username: "alice" },
+      message: { chat: { id: 500 }, message_id: 999 },
+    },
+  });
+
+  expect(onMessage).toHaveBeenCalledWith(
+    expect.objectContaining({ text: "deny" }),
+  );
+  expect(bot.api.editMessageText).toHaveBeenCalledWith("500", 999, "❌ Denied");
+});
+
+test("callback_query option synthesizes the option label and edits the button message", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  const onMessage = mock(async () => {});
+  adapter.onMessage = onMessage;
+
+  await adapter.start();
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent({
+    requestId: "req-option",
+    kind: "ask_user_question" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "500",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "AskUserQuestion",
+    input: {
+      questions: [
+        {
+          question: "Environment?",
+          options: [{ label: "Staging" }, { label: "Production" }],
+        },
+      ],
+    },
+  });
+
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+  if (!bot) throw new Error("bot not found");
+  bot.api.sendMessage.mockClear();
+
+  await bot.emit("callback_query", {
+    callbackQuery: {
+      id: "cq-3",
+      data: JSON.stringify({ k: "0", a: "option", i: 0 }),
+      from: { id: 456, username: "alice" },
+      message: { chat: { id: 500 }, message_id: 999 },
+    },
+  });
+
+  expect(onMessage).toHaveBeenCalledWith(
+    expect.objectContaining({ text: "Staging" }),
+  );
+  expect(bot.api.editMessageText).toHaveBeenCalledWith(
+    "500",
+    999,
+    "Selected: Staging",
+  );
+});
+
+test("callback_query deny_reason sets awaitingFeedback and sends a prompt", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  const onMessage = mock(async () => {});
+  adapter.onMessage = onMessage;
+
+  await adapter.start();
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent({
+    requestId: "req-dr",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "500",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: { command: "echo hi" },
+  });
+
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+  if (!bot) throw new Error("bot not found");
+  bot.api.sendMessage.mockClear();
+
+  await bot.emit("callback_query", {
+    callbackQuery: {
+      id: "cq-dr",
+      data: JSON.stringify({ k: "0", a: "deny_reason" }),
+      from: { id: 456, username: "alice" },
+      message: { chat: { id: 500 }, message_id: 999 },
+    },
+  });
+
+  expect(onMessage).not.toHaveBeenCalled();
+  expect(bot.api.sendMessage).toHaveBeenCalledWith(
+    "500",
+    "Please type your reason for denying.",
+    {},
+  );
+});
+
+test("text message in awaitingFeedback chat submits denial reason via onMessage", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  const onMessage = mock(async () => {});
+  adapter.onMessage = onMessage;
+
+  await adapter.start();
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent({
+    requestId: "req-dr2",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "500",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: { command: "echo hi" },
+  });
+
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+  if (!bot) throw new Error("bot not found");
+
+  // Tap deny_reason to enter awaitingFeedback state
+  await bot.emit("callback_query", {
+    callbackQuery: {
+      id: "cq-dr2",
+      data: JSON.stringify({ k: "0", a: "deny_reason" }),
+      from: { id: 456, username: "alice" },
+      message: { chat: { id: 500 }, message_id: 999 },
+    },
+  });
+
+  onMessage.mockClear();
+  bot.api.sendMessage.mockClear();
+
+  // User types their reason
+  await bot.emit("message", {
+    message: {
+      chat: { id: 500 },
+      from: { id: 456, username: "alice", first_name: "Alice" },
+      text: "Too dangerous",
+      date: 1_736_380_800,
+      message_id: 1000,
+    },
+  });
+
+  expect(onMessage).toHaveBeenCalledWith(
+    expect.objectContaining({
+      chatId: "500",
+      text: "Too dangerous",
+    }),
+  );
+  expect(bot.api.editMessageText).toHaveBeenCalledWith(
+    "500",
+    999,
+    "❌ Denied: Too dangerous",
+  );
+});
+
+test("empty message while awaitingFeedback sends error reply and keeps state open", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  const onMessage = mock(async () => {});
+  adapter.onMessage = onMessage;
+
+  await adapter.start();
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent({
+    requestId: "req-empty",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "500",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: {},
+  });
+
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+  if (!bot) throw new Error("bot not found");
+
+  await bot.emit("callback_query", {
+    callbackQuery: {
+      id: "cq-empty",
+      data: JSON.stringify({ k: "0", a: "deny_reason" }),
+      from: { id: 456, username: "alice" },
+      message: { chat: { id: 500 }, message_id: 999 },
+    },
+  });
+
+  onMessage.mockClear();
+  bot.api.sendMessage.mockClear();
+
+  // Send empty message
+  await bot.emit("message", {
+    message: {
+      chat: { id: 500 },
+      from: { id: 456, username: "alice", first_name: "Alice" },
+      text: "   ",
+      date: 1_736_380_800,
+      message_id: 1001,
+    },
+  });
+
+  expect(onMessage).not.toHaveBeenCalled();
+  expect(bot.api.sendMessage).toHaveBeenCalledWith(
+    "500",
+    "Please type a non-empty reply.",
+    {},
+  );
+
+  // State is still open — next real message should still be intercepted
+  bot.api.sendMessage.mockClear();
+  await bot.emit("message", {
+    message: {
+      chat: { id: 500 },
+      from: { id: 456, username: "alice", first_name: "Alice" },
+      text: "Actually too risky",
+      date: 1_736_380_801,
+      message_id: 1002,
+    },
+  });
+
+  expect(onMessage).toHaveBeenCalledWith(
+    expect.objectContaining({ text: "Actually too risky" }),
+  );
+});
+
+test("callback_query edit failure falls back to sending text confirmation", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "pairing",
+    allowedUsers: [],
+  });
+
+  const onMessage = mock(async () => {});
+  adapter.onMessage = onMessage;
+
+  await adapter.start();
+
+  expect(adapter.handleControlRequestEvent).toBeDefined();
+  if (!adapter.handleControlRequestEvent)
+    throw new Error("handleControlRequestEvent not defined");
+  await adapter.handleControlRequestEvent({
+    requestId: "req-edit-fail",
+    kind: "generic_tool_approval" as const,
+    source: {
+      channel: "telegram" as const,
+      accountId: "telegram-test-account",
+      chatId: "500",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+    },
+    toolName: "Bash",
+    input: {},
+  });
+
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+  if (!bot) throw new Error("bot not found");
+  bot.api.editMessageText.mockImplementation(async () => {
+    throw new Error("message too old");
+  });
+  bot.api.sendMessage.mockClear();
+
+  await bot.emit("callback_query", {
+    callbackQuery: {
+      id: "cq-ef",
+      data: JSON.stringify({ k: "0", a: "approve" }),
+      from: { id: 456, username: "alice" },
+      message: { chat: { id: 500 }, message_id: 999 },
+    },
+  });
+
+  expect(bot.api.sendMessage).toHaveBeenCalledWith("500", "✅ Approved", {});
 });
