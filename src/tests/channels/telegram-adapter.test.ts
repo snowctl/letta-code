@@ -1345,7 +1345,7 @@ test("tool block: first tool_call sends a new message", async () => {
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
-  const [chatId, text] = bot.api.sendMessage.mock.calls[0]!;
+  const [chatId, text] = bot.api.sendMessage.mock.calls[0]! as unknown as [string, string];
   expect(chatId).toBe("chat-42");
   expect(text).toBe("🔧 Tools used:\n• read_file");
   await adapter.stop();
@@ -1374,7 +1374,7 @@ test("tool block: second tool_call edits the existing message", async () => {
 
   expect(bot.api.sendMessage).toHaveBeenCalledTimes(1); // no second send
   expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
-  const [chatId, _msgId, text] = bot.api.editMessageText.mock.calls[0]!;
+  const [chatId, _msgId, text] = bot.api.editMessageText.mock.calls[0]! as unknown as [string, number, string];
   expect(chatId).toBe("chat-42");
   expect(text).toBe("🔧 Tools used:\n• read_file ×2");
   await adapter.stop();
@@ -1403,7 +1403,7 @@ test("tool block: tool with description grouped correctly", async () => {
   // Wait for async operations to complete
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  const [, _msgId, text] = bot.api.editMessageText.mock.calls[0]!;
+  const [, _msgId, text] = bot.api.editMessageText.mock.calls[0]! as unknown as [string, number, string];
   expect(text).toBe("🔧 Tools used:\n• bash — Run tests ×2");
   await adapter.stop();
 });
