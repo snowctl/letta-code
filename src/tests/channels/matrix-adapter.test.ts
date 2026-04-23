@@ -127,6 +127,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  mock.restore();
   rmSync(channelRoot, { recursive: true, force: true });
 });
 
