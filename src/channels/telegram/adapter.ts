@@ -764,6 +764,8 @@ export function createTelegramAdapter(
       // "finished"
       for (const source of event.sources) {
         stopTypingInterval(source.chatId);
+        const pending = toolBlockOperationByChatId.get(source.chatId);
+        if (pending) await pending.catch(() => {});
         toolBlockStateByChatId.delete(source.chatId);
         toolBlockOperationByChatId.delete(source.chatId);
       }

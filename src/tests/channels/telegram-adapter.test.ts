@@ -1433,7 +1433,7 @@ test("tool block: exceeding 3800 chars sends new message", async () => {
   }
 
   // Wait for async operations to complete
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await new Promise((resolve) => setTimeout(resolve, 200));
 
   // sendMessage should have been called more than once (overflow triggered)
   expect(bot.api.sendMessage.mock.calls.length).toBeGreaterThan(1);
