@@ -1673,6 +1673,20 @@ async function handleChannelsProtocolCommand(
         has_token: snapshot.hasToken,
       };
     }
+    if (snapshot.channelId === "matrix") {
+      return {
+        channel_id: snapshot.channelId,
+        account_id: snapshot.accountId,
+        display_name: snapshot.displayName,
+        enabled: snapshot.enabled,
+        dm_policy: snapshot.dmPolicy,
+        allowed_users: snapshot.allowedUsers,
+        has_homeserver_url: snapshot.hasHomeserverUrl,
+        has_access_token: snapshot.hasAccessToken,
+        user_id: snapshot.userId,
+        e2ee: snapshot.e2ee,
+      };
+    }
     return {
       channel_id: snapshot.channelId,
       account_id: snapshot.accountId,
@@ -1721,6 +1735,26 @@ async function handleChannelsProtocolCommand(
         allowed_users: snapshot.allowedUsers,
         has_token: snapshot.hasToken,
         agent_id: snapshot.agentId,
+        created_at: snapshot.createdAt,
+        updated_at: snapshot.updatedAt,
+      };
+    }
+
+    if (snapshot.channelId === "matrix") {
+      return {
+        channel_id: snapshot.channelId,
+        account_id: snapshot.accountId,
+        display_name: snapshot.displayName,
+        enabled: snapshot.enabled,
+        configured: snapshot.configured,
+        running: snapshot.running,
+        dm_policy: snapshot.dmPolicy,
+        allowed_users: snapshot.allowedUsers,
+        has_homeserver_url: snapshot.hasHomeserverUrl,
+        has_access_token: snapshot.hasAccessToken,
+        user_id: snapshot.userId,
+        e2ee: snapshot.e2ee,
+        transcribe_voice: snapshot.transcribeVoice,
         created_at: snapshot.createdAt,
         updated_at: snapshot.updatedAt,
       };

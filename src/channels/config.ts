@@ -168,12 +168,31 @@ const discordConfigCodec: ChannelConfigCodec<DiscordChannelConfig> = {
   },
 };
 
+const matrixConfigCodec: ChannelConfigCodec<ChannelConfig> = {
+  parse(parsed) {
+    // MatrixChannelAccount is not in the ChannelConfig union (Matrix uses accounts.json directly,
+    // not YAML config), so we cast through unknown to satisfy the codec's return type.
+    return {
+      channel: "matrix",
+      enabled: parsed.enabled !== false,
+      homeserverUrl: String(parsed.homeserver_url ?? ""),
+      accessToken: String(parsed.access_token ?? ""),
+      userId: String(parsed.user_id ?? ""),
+      dmPolicy: (parsed.dm_policy as DmPolicy) ?? "pairing",
+      allowedUsers: (parsed.allowed_users as string[]) ?? [],
+      e2ee: parsed.e2ee === true,
+      transcribeVoice: parsed.transcribe_voice === true,
+    } as unknown as ChannelConfig;
+  },
+};
+
 const CHANNEL_CONFIG_CODECS: Partial<
   Record<string, ChannelConfigCodec<ChannelConfig>>
 > = {
   telegram: telegramConfigCodec as ChannelConfigCodec<ChannelConfig>,
   slack: slackConfigCodec as ChannelConfigCodec<ChannelConfig>,
   discord: discordConfigCodec as ChannelConfigCodec<ChannelConfig>,
+  matrix: matrixConfigCodec,
 };
 
 function getChannelConfigCodec(

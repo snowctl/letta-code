@@ -10,6 +10,7 @@
  * plugin.messageActions, following the OpenClaw-style architecture.
  */
 
+import { marked } from "marked";
 import {
   isSupportedChannelId,
   loadChannelPlugin,
@@ -436,6 +437,31 @@ export function markdownToSlackMrkdwn(text: string): string {
   return formatSlackText(text);
 }
 
+export function markdownToMatrixHtml(text: string): string {
+  return (marked.parse(text) as string).trimEnd();
+}
+
+export function stripMarkdownToPlainText(text: string): string {
+  // Remove headings
+  let result = text.replace(/^#{1,6}\s+/gm, "");
+  // Remove bold+italic (***text***, ___text___), then bold (**text**, __text__), then italic (*text*, _text_) — longest first
+  result = result.replace(/\*{3}(.+?)\*{3}/g, "$1");
+  result = result.replace(/_{3}(.+?)_{3}/g, "$1");
+  result = result.replace(/\*{2}(.+?)\*{2}/g, "$1");
+  result = result.replace(/_{2}(.+?)_{2}/g, "$1");
+  result = result.replace(/\*(.+?)\*/g, "$1");
+  result = result.replace(/_(.+?)_/g, "$1");
+  // Remove fenced code blocks — keep content (must run before inline code strip)
+  result = result.replace(/```[^\n]*\n([\s\S]*?)```/g, "$1");
+  // Remove inline code
+  result = result.replace(/`([^`]+)`/g, "$1");
+  // Remove links — keep label
+  result = result.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  // Collapse multiple blank lines
+  result = result.replace(/\n{3,}/g, "\n\n");
+  return result.trim();
+}
+
 const CHANNEL_OUTBOUND_FORMATTERS: Partial<
   Record<string, OutboundChannelFormatter>
 > = {
@@ -448,6 +474,12 @@ const CHANNEL_OUTBOUND_FORMATTERS: Partial<
   slack(text) {
     return {
       text: markdownToSlackMrkdwn(text),
+    };
+  },
+  matrix(text) {
+    return {
+      text: stripMarkdownToPlainText(text),
+      parseMode: "HTML",
     };
   },
 };
