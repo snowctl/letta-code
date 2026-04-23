@@ -129,9 +129,9 @@ export function createMatrixAdapter(
     if (timer !== undefined) {
       clearInterval(timer);
       typingIntervalByChatId.delete(chatId);
-    }
-    if (matrixClient) {
-      await matrixClient.sendTyping(chatId, false).catch(() => {});
+      if (matrixClient) {
+        await matrixClient.sendTyping(chatId, false).catch(() => {});
+      }
     }
   }
 
