@@ -30,8 +30,13 @@ test("stripMarkdownToPlainText removes inline code markers", () => {
   expect(result).toBe("foo");
 });
 
-test("formatOutboundChannelMessage matrix returns HTML parseMode", () => {
-  // Tested via the formatter directly below
+test("stripMarkdownToPlainText removes fenced code block markers", () => {
+  const result = stripMarkdownToPlainText("```js\nconst x = 1;\n```");
+  expect(result).not.toContain("```");
+  expect(result).toContain("const x = 1;");
+});
+
+test("stripMarkdownToPlainText removes heading and emphasis markers", () => {
   const result = stripMarkdownToPlainText("# Heading\n**bold** _italic_");
   expect(result).not.toContain("**");
   expect(result).not.toContain("_");

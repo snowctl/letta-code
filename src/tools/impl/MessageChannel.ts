@@ -438,21 +438,23 @@ export function markdownToSlackMrkdwn(text: string): string {
 }
 
 export function markdownToMatrixHtml(text: string): string {
-  // marked.parse returns a string synchronously when given a string with no async extensions
-  const html = marked.parse(text, { async: false }) as string;
-  // Trim trailing newline that marked appends
-  return html.trimEnd();
+  return (marked.parse(text) as string).trimEnd();
 }
 
 export function stripMarkdownToPlainText(text: string): string {
   // Remove headings
   let result = text.replace(/^#{1,6}\s+/gm, "");
-  // Remove bold/italic (**, __, *, _)
-  result = result.replace(/(\*{1,2}|_{1,2})(.+?)\1/g, "$2");
+  // Remove bold+italic (***text***, ___text___), then bold (**text**, __text__), then italic (*text*, _text_) — longest first
+  result = result.replace(/\*{3}(.+?)\*{3}/g, "$1");
+  result = result.replace(/_{3}(.+?)_{3}/g, "$1");
+  result = result.replace(/\*{2}(.+?)\*{2}/g, "$1");
+  result = result.replace(/_{2}(.+?)_{2}/g, "$1");
+  result = result.replace(/\*(.+?)\*/g, "$1");
+  result = result.replace(/_(.+?)_/g, "$1");
+  // Remove fenced code blocks — keep content (must run before inline code strip)
+  result = result.replace(/```[^\n]*\n([\s\S]*?)```/g, "$1");
   // Remove inline code
   result = result.replace(/`([^`]+)`/g, "$1");
-  // Remove fenced code blocks — keep content
-  result = result.replace(/```[^\n]*\n([\s\S]*?)```/g, "$1");
   // Remove links — keep label
   result = result.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
   // Collapse multiple blank lines
