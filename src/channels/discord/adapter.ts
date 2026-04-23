@@ -775,6 +775,7 @@ export function createDiscordAdapter(
         return;
       }
       if (event.type === "processing") return;
+      if (event.type === "tool_call") return;
       const nextState: LifecycleState =
         event.outcome === "completed"
           ? "completed"
