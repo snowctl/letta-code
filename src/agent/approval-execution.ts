@@ -227,6 +227,7 @@ async function executeSingleDecision(
   if (decision.type === "approve") {
     // If fancy UI already computed the result, use it directly
     if (decision.precomputedResult) {
+      // onToolCall is not fired here — precomputed results bypass executeTool
       return {
         type: "tool",
         tool_call_id: decision.approval.toolCallId,
@@ -450,7 +451,6 @@ export async function executeApprovalBatch(
       results[i] = await executeSingleDecision(decision, onChunk, {
         ...options,
         toolContextId,
-        onToolCall: options?.onToolCall,
       });
     }
   };
