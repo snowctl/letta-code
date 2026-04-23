@@ -1532,6 +1532,8 @@ export async function executeTool(
     /** Called after a file-mutating tool (Edit, Write, MultiEdit) writes to disk.
      *  The listener layer uses this to broadcast the new content via WebSocket. */
     onFileWrite?: (filePath: string, content: string) => void;
+    /** Called just before each tool runs. Used by channel adapters to show tool activity. */
+    onToolCall?: (toolName: string, description?: string) => void;
   },
 ): Promise<ToolExecutionResult> {
   const context = options?.toolContextId
@@ -1670,6 +1672,13 @@ export async function executeTool(
           _executionContextId: options.toolContextId,
         };
       }
+
+      options?.onToolCall?.(
+        internalName,
+        typeof (args as Record<string, unknown>).description === "string"
+          ? ((args as Record<string, unknown>).description as string)
+          : undefined,
+      );
 
       const result = await tool.fn(enhancedArgs);
       const duration = Date.now() - startTime;
