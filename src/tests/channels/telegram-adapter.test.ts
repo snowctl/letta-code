@@ -868,7 +868,7 @@ test("callback_query approve synthesizes approve text and edits the button messa
   await bot.emit("callback_query", {
     callbackQuery: {
       id: "cq-1",
-      data: JSON.stringify({ requestId: "req-approve", action: "approve" }),
+      data: JSON.stringify({ k: "0", a: "approve" }),
       from: { id: 456, username: "alice" },
       message: { chat: { id: 500 }, message_id: 999 },
     },
@@ -929,7 +929,7 @@ test("callback_query deny synthesizes deny text and edits the button message", a
   await bot.emit("callback_query", {
     callbackQuery: {
       id: "cq-2",
-      data: JSON.stringify({ requestId: "req-deny", action: "deny" }),
+      data: JSON.stringify({ k: "0", a: "deny" }),
       from: { id: 456, username: "alice" },
       message: { chat: { id: 500 }, message_id: 999 },
     },
@@ -988,11 +988,7 @@ test("callback_query option synthesizes the option label and edits the button me
   await bot.emit("callback_query", {
     callbackQuery: {
       id: "cq-3",
-      data: JSON.stringify({
-        requestId: "req-option",
-        action: "option",
-        value: "Staging",
-      }),
+      data: JSON.stringify({ k: "0", a: "option", i: 0 }),
       from: { id: 456, username: "alice" },
       message: { chat: { id: 500 }, message_id: 999 },
     },
@@ -1048,7 +1044,7 @@ test("callback_query deny_reason sets awaitingFeedback and sends a prompt", asyn
   await bot.emit("callback_query", {
     callbackQuery: {
       id: "cq-dr",
-      data: JSON.stringify({ requestId: "req-dr", action: "deny_reason" }),
+      data: JSON.stringify({ k: "0", a: "deny_reason" }),
       from: { id: 456, username: "alice" },
       message: { chat: { id: 500 }, message_id: 999 },
     },
@@ -1102,7 +1098,7 @@ test("text message in awaitingFeedback chat submits denial reason via onMessage"
   await bot.emit("callback_query", {
     callbackQuery: {
       id: "cq-dr2",
-      data: JSON.stringify({ requestId: "req-dr2", action: "deny_reason" }),
+      data: JSON.stringify({ k: "0", a: "deny_reason" }),
       from: { id: 456, username: "alice" },
       message: { chat: { id: 500 }, message_id: 999 },
     },
@@ -1174,7 +1170,7 @@ test("empty message while awaitingFeedback sends error reply and keeps state ope
   await bot.emit("callback_query", {
     callbackQuery: {
       id: "cq-empty",
-      data: JSON.stringify({ requestId: "req-empty", action: "deny_reason" }),
+      data: JSON.stringify({ k: "0", a: "deny_reason" }),
       from: { id: 456, username: "alice" },
       message: { chat: { id: 500 }, message_id: 999 },
     },
@@ -1261,7 +1257,7 @@ test("callback_query edit failure falls back to sending text confirmation", asyn
   await bot.emit("callback_query", {
     callbackQuery: {
       id: "cq-ef",
-      data: JSON.stringify({ requestId: "req-edit-fail", action: "approve" }),
+      data: JSON.stringify({ k: "0", a: "approve" }),
       from: { id: 456, username: "alice" },
       message: { chat: { id: 500 }, message_id: 999 },
     },

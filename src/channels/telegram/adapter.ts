@@ -70,6 +70,22 @@ type TelegramReactionUpdate = {
   new_reaction: TelegramReactionType[];
 };
 
+type TelegramCallbackQueryContext = {
+  callbackQuery?: {
+    id: string;
+    data?: string;
+    from: {
+      id: string | number;
+      username?: string;
+      first_name?: string;
+    };
+    message?: {
+      chat: { id: string | number; type?: string };
+      message_id: number;
+    };
+  };
+};
+
 function resolveTelegramBotConstructor(
   mod: GrammYModule,
 ): TelegramBotConstructor {
@@ -198,13 +214,14 @@ export function createTelegramAdapter(
   let botModule: GrammYModule | null = null;
   let running = false;
   const bufferedMediaGroups = new Map<string, BufferedMediaGroup>();
+  let callbackKeyCounter = 0;
   const buttonMessages = new Map<
     string,
-    { chatId: string; messageId: string }
+    { chatId: string; messageId: string; requestId: string; options: string[] }
   >();
   const awaitingFeedback = new Map<
     string,
-    { requestId: string; action: "deny_reason" | "freeform" }
+    { requestId: string; action: "deny_reason" | "freeform"; buttonKey: string }
   >();
 
   async function ensureModule(): Promise<GrammYModule> {
@@ -342,9 +359,9 @@ export function createTelegramAdapter(
           }
         }
 
-        const buttonEntry = buttonMessages.get(feedbackEntry.requestId);
+        const buttonEntry = buttonMessages.get(feedbackEntry.buttonKey);
         if (buttonEntry) {
-          buttonMessages.delete(feedbackEntry.requestId);
+          buttonMessages.delete(feedbackEntry.buttonKey);
           const confirmationText =
             feedbackEntry.action === "deny_reason"
               ? `❌ Denied: ${text}`
@@ -448,23 +465,7 @@ export function createTelegramAdapter(
     });
 
     instance.on("callback_query", async (ctx) => {
-      const query = (
-        ctx as {
-          callbackQuery?: {
-            id: string;
-            data?: string;
-            from: {
-              id: string | number;
-              username?: string;
-              first_name?: string;
-            };
-            message?: {
-              chat: { id: string | number };
-              message_id: number;
-            };
-          };
-        }
-      ).callbackQuery;
+      const query = (ctx as TelegramCallbackQueryContext).callbackQuery;
       if (!query) return;
 
       try {
@@ -474,9 +475,9 @@ export function createTelegramAdapter(
       }
 
       type CallbackPayload =
-        | { requestId: string; action: "approve" | "deny" }
-        | { requestId: string; action: "option"; value: string }
-        | { requestId: string; action: "deny_reason" | "freeform" };
+        | { k: string; a: "approve" | "deny" }
+        | { k: string; a: "option"; i: number }
+        | { k: string; a: "deny_reason" | "freeform" };
 
       let payload: CallbackPayload;
       try {
@@ -486,17 +487,18 @@ export function createTelegramAdapter(
         return;
       }
 
-      const { requestId, action } = payload;
-      const buttonEntry = buttonMessages.get(requestId);
+      const { k, a: action } = payload;
+      const buttonEntry = buttonMessages.get(k);
       if (!buttonEntry) return;
 
+      const { requestId } = buttonEntry;
       const chatId = String(query.message?.chat.id ?? buttonEntry.chatId);
       const senderId = String(query.from.id);
       const senderName =
         query.from.username ?? query.from.first_name ?? undefined;
 
       if (action === "deny_reason" || action === "freeform") {
-        awaitingFeedback.set(chatId, { requestId, action });
+        awaitingFeedback.set(chatId, { requestId, action, buttonKey: k });
         const prompt =
           action === "deny_reason"
             ? "Please type your reason for denying."
@@ -515,15 +517,16 @@ export function createTelegramAdapter(
         syntheticText = "deny";
         confirmationText = "❌ Denied";
       } else if (action === "option") {
-        const value = (
-          payload as { requestId: string; action: "option"; value: string }
-        ).value;
+        const i = (payload as { k: string; a: "option"; i: number }).i;
+        const value = buttonEntry.options[i] ?? "";
         syntheticText = value;
         confirmationText = `Selected: ${value}`;
       } else {
         console.error("[Telegram] Unknown callback action:", action);
         return;
       }
+
+      buttonMessages.delete(k);
 
       if (adapter.onMessage) {
         const inbound: InboundChannelMessage = {
@@ -535,7 +538,9 @@ export function createTelegramAdapter(
           text: syntheticText,
           timestamp: Date.now(),
           messageId: String(query.message?.message_id ?? ""),
-          chatType: "direct",
+          chatType: query.message?.chat
+            ? getTelegramChatType(query.message.chat)
+            : "direct",
         };
         try {
           await adapter.onMessage(inbound);
@@ -543,8 +548,6 @@ export function createTelegramAdapter(
           console.error("[Telegram] Error processing callback query:", error);
         }
       }
-
-      buttonMessages.delete(requestId);
 
       try {
         await instance.api.editMessageText(
@@ -778,6 +781,7 @@ export function createTelegramAdapter(
           : undefined;
 
       if (event.kind === "generic_tool_approval") {
+        const callbackKey = (callbackKeyCounter++).toString(36);
         const text = formatChannelControlRequestPrompt(event);
         const result = await telegramBot.api.sendMessage(
           event.source.chatId,
@@ -790,22 +794,22 @@ export function createTelegramAdapter(
                   {
                     text: "✅ Approve",
                     callback_data: JSON.stringify({
-                      requestId: event.requestId,
-                      action: "approve",
+                      k: callbackKey,
+                      a: "approve",
                     }),
                   },
                   {
                     text: "❌ Deny",
                     callback_data: JSON.stringify({
-                      requestId: event.requestId,
-                      action: "deny",
+                      k: callbackKey,
+                      a: "deny",
                     }),
                   },
                   {
                     text: "📝 Deny with Reason",
                     callback_data: JSON.stringify({
-                      requestId: event.requestId,
-                      action: "deny_reason",
+                      k: callbackKey,
+                      a: "deny_reason",
                     }),
                   },
                 ],
@@ -813,9 +817,11 @@ export function createTelegramAdapter(
             },
           },
         );
-        buttonMessages.set(event.requestId, {
+        buttonMessages.set(callbackKey, {
           chatId: event.source.chatId,
           messageId: String(result.message_id),
+          requestId: event.requestId,
+          options: [],
         });
         return;
       }
@@ -831,13 +837,14 @@ export function createTelegramAdapter(
         const options = firstQuestion?.options ?? [];
 
         if (options.length > 0) {
+          const callbackKey = (callbackKeyCounter++).toString(36);
           const text = formatChannelControlRequestPrompt(event);
-          const optionButtons = options.map((option) => ({
+          const optionButtons = options.map((option, optionIndex) => ({
             text: option.label ?? "Option",
             callback_data: JSON.stringify({
-              requestId: event.requestId,
-              action: "option",
-              value: option.label ?? "",
+              k: callbackKey,
+              a: "option",
+              i: optionIndex,
             }),
           }));
           const result = await telegramBot.api.sendMessage(
@@ -852,8 +859,8 @@ export function createTelegramAdapter(
                     {
                       text: "✏️ Something else",
                       callback_data: JSON.stringify({
-                        requestId: event.requestId,
-                        action: "freeform",
+                        k: callbackKey,
+                        a: "freeform",
                       }),
                     },
                   ],
@@ -861,9 +868,11 @@ export function createTelegramAdapter(
               },
             },
           );
-          buttonMessages.set(event.requestId, {
+          buttonMessages.set(callbackKey, {
             chatId: event.source.chatId,
             messageId: String(result.message_id),
+            requestId: event.requestId,
+            options: options.map((o) => o.label ?? ""),
           });
           return;
         }
