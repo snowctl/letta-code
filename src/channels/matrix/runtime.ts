@@ -5,12 +5,16 @@ import {
   loadChannelRuntimeModule,
 } from "../runtimeDeps";
 
-// Use a local interface to avoid TypeScript errors for an uninstalled dependency
+// Local interface to avoid TypeScript errors for the uninstalled runtime dependency.
+// TODO: Replace with typeof import("matrix-bot-sdk") once the package is installed.
 export interface MatrixBotSdkLike {
-  MatrixClient: new (options: unknown) => unknown;
-  MemoryStorageProvider: new () => unknown;
+  MatrixClient: new (...args: unknown[]) => unknown;
   SimpleFsStorageProvider: new (path: string) => unknown;
-  RichReply: new (body: unknown, formattedBody: unknown) => unknown;
+  RustSdkCryptoStorageProvider: new (
+    path: string,
+    storeType: unknown,
+  ) => unknown;
+  RustSdkCryptoStoreType: { Sled: string };
 }
 
 export async function loadMatrixBotSdkModule(): Promise<MatrixBotSdkLike> {
