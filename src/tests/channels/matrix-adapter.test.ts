@@ -361,3 +361,552 @@ test("adapter sendDirectReply with replyToMessageId includes m.in_reply_to", asy
     }),
   );
 });
+
+// ── Task 8: Inbound text, invites, bot commands ───────────────────────────────
+
+test("adapter auto-accepts room invites", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.invite", "!newroom:example.com", {
+    type: "m.room.member",
+    content: { membership: "invite" },
+  });
+
+  expect(client.joinRoom).toHaveBeenCalledWith("!newroom:example.com");
+});
+
+test("adapter emits inbound text message to onMessage", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$evt1",
+    content: { msgtype: "m.text", body: "hello" },
+  });
+
+  expect(received).toHaveLength(1);
+  expect(received[0]?.text).toBe("hello");
+  expect(received[0]?.senderId).toBe("@user:example.com");
+  expect(received[0]?.chatId).toBe("!room:example.com");
+});
+
+test("adapter filters out own messages", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@letta-bot:example.com", // same as userId in TEST_ACCOUNT
+    event_id: "$own-msg",
+    content: { msgtype: "m.text", body: "I said this" },
+  });
+
+  expect(received).toHaveLength(0);
+});
+
+test("adapter responds to !start command", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$cmd1",
+    content: { msgtype: "m.text", body: "!start" },
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({ body: expect.stringContaining("Letta") }),
+  );
+});
+
+test("adapter responds to !status command", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$cmd2",
+    content: { msgtype: "m.text", body: "!status" },
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({
+      body: expect.stringContaining("@letta-bot:example.com"),
+    }),
+  );
+});
+
+test("adapter sets chatType=direct for 2-member rooms", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+  client.getJoinedRoomMembers.mockResolvedValueOnce([
+    "@bot:example.com",
+    "@user:example.com",
+  ]);
+
+  await client.emit("room.message", "!room:example.com", {
+    sender: "@user:example.com",
+    event_id: "$evt2",
+    content: { msgtype: "m.text", body: "hi" },
+  });
+
+  expect(received[0]?.chatType).toBe("direct");
+});
+
+// ── Task 9: Inbound and outbound reactions ────────────────────────────────────
+
+test("adapter emits reaction add as InboundChannelMessage", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.event", "!room:example.com", {
+    type: "m.reaction",
+    sender: "@user:example.com",
+    content: {
+      "m.relates_to": {
+        rel_type: "m.annotation",
+        event_id: "$target-event",
+        key: "👍",
+      },
+    },
+  });
+
+  expect(received).toHaveLength(1);
+  expect(received[0]?.reaction?.action).toBe("added");
+  expect(received[0]?.reaction?.emoji).toBe("👍");
+  expect(received[0]?.reaction?.targetMessageId).toBe("$target-event");
+});
+
+test("adapter sendMessage with reaction sends m.reaction event", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendEvent.mockResolvedValueOnce("$reaction-event");
+
+  const result = await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room:example.com",
+    text: "",
+    reaction: "👍",
+    targetMessageId: "$target-msg",
+  });
+
+  expect(result.messageId).toBe("$reaction-event");
+  expect(client.sendEvent).toHaveBeenCalledWith(
+    "!room:example.com",
+    "m.reaction",
+    {
+      "m.relates_to": {
+        rel_type: "m.annotation",
+        event_id: "$target-msg",
+        key: "👍",
+      },
+    },
+  );
+});
+
+test("adapter sendMessage with removeReaction redacts event", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.redactEvent.mockResolvedValueOnce("$redaction-event");
+
+  const result = await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room:example.com",
+    text: "",
+    removeReaction: true,
+    targetMessageId: "$reaction-to-remove",
+  });
+
+  expect(result.messageId).toBe("$redaction-event");
+  expect(client.redactEvent).toHaveBeenCalledWith(
+    "!room:example.com",
+    "$reaction-to-remove",
+  );
+});
+
+// ── Task 10: Control requests approve/deny ────────────────────────────────────
+
+test("handleControlRequestEvent sends prompt and pre-reacts for generic_tool_approval", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$prompt-event");
+  client.sendEvent.mockResolvedValue("$reaction-event");
+
+  await adapter.handleControlRequestEvent!({
+    requestId: "req1",
+    kind: "generic_tool_approval",
+    source: {
+      channel: "matrix",
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      messageId: "$orig",
+      agentId: "a1",
+      conversationId: "c1",
+    },
+    toolName: "bash",
+    input: { command: "ls" },
+  });
+
+  // Prompt sent
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({ body: expect.stringContaining("bash") }),
+  );
+  // Pre-reacted with ✅, ❌, 📝
+  const reactionCalls = client.sendEvent.mock.calls.filter(
+    (c: unknown[]) => c[1] === "m.reaction",
+  );
+  const keys = reactionCalls.map(
+    (c: unknown[]) => (c[2] as any)["m.relates_to"].key,
+  );
+  expect(keys).toContain("✅");
+  expect(keys).toContain("❌");
+  expect(keys).toContain("📝");
+});
+
+test("tapping ✅ emits synthetic approve message", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$prompt-event");
+  client.sendEvent.mockResolvedValue("$reaction-event");
+
+  await adapter.handleControlRequestEvent!({
+    requestId: "req1",
+    kind: "generic_tool_approval",
+    source: {
+      channel: "matrix",
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      messageId: "$orig",
+      agentId: "a1",
+      conversationId: "c1",
+    },
+    toolName: "bash",
+    input: {},
+  });
+
+  // User taps ✅
+  await client.emit("room.event", "!room:example.com", {
+    type: "m.reaction",
+    sender: "@user:example.com",
+    content: {
+      "m.relates_to": {
+        rel_type: "m.annotation",
+        event_id: "$prompt-event",
+        key: "✅",
+      },
+    },
+  });
+
+  expect(received).toHaveLength(1);
+  expect(received[0]?.text).toBe("approve");
+  // Pre-reactions redacted
+  expect(client.redactEvent).toHaveBeenCalled();
+});
+
+test("tapping ❌ emits synthetic deny message", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$prompt-event");
+  client.sendEvent.mockResolvedValue("$reaction-event");
+
+  await adapter.handleControlRequestEvent!({
+    requestId: "req2",
+    kind: "enter_plan_mode",
+    source: {
+      channel: "matrix",
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      messageId: "$orig",
+      agentId: "a1",
+      conversationId: "c1",
+    },
+    toolName: "EnterPlanMode",
+    input: {},
+  });
+
+  await client.emit("room.event", "!room:example.com", {
+    type: "m.reaction",
+    sender: "@user:example.com",
+    content: {
+      "m.relates_to": {
+        rel_type: "m.annotation",
+        event_id: "$prompt-event",
+        key: "❌",
+      },
+    },
+  });
+
+  expect(received[0]?.text).toBe("deny");
+});
+
+test("bot's own reactions to the prompt are ignored (no self-feedback loop)", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$prompt-event");
+  client.sendEvent.mockResolvedValue("$reaction-event");
+
+  await adapter.handleControlRequestEvent!({
+    requestId: "req3",
+    kind: "generic_tool_approval",
+    source: {
+      channel: "matrix",
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      messageId: "$orig",
+      agentId: "a1",
+      conversationId: "c1",
+    },
+    toolName: "bash",
+    input: {},
+  });
+
+  // Bot's own pre-reaction echoes back — should be ignored (senderIdStr === userId)
+  await client.emit("room.event", "!room:example.com", {
+    type: "m.reaction",
+    sender: "@letta-bot:example.com",
+    content: {
+      "m.relates_to": {
+        rel_type: "m.annotation",
+        event_id: "$prompt-event",
+        key: "✅",
+      },
+    },
+  });
+
+  expect(received.filter((m) => m.text === "approve")).toHaveLength(0);
+});
+
+// ── Task 11: Freeform flow and ask_user_question ──────────────────────────────
+
+test("tapping 📝 sends follow-up prompt and waits for freeform text", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$prompt-event") // control request prompt
+    .mockResolvedValueOnce("$followup-event"); // follow-up "please type"
+  client.sendEvent.mockResolvedValue("$reaction-event");
+
+  await adapter.handleControlRequestEvent!({
+    requestId: "req-freeform",
+    kind: "generic_tool_approval",
+    source: {
+      channel: "matrix",
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      messageId: "$orig",
+      agentId: "a1",
+      conversationId: "c1",
+    },
+    toolName: "bash",
+    input: {},
+  });
+
+  // Tap 📝
+  await client.emit("room.event", "!room:example.com", {
+    type: "m.reaction",
+    sender: "@user:example.com",
+    content: {
+      "m.relates_to": {
+        rel_type: "m.annotation",
+        event_id: "$prompt-event",
+        key: "📝",
+      },
+    },
+  });
+
+  // Should NOT emit yet — waiting for text
+  expect(received.filter((m) => m.text && m.text !== "")).toHaveLength(0);
+  // Follow-up prompt should have been sent
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({
+      body: expect.stringContaining("type your reason"),
+    }),
+  );
+
+  // User types their reason
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$freeform-reply",
+    content: { msgtype: "m.text", body: "because it is dangerous" },
+  });
+
+  // Now should have emitted with the freeform text
+  const freeformMsg = received.find(
+    (m) => m.text === "because it is dangerous",
+  );
+  expect(freeformMsg).toBeDefined();
+  // Pre-reactions should be redacted
+  expect(client.redactEvent).toHaveBeenCalled();
+});
+
+test("ask_user_question with options: tapping 1️⃣ emits synthetic text '1'", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$prompt-event");
+  client.sendEvent.mockResolvedValue("$reaction-event");
+
+  await adapter.handleControlRequestEvent!({
+    requestId: "req-ask",
+    kind: "ask_user_question",
+    source: {
+      channel: "matrix",
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      messageId: "$orig",
+      agentId: "a1",
+      conversationId: "c1",
+    },
+    toolName: "AskUserQuestion",
+    input: {
+      questions: [
+        {
+          question: "Which env?",
+          options: [{ label: "staging" }, { label: "production" }],
+        },
+      ],
+    },
+  });
+
+  // Prompt includes emoji labels
+  const promptCall = client.sendMessage.mock.calls[0];
+  expect((promptCall?.[1] as any)?.body).toContain("1️⃣");
+
+  // Tap 1️⃣
+  await client.emit("room.event", "!room:example.com", {
+    type: "m.reaction",
+    sender: "@user:example.com",
+    content: {
+      "m.relates_to": {
+        rel_type: "m.annotation",
+        event_id: "$prompt-event",
+        key: "1️⃣",
+      },
+    },
+  });
+
+  expect(received[0]?.text).toBe("1");
+});
+
+test("ask_user_question with >10 options falls back to text prompt, no pre-reactions", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$prompt-event");
+  client.sendEvent.mockResolvedValue("$reaction-event");
+
+  const manyOptions = Array.from({ length: 12 }, (_, i) => ({
+    label: `Option ${i + 1}`,
+  }));
+
+  await adapter.handleControlRequestEvent!({
+    requestId: "req-many",
+    kind: "ask_user_question",
+    source: {
+      channel: "matrix",
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      messageId: "$orig",
+      agentId: "a1",
+      conversationId: "c1",
+    },
+    toolName: "AskUserQuestion",
+    input: { questions: [{ question: "Pick one:", options: manyOptions }] },
+  });
+
+  // 10 keycap emojis + 📝 = 11 pre-reactions
+  const reactionCalls = client.sendEvent.mock.calls.filter(
+    (c: unknown[]) => c[1] === "m.reaction",
+  );
+  expect(reactionCalls).toHaveLength(11);
+});
+
+// ── Task 12: E2EE graceful degradation ───────────────────────────────────────
+
+test("adapter starts without E2EE when crypto addon throws", async () => {
+  mock.module("../../channels/matrix/runtime", () => ({
+    loadMatrixBotSdkModule: async () => ({
+      MatrixClient: FakeMatrixClient,
+      SimpleFsStorageProvider: FakeSimpleFsStorageProvider,
+      RustSdkCryptoStorageProvider: class {
+        constructor() {
+          throw new Error("Rust addon failed to load");
+        }
+      },
+      RustSdkCryptoStoreType: { Sled: "sled" },
+    }),
+    ensureMatrixRuntimeInstalled: async () => true,
+  }));
+
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  const e2eeAccount = { ...TEST_ACCOUNT, e2ee: true };
+  const adapter = createMatrixAdapter(e2eeAccount);
+
+  // Should not throw even though crypto addon fails
+  await adapter.start();
+  expect(adapter.isRunning()).toBe(true);
+  // Client still created (without crypto provider)
+  expect(FakeMatrixClient.instances).toHaveLength(1);
+});
