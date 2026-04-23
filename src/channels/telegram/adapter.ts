@@ -7,9 +7,15 @@
 import type { ReactionType, ReactionTypeEmoji } from "@grammyjs/types";
 import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
 import { formatChannelControlRequestPrompt } from "../interactive";
+import {
+  renderToolBlock,
+  upsertToolCallGroup,
+  type ToolCallGroup,
+} from "../tool-block";
 import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
+  ChannelTurnLifecycleEvent,
   InboundChannelMessage,
   OutboundChannelMessage,
   TelegramChannelAccount,
@@ -213,6 +219,15 @@ export function createTelegramAdapter(
   let bot: TelegramBot | null = null;
   let botModule: GrammYModule | null = null;
   let running = false;
+  const typingIntervalByChatId = new Map<string, ReturnType<typeof setInterval>>();
+
+  interface ToolBlockState {
+    messageId: number;
+    groups: ToolCallGroup[];
+  }
+  const toolBlockStateByChatId = new Map<string, ToolBlockState>();
+  const toolBlockOperationByChatId = new Map<string, Promise<void>>();
+
   const bufferedMediaGroups = new Map<string, BufferedMediaGroup>();
   let callbackKeyCounter = 0;
   const buttonMessages = new Map<
@@ -223,6 +238,78 @@ export function createTelegramAdapter(
     string,
     { requestId: string; action: "deny_reason" | "freeform"; buttonKey: string }
   >();
+
+  function startTypingInterval(chatId: string): void {
+    if (typingIntervalByChatId.has(chatId) || !bot) return;
+    const fire = () => {
+      if (!bot) return;
+      void bot.api.sendChatAction(chatId, "typing").catch(() => {});
+    };
+    fire();
+    typingIntervalByChatId.set(chatId, setInterval(fire, 4000));
+  }
+
+  function stopTypingInterval(chatId: string): void {
+    const timer = typingIntervalByChatId.get(chatId);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      typingIntervalByChatId.delete(chatId);
+    }
+  }
+
+  function scheduleToolBlockUpdate(
+    chatId: string,
+    toolName: string,
+    description?: string,
+  ): void {
+    const previous =
+      toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
+    const operation = previous
+      .catch(() => {})
+      .then(async () => {
+        if (!bot) return;
+        const state = toolBlockStateByChatId.get(chatId);
+        const newGroups = upsertToolCallGroup(
+          state?.groups ?? [],
+          toolName,
+          description,
+        );
+        const text = renderToolBlock(newGroups);
+
+        if (!state) {
+          const result = await bot.api.sendMessage(chatId, text);
+          toolBlockStateByChatId.set(chatId, {
+            messageId: result.message_id,
+            groups: newGroups,
+          });
+        } else if (text.length > 3800) {
+          const freshGroups = upsertToolCallGroup([], toolName, description);
+          const freshText = renderToolBlock(freshGroups);
+          const result = await bot.api.sendMessage(chatId, freshText);
+          toolBlockStateByChatId.set(chatId, {
+            messageId: result.message_id,
+            groups: freshGroups,
+          });
+        } else {
+          await bot.api
+            .editMessageText(chatId, state.messageId, text)
+            .catch(() => {});
+          toolBlockStateByChatId.set(chatId, { ...state, groups: newGroups });
+        }
+      })
+      .catch((error) => {
+        console.warn(
+          `[Telegram] Failed to update tool block for ${chatId}:`,
+          error instanceof Error ? error.message : error,
+        );
+      })
+      .finally(() => {
+        if (toolBlockOperationByChatId.get(chatId) === operation) {
+          toolBlockOperationByChatId.delete(chatId);
+        }
+      });
+    toolBlockOperationByChatId.set(chatId, operation);
+  }
 
   async function ensureModule(): Promise<GrammYModule> {
     if (!botModule) {
@@ -626,6 +713,13 @@ export function createTelegramAdapter(
     },
 
     async stop(): Promise<void> {
+      for (const timer of typingIntervalByChatId.values()) {
+        clearInterval(timer);
+      }
+      typingIntervalByChatId.clear();
+      toolBlockStateByChatId.clear();
+      toolBlockOperationByChatId.clear();
+
       for (const entry of bufferedMediaGroups.values()) {
         clearTimeout(entry.timer);
       }
@@ -641,6 +735,38 @@ export function createTelegramAdapter(
 
     isRunning(): boolean {
       return running;
+    },
+
+    async handleTurnLifecycleEvent(
+      event: ChannelTurnLifecycleEvent,
+    ): Promise<void> {
+      if (!running) return;
+
+      if (event.type === "queued") {
+        startTypingInterval(event.source.chatId);
+        return;
+      }
+
+      if (event.type === "processing") {
+        for (const source of event.sources) {
+          startTypingInterval(source.chatId);
+        }
+        return;
+      }
+
+      if (event.type === "tool_call") {
+        for (const source of event.sources) {
+          scheduleToolBlockUpdate(source.chatId, event.toolName, event.description);
+        }
+        return;
+      }
+
+      // "finished"
+      for (const source of event.sources) {
+        stopTypingInterval(source.chatId);
+        toolBlockStateByChatId.delete(source.chatId);
+        toolBlockOperationByChatId.delete(source.chatId);
+      }
     },
 
     async sendMessage(

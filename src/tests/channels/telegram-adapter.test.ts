@@ -60,6 +60,7 @@ class FakeBot {
     getFile: mock(async (fileId: string) => FakeBot.nextGetFileImpl(fileId)),
     answerCallbackQuery: mock(async () => true),
     editMessageText: mock(async () => ({ message_id: 999 })),
+    sendChatAction: mock(async () => true),
   };
   catchHandler:
     | ((error: {
@@ -1264,4 +1265,217 @@ test("callback_query edit failure falls back to sending text confirmation", asyn
   });
 
   expect(bot.api.sendMessage).toHaveBeenCalledWith("500", "✅ Approved", {});
+});
+
+// ── Lifecycle event tests ─────────────────────────────────────────────────────
+
+const LIFECYCLE_ACCOUNT = {
+  ...telegramAccountDefaults,
+  channel: "telegram" as const,
+  enabled: true,
+  token: "test-token",
+  dmPolicy: "pairing" as const,
+  allowedUsers: [],
+};
+
+const LIFECYCLE_SOURCE = {
+  channel: "telegram" as const,
+  accountId: "telegram-test-account",
+  chatId: "chat-42",
+  agentId: "agent-1",
+  conversationId: "conv-1",
+};
+
+test("typing indicator: sendChatAction called on queued event", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: LIFECYCLE_SOURCE,
+  });
+
+  expect(bot.api.sendChatAction).toHaveBeenCalledWith("chat-42", "typing");
+  await adapter.stop();
+});
+
+test("typing indicator: idempotent — second queued for same chat does not double-start", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({ type: "queued", source: LIFECYCLE_SOURCE });
+  const callsAfterFirst = bot.api.sendChatAction.mock.calls.length;
+  await adapter.handleTurnLifecycleEvent!({ type: "queued", source: LIFECYCLE_SOURCE });
+
+  expect(bot.api.sendChatAction.mock.calls.length).toBe(callsAfterFirst);
+  await adapter.stop();
+});
+
+test("typing indicator: processing event starts interval for new chats", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+  const newSource = { ...LIFECYCLE_SOURCE, chatId: "chat-99" };
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "processing",
+    batchId: "batch-1",
+    sources: [newSource],
+  });
+
+  expect(bot.api.sendChatAction).toHaveBeenCalledWith("chat-99", "typing");
+  await adapter.stop();
+});
+
+test("tool block: first tool_call sends a new message", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async tool block operation to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+  const [chatId, text] = bot.api.sendMessage.mock.calls[0]!;
+  expect(chatId).toBe("chat-42");
+  expect(text).toBe("🔧 Tools used:\n• read_file");
+  await adapter.stop();
+});
+
+test("tool block: second tool_call edits the existing message", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operations to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(bot.api.sendMessage).toHaveBeenCalledTimes(1); // no second send
+  expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+  const [chatId, _msgId, text] = bot.api.editMessageText.mock.calls[0]!;
+  expect(chatId).toBe("chat-42");
+  expect(text).toBe("🔧 Tools used:\n• read_file ×2");
+  await adapter.stop();
+});
+
+test("tool block: tool with description grouped correctly", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    description: "Run tests",
+    sources: [LIFECYCLE_SOURCE],
+  });
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    description: "Run tests",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operations to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const [, _msgId, text] = bot.api.editMessageText.mock.calls[0]!;
+  expect(text).toBe("🔧 Tools used:\n• bash — Run tests ×2");
+  await adapter.stop();
+});
+
+test("tool block: exceeding 3800 chars sends new message", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  // First tool call creates the block
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Push 100 distinct descriptions to exceed 3800 chars
+  for (let i = 0; i < 100; i++) {
+    await adapter.handleTurnLifecycleEvent!({
+      type: "tool_call",
+      batchId: "batch-1",
+      toolName: "bash",
+      description: `A very long description that makes things large number ${i}`,
+      sources: [LIFECYCLE_SOURCE],
+    });
+  }
+
+  // Wait for async operations to complete
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  // sendMessage should have been called more than once (overflow triggered)
+  expect(bot.api.sendMessage.mock.calls.length).toBeGreaterThan(1);
+  await adapter.stop();
+});
+
+test("tool block: cleared on finished (state does not persist across turns)", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operation to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const sendCallsBefore = bot.api.sendMessage.mock.calls.length;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  // New turn — tool_call should create a fresh message, not edit
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-2",
+    toolName: "glob",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operation to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(bot.api.sendMessage.mock.calls.length).toBe(sendCallsBefore + 1);
+  expect(bot.api.editMessageText.mock.calls.length).toBe(0);
+  await adapter.stop();
 });
