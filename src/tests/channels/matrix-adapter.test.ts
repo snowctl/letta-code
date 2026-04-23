@@ -850,7 +850,7 @@ test("ask_user_question with options: tapping 1️⃣ emits synthetic text '1'",
   expect(received[0]?.text).toBe("1");
 });
 
-test("ask_user_question with >10 options falls back to text prompt, no pre-reactions", async () => {
+test("ask_user_question with >10 options sends 10 keycap + 📝 = 11 pre-reactions", async () => {
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
