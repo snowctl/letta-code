@@ -66,10 +66,10 @@ export interface MatrixMediaCandidate {
 export function collectMatrixMediaCandidate(
   event: Record<string, unknown>,
 ): MatrixMediaCandidate | null {
-  const content = event["content"] as Record<string, unknown> | undefined;
+  const content = event.content as Record<string, unknown> | undefined;
   if (!content) return null;
 
-  const msgtype = content["msgtype"] as string | undefined;
+  const msgtype = content.msgtype as string | undefined;
   if (
     !msgtype ||
     !["m.image", "m.video", "m.audio", "m.file"].includes(msgtype)
@@ -77,27 +77,27 @@ export function collectMatrixMediaCandidate(
     return null;
   }
 
-  const url = content["url"] as string | undefined;
+  const url = content.url as string | undefined;
   if (!url?.startsWith("mxc://")) return null;
 
-  const info = content["info"] as Record<string, unknown> | undefined;
+  const info = content.info as Record<string, unknown> | undefined;
   const mimeType =
-    (info?.["mimetype"] as string | undefined) ??
-    (content["filename"]
-      ? inferMimeTypeFromExtension(content["filename"] as string)
+    (info?.mimetype as string | undefined) ??
+    (content.filename
+      ? inferMimeTypeFromExtension(content.filename as string)
       : undefined);
 
   return {
     mxcUrl: url,
     msgtype,
     filename:
-      (content["filename"] as string | undefined) ??
-      (content["body"] as string | undefined),
+      (content.filename as string | undefined) ??
+      (content.body as string | undefined),
     mimeType,
-    sizeBytes: info?.["size"] as number | undefined,
+    sizeBytes: info?.size as number | undefined,
     isVoice:
       msgtype === "m.audio" &&
-      (content["org.matrix.msc3245.voice"] != null || content["voice"] != null),
+      (content["org.matrix.msc3245.voice"] != null || content.voice != null),
   };
 }
 

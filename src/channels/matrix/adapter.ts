@@ -179,17 +179,15 @@ export function createMatrixAdapter(
       client.on("room.message", async (roomId: unknown, event: unknown) => {
         const roomIdStr = roomId as string;
         const eventObj = event as Record<string, unknown>;
-        if (eventObj["sender"] === userId) return;
+        if (eventObj.sender === userId) return;
 
-        const content = eventObj["content"] as
-          | Record<string, unknown>
-          | undefined;
+        const content = eventObj.content as Record<string, unknown> | undefined;
         if (!content) return;
-        const msgtype = content["msgtype"] as string | undefined;
+        const msgtype = content.msgtype as string | undefined;
 
         // Bot commands
         if (msgtype === "m.text" || msgtype === "m.notice") {
-          const body = (content["body"] as string | undefined)?.trim() ?? "";
+          const body = (content.body as string | undefined)?.trim() ?? "";
           if (body.startsWith("!")) {
             await handleBotCommand(roomIdStr, body, eventObj);
             return;
@@ -197,7 +195,7 @@ export function createMatrixAdapter(
         }
 
         // Check freeform awaiting
-        const senderIdStr = eventObj["sender"] as string;
+        const senderIdStr = eventObj.sender as string;
         const freeformKey = buildFreeformKey(roomIdStr, senderIdStr);
         const pendingId = awaitingFreeformByChat.get(freeformKey);
         if (pendingId) {
@@ -227,9 +225,7 @@ export function createMatrixAdapter(
           if (attachment) attachments.push(attachment);
         }
 
-        const textContent = (
-          (content["body"] as string | undefined) ?? ""
-        ).trim();
+        const textContent = ((content.body as string | undefined) ?? "").trim();
         const isMediaOnly = candidate != null;
 
         if (!textContent && attachments.length === 0) return;
@@ -253,7 +249,7 @@ export function createMatrixAdapter(
           senderName,
           text: isMediaOnly ? "" : textContent,
           timestamp: Date.now(),
-          messageId: eventObj["event_id"] as string | undefined,
+          messageId: eventObj.event_id as string | undefined,
           chatType,
           attachments: attachments.length > 0 ? attachments : undefined,
         };
@@ -265,7 +261,7 @@ export function createMatrixAdapter(
       client.on("room.event", async (roomId: unknown, event: unknown) => {
         const roomIdStr = roomId as string;
         const eventObj = event as Record<string, unknown>;
-        const type = eventObj["type"] as string;
+        const type = eventObj.type as string;
 
         if (type === "m.reaction") {
           await handleReactionEvent(roomIdStr, eventObj);
@@ -341,8 +337,8 @@ export function createMatrixAdapter(
       };
 
       if (msg.parseMode === "HTML") {
-        content["format"] = "org.matrix.custom.html";
-        content["formatted_body"] = markdownToMatrixHtml(msg.text);
+        content.format = "org.matrix.custom.html";
+        content.formatted_body = markdownToMatrixHtml(msg.text);
       }
 
       if (msg.replyToMessageId) {
@@ -458,15 +454,15 @@ export function createMatrixAdapter(
     roomId: string,
     event: Record<string, unknown>,
   ): Promise<void> {
-    const content = event["content"] as Record<string, unknown> | undefined;
+    const content = event.content as Record<string, unknown> | undefined;
     const relatesTo = content?.["m.relates_to"] as
       | Record<string, unknown>
       | undefined;
     if (!relatesTo) return;
 
-    const targetEventId = relatesTo["event_id"] as string | undefined;
-    const emoji = relatesTo["key"] as string | undefined;
-    const senderIdStr = event["sender"] as string;
+    const targetEventId = relatesTo.event_id as string | undefined;
+    const emoji = relatesTo.key as string | undefined;
+    const senderIdStr = event.sender as string;
 
     if (!targetEventId || !emoji) return;
     if (senderIdStr === userId) return;
@@ -535,7 +531,7 @@ export function createMatrixAdapter(
     _roomId: string,
     event: Record<string, unknown>,
   ): Promise<void> {
-    const redactedEventId = event["redacts"] as string | undefined;
+    const redactedEventId = event.redacts as string | undefined;
     if (!redactedEventId) return;
 
     // Check if this redaction targets one of our own pre-reactions — if so, ignore
