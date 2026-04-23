@@ -3,10 +3,16 @@ import { join } from "node:path";
 import { marked } from "marked";
 import { getChannelDir } from "../config";
 import { formatChannelControlRequestPrompt } from "../interactive";
+import {
+  renderToolBlock,
+  upsertToolCallGroup,
+  type ToolCallGroup,
+} from "../tool-block";
 import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
   ChannelControlRequestKind,
+  ChannelTurnLifecycleEvent,
   InboundChannelMessage,
   MatrixChannelAccount,
   OutboundChannelMessage,
@@ -68,6 +74,7 @@ interface MatrixClientLike {
   mxcToHttp(mxc: string): string;
   getUserProfile(userId: string): Promise<{ displayname?: string }>;
   getJoinedRoomMembers(roomId: string): Promise<string[]>;
+  sendTyping(roomId: string, isTyping: boolean, timeout?: number): Promise<void>;
 }
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
@@ -93,6 +100,87 @@ export function createMatrixAdapter(
   const pendingReactionRequests = new Map<string, PendingReactionRequest>();
   // Map from `${chatId}:${senderId}` → requestId
   const awaitingFreeformByChat = new Map<string, string>();
+
+  // ── Typing indicator state ────────────────────────────────────────
+  const typingIntervalByChatId = new Map<string, ReturnType<typeof setInterval>>();
+
+  // ── Tool block state ─────────────────────────────────────────────
+  interface MatrixToolBlockState {
+    messageId: string;
+    groups: ToolCallGroup[];
+  }
+  const toolBlockStateByChatId = new Map<string, MatrixToolBlockState>();
+  const toolBlockOperationByChatId = new Map<string, Promise<void>>();
+
+  // ── Typing interval helpers ───────────────────────────────────────
+
+  function startTypingInterval(chatId: string): void {
+    if (typingIntervalByChatId.has(chatId) || !matrixClient) return;
+    const fire = () => {
+      if (!matrixClient) return;
+      void matrixClient.sendTyping(chatId, true, 8000).catch(() => {});
+    };
+    fire();
+    typingIntervalByChatId.set(chatId, setInterval(fire, 4000));
+  }
+
+  async function stopTypingInterval(chatId: string): Promise<void> {
+    const timer = typingIntervalByChatId.get(chatId);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      typingIntervalByChatId.delete(chatId);
+    }
+    if (matrixClient) {
+      await matrixClient.sendTyping(chatId, false).catch(() => {});
+    }
+  }
+
+  // ── Tool block helper ─────────────────────────────────────────────
+
+  function scheduleToolBlockUpdate(chatId: string, toolName: string, description?: string): void {
+    const previous = toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
+    const operation = previous
+      .catch(() => {})
+      .then(async () => {
+        if (!matrixClient) return;
+        const state = toolBlockStateByChatId.get(chatId);
+        const newGroups = upsertToolCallGroup(state?.groups ?? [], toolName, description);
+        const text = renderToolBlock(newGroups);
+
+        if (!state) {
+          // Send new message
+          const eventId = await matrixClient.sendMessage(chatId, {
+            msgtype: "m.text",
+            body: text,
+          });
+          toolBlockStateByChatId.set(chatId, { messageId: String(eventId), groups: newGroups });
+        } else {
+          // Edit via m.relates_to / m.replace
+          await matrixClient.sendMessage(chatId, {
+            msgtype: "m.text",
+            body: `* ${text}`,
+            "m.new_content": { msgtype: "m.text", body: text },
+            "m.relates_to": {
+              rel_type: "m.replace",
+              event_id: state.messageId,
+            },
+          });
+          toolBlockStateByChatId.set(chatId, { messageId: state.messageId, groups: newGroups });
+        }
+      })
+      .catch((error) => {
+        console.warn(
+          `[Matrix] Failed to update tool block for ${chatId}:`,
+          error instanceof Error ? error.message : error,
+        );
+      })
+      .finally(() => {
+        if (toolBlockOperationByChatId.get(chatId) === operation) {
+          toolBlockOperationByChatId.delete(chatId);
+        }
+      });
+    toolBlockOperationByChatId.set(chatId, operation);
+  }
 
   async function createClient(): Promise<MatrixClientLike> {
     const {
@@ -279,6 +367,17 @@ export function createMatrixAdapter(
     },
 
     async stop(): Promise<void> {
+      // Clean up typing intervals
+      for (const [chatId, timer] of typingIntervalByChatId) {
+        clearInterval(timer);
+        if (matrixClient) {
+          await matrixClient.sendTyping(chatId, false).catch(() => {});
+        }
+      }
+      typingIntervalByChatId.clear();
+      toolBlockStateByChatId.clear();
+      toolBlockOperationByChatId.clear();
+
       await matrixClient?.stop();
       running = false;
     },
@@ -418,6 +517,38 @@ export function createMatrixAdapter(
         sentReactionEventIds,
         awaitingFreeform: false,
       });
+    },
+
+    async handleTurnLifecycleEvent(event: ChannelTurnLifecycleEvent): Promise<void> {
+      if (!running) return;
+
+      if (event.type === "queued") {
+        startTypingInterval(event.source.chatId);
+        return;
+      }
+
+      if (event.type === "processing") {
+        for (const source of event.sources) {
+          startTypingInterval(source.chatId);
+        }
+        return;
+      }
+
+      if (event.type === "tool_call") {
+        for (const source of event.sources) {
+          scheduleToolBlockUpdate(source.chatId, event.toolName, event.description);
+        }
+        return;
+      }
+
+      // "finished"
+      for (const source of event.sources) {
+        await stopTypingInterval(source.chatId);
+        const pending = toolBlockOperationByChatId.get(source.chatId);
+        if (pending) await pending.catch(() => {});
+        toolBlockStateByChatId.delete(source.chatId);
+        toolBlockOperationByChatId.delete(source.chatId);
+      }
     },
 
     onMessage: undefined,

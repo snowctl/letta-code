@@ -29,6 +29,9 @@ class FakeMatrixClient {
   sendMessage = mock(
     async (_roomId: string, _content: unknown) => "$fake-event-id",
   );
+  sendTyping = mock(
+    async (_roomId: string, _isTyping: boolean, _timeout?: number) => {},
+  );
   sendEvent = mock(
     async (_roomId: string, _type: string, _content: unknown) =>
       "$fake-reaction-id",
@@ -952,4 +955,213 @@ test("adapter starts without E2EE when crypto addon throws", async () => {
   // Client created, but without a crypto provider (graceful fallback)
   expect(FakeMatrixClient.instances).toHaveLength(1);
   expect(getFakeClient().cryptoProviderArg).toBeUndefined();
+});
+
+// ── Lifecycle event tests ─────────────────────────────────────────────────────
+
+const MATRIX_LIFECYCLE_ACCOUNT = {
+  channel: "matrix" as const,
+  accountId: "matrix-lifecycle-account",
+  homeserverUrl: "https://matrix.example.org",
+  accessToken: "lifecycle-token",
+  userId: "@bot:matrix.example.org",
+  enabled: true,
+  dmPolicy: "open" as const,
+  allowedUsers: [],
+  createdAt: "2026-04-23T00:00:00.000Z",
+  updatedAt: "2026-04-23T00:00:00.000Z",
+  e2ee: false,
+};
+
+const MATRIX_LIFECYCLE_SOURCE = {
+  channel: "matrix" as const,
+  accountId: "matrix-lifecycle-account",
+  chatId: "!room-abc:matrix.example.org",
+  agentId: "agent-1",
+  conversationId: "conv-1",
+};
+
+async function makeLifecycleAdapter() {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  return createMatrixAdapter(MATRIX_LIFECYCLE_ACCOUNT);
+}
+
+function getLifecycleFakeClient(): FakeMatrixClient {
+  // The lifecycle adapter is created after other adapters in setup; get the last instance
+  const client = FakeMatrixClient.instances[FakeMatrixClient.instances.length - 1];
+  if (!client) throw new Error("No FakeMatrixClient created");
+  return client;
+}
+
+test("Matrix typing indicator: sendTyping(true) called on queued event", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: MATRIX_LIFECYCLE_SOURCE,
+  });
+
+  expect(client.sendTyping).toHaveBeenCalledWith(
+    MATRIX_LIFECYCLE_SOURCE.chatId,
+    true,
+    8000,
+  );
+});
+
+test("Matrix typing indicator: sendTyping(false) called on finished event", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: MATRIX_LIFECYCLE_SOURCE,
+  });
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  expect(client.sendTyping).toHaveBeenCalledWith(
+    MATRIX_LIFECYCLE_SOURCE.chatId,
+    false,
+  );
+});
+
+test("Matrix tool block: first tool_call sends a new message", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$tool-block-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    description: "run ls",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [roomId, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  expect(roomId).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+  expect(content.msgtype).toBe("m.text");
+  expect(content.body).toContain("bash");
+  // First message has no m.relates_to (it's a new message, not an edit)
+  expect(content["m.relates_to"]).toBeUndefined();
+});
+
+test("Matrix tool block: second tool_call edits via m.replace", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$tool-block-1")
+    .mockResolvedValueOnce("$tool-block-edit-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  const secondCall = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  const secondContent = secondCall[1];
+  const relatesTo = secondContent["m.relates_to"] as Record<string, unknown> | undefined;
+  expect(relatesTo?.rel_type).toBe("m.replace");
+  expect(relatesTo?.event_id).toBe("$tool-block-1");
+
+  const newContent = secondContent["m.new_content"] as Record<string, unknown> | undefined;
+  expect(newContent?.body).toContain("bash");
+  expect(newContent?.body).toContain("read_file");
+});
+
+test("Matrix tool block: no size guard — block grows indefinitely", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  // First call returns an event ID; subsequent ones return edits
+  client.sendMessage.mockResolvedValue("$tool-block-main");
+
+  for (let i = 0; i < 150; i++) {
+    await adapter.handleTurnLifecycleEvent!({
+      type: "tool_call",
+      batchId: "batch-1",
+      toolName: `tool_${i}`,
+      description: `desc ${i}`,
+      sources: [MATRIX_LIFECYCLE_SOURCE],
+    });
+  }
+
+  await new Promise((r) => setTimeout(r, 200));
+
+  const calls = client.sendMessage.mock.calls as Array<[string, Record<string, unknown>]>;
+  // First call has no m.relates_to
+  expect(calls[0]![1]["m.relates_to"]).toBeUndefined();
+  // All subsequent calls are edits (have m.relates_to)
+  for (let i = 1; i < calls.length; i++) {
+    const relatesTo = calls[i]![1]["m.relates_to"] as Record<string, unknown> | undefined;
+    expect(relatesTo?.rel_type).toBe("m.replace");
+  }
+  // All 150 events processed — first is create, rest are edits (no new creates like Telegram would do)
+  expect(calls).toHaveLength(150);
+});
+
+test("Matrix tool block: cleared on finished", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$block-first")
+    .mockResolvedValueOnce("$block-second");
+
+  // First tool_call
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Finish the turn — clears tool block state
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  // Second tool_call in a new turn
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-2",
+    toolName: "read_file",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Second tool_call's sendMessage should have no m.relates_to (fresh block)
+  const secondCreate = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  expect(secondCreate[1]["m.relates_to"]).toBeUndefined();
 });
