@@ -266,3 +266,98 @@ test("matrixMessageActions.handleAction upload-file calls adapter.sendMessage wi
 
   expect(result).toContain("Attachment sent");
 });
+
+// ── Lifecycle and outbound tests ──────────────────────────────────────────────
+
+test("adapter starts and creates MatrixClient with correct args", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  expect(FakeMatrixClient.instances).toHaveLength(1);
+  const client = getFakeClient();
+  expect(client.homeserverUrl).toBe("https://matrix.example.com");
+  expect(client.accessToken).toBe("syt_test_token");
+  expect(client.start).toHaveBeenCalledTimes(1);
+  expect(adapter.isRunning()).toBe(true);
+});
+
+test("adapter stop sets isRunning to false", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  await adapter.stop();
+  expect(adapter.isRunning()).toBe(false);
+});
+
+test("adapter sendMessage text sends m.text event", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$msg-event-id");
+
+  const result = await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room:example.com",
+    text: "hello world",
+  });
+
+  expect(result.messageId).toBe("$msg-event-id");
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({ msgtype: "m.text", body: "hello world" }),
+  );
+});
+
+test("adapter sendMessage with parseMode HTML sends formatted_body", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$html-event-id");
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room:example.com",
+    text: "hello world",
+    parseMode: "HTML",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({
+      msgtype: "m.text",
+      body: "hello world",
+      format: "org.matrix.custom.html",
+      formatted_body: expect.any(String),
+    }),
+  );
+});
+
+test("adapter sendDirectReply sends plain text message", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await adapter.sendDirectReply("!room:example.com", "pairing code: 1234");
+
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({ msgtype: "m.text", body: "pairing code: 1234" }),
+  );
+});
+
+test("adapter sendDirectReply with replyToMessageId includes m.in_reply_to", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await adapter.sendDirectReply("!room:example.com", "reply text", {
+    replyToMessageId: "$orig-event",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    "!room:example.com",
+    expect.objectContaining({
+      "m.relates_to": { "m.in_reply_to": { event_id: "$orig-event" } },
+    }),
+  );
+});
