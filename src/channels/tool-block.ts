@@ -19,6 +19,7 @@ export function makeToolCallLabel(
 }
 
 export function renderToolBlock(groups: ToolCallGroup[]): string {
+  if (groups.length === 0) return "";
   const lines = groups.map((g) =>
     g.count === 1 ? `• ${g.label}` : `• ${g.label} ×${g.count}`,
   );

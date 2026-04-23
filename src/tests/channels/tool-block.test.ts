@@ -6,6 +6,10 @@ import {
   type ToolCallGroup,
 } from "../../channels/tool-block";
 
+test("renderToolBlock: empty groups returns empty string", () => {
+  expect(renderToolBlock([])).toBe("");
+});
+
 test("renderToolBlock: single tool no description", () => {
   const groups: ToolCallGroup[] = [{ key: "bash", label: "bash", count: 1 }];
   expect(renderToolBlock(groups)).toBe("🔧 Tools used:\n• bash");
