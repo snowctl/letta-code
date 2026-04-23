@@ -496,6 +496,22 @@ export async function handleApprovalStop(params: {
     }
   };
 
+  const channelSources = runtime.activeChannelTurnSources ?? [];
+  const onToolCall =
+    channelSources.length > 0
+      ? (toolName: string, description?: string) => {
+          const registry = getChannelRegistry();
+          if (!registry) return;
+          void registry.dispatchTurnLifecycleEvent({
+            type: "tool_call",
+            batchId: dequeuedBatchId,
+            toolName,
+            description,
+            sources: channelSources,
+          });
+        }
+      : undefined;
+
   const executionResults = await executeApprovalBatch(decisions, undefined, {
     toolContextId: turnToolContextId ?? undefined,
     abortSignal: abortController.signal,
@@ -504,6 +520,7 @@ export async function handleApprovalStop(params: {
     parentScope:
       agentId && conversationId ? { agentId, conversationId } : undefined,
     onFileWrite,
+    onToolCall,
   });
   const persistedExecutionResults = normalizeExecutionResultsForInterruptParity(
     runtime,
