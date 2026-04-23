@@ -1,5 +1,8 @@
 import type { ChannelPlugin } from "../pluginTypes";
-import type { ChannelAdapter } from "../types";
+import type { ChannelAccount, MatrixChannelAccount } from "../types";
+import { createMatrixAdapter } from "./adapter";
+import { matrixMessageActions } from "./messageActions";
+import { runMatrixSetup } from "./setup";
 
 export const matrixChannelPlugin: ChannelPlugin = {
   metadata: {
@@ -8,7 +11,11 @@ export const matrixChannelPlugin: ChannelPlugin = {
     runtimePackages: ["matrix-bot-sdk@0.8.0"],
     runtimeModules: ["matrix-bot-sdk"],
   },
-  async createAdapter(): Promise<ChannelAdapter> {
-    throw new Error("Matrix adapter not yet implemented");
+  createAdapter(account: ChannelAccount) {
+    return createMatrixAdapter(account as MatrixChannelAccount);
+  },
+  messageActions: matrixMessageActions,
+  runSetup() {
+    return runMatrixSetup();
   },
 };
