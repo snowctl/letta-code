@@ -61,10 +61,17 @@ class FakeMatrixClient {
     this._started = false;
   });
   dms = { isDm: (_roomId: string) => false };
+  cryptoProviderArg: unknown = undefined;
 
-  constructor(homeserverUrl: string, accessToken: string) {
+  constructor(
+    homeserverUrl: string,
+    accessToken: string,
+    _storageProvider?: unknown,
+    cryptoProvider?: unknown,
+  ) {
     this.homeserverUrl = homeserverUrl;
     this.accessToken = accessToken;
+    this.cryptoProviderArg = cryptoProvider;
     FakeMatrixClient.instances.push(this);
   }
 
@@ -432,8 +439,13 @@ test("adapter responds to !start command", async () => {
 
   expect(client.sendMessage).toHaveBeenCalledWith(
     "!room:example.com",
-    expect.objectContaining({ body: expect.stringContaining("Letta") }),
+    expect.objectContaining({
+      body: expect.stringContaining("Letta"),
+    }),
   );
+  // Verify it's the welcome/pairing reply, not the status reply
+  const call = client.sendMessage.mock.calls[0];
+  expect((call?.[1] as any)?.body).toContain("pairing code");
 });
 
 test("adapter responds to !status command", async () => {
@@ -454,6 +466,9 @@ test("adapter responds to !status command", async () => {
       body: expect.stringContaining("@letta-bot:example.com"),
     }),
   );
+  // Verify it's the status reply, not the welcome reply
+  const call = client.sendMessage.mock.calls[0];
+  expect((call?.[1] as any)?.body).toContain("DM Policy");
 });
 
 test("adapter sets chatType=direct for 2-member rooms", async () => {
@@ -640,8 +655,12 @@ test("tapping ✅ emits synthetic approve message", async () => {
 
   expect(received).toHaveLength(1);
   expect(received[0]?.text).toBe("approve");
-  // Pre-reactions redacted
-  expect(client.redactEvent).toHaveBeenCalled();
+  // Pre-reactions redacted — all 3 (✅, ❌, 📝) returned "$reaction-event"
+  expect(client.redactEvent).toHaveBeenCalledWith(
+    "!room:example.com",
+    "$reaction-event",
+  );
+  expect(client.redactEvent).toHaveBeenCalledTimes(3);
 });
 
 test("tapping ❌ emits synthetic deny message", async () => {
@@ -683,6 +702,10 @@ test("tapping ❌ emits synthetic deny message", async () => {
   });
 
   expect(received[0]?.text).toBe("deny");
+  expect(client.redactEvent).toHaveBeenCalledWith(
+    "!room:example.com",
+    "$reaction-event",
+  );
 });
 
 test("bot's own reactions to the prompt are ignored (no self-feedback loop)", async () => {
@@ -770,8 +793,8 @@ test("tapping 📝 sends follow-up prompt and waits for freeform text", async ()
     },
   });
 
-  // Should NOT emit yet — waiting for text
-  expect(received.filter((m) => m.text && m.text !== "")).toHaveLength(0);
+  // Should NOT emit yet — 📝 tap is a control signal, not a message
+  expect(received).toHaveLength(0);
   // Follow-up prompt should have been sent
   expect(client.sendMessage).toHaveBeenCalledWith(
     "!room:example.com",
@@ -793,8 +816,12 @@ test("tapping 📝 sends follow-up prompt and waits for freeform text", async ()
     (m) => m.text === "because it is dangerous",
   );
   expect(freeformMsg).toBeDefined();
-  // Pre-reactions should be redacted
-  expect(client.redactEvent).toHaveBeenCalled();
+  // Pre-reactions should be redacted (generic_tool_approval has ✅, ❌, 📝 = 3)
+  expect(client.redactEvent).toHaveBeenCalledWith(
+    "!room:example.com",
+    "$reaction-event",
+  );
+  expect(client.redactEvent).toHaveBeenCalledTimes(3);
 });
 
 test("ask_user_question with options: tapping 1️⃣ emits synthetic text '1'", async () => {
@@ -907,6 +934,7 @@ test("adapter starts without E2EE when crypto addon throws", async () => {
   // Should not throw even though crypto addon fails
   await adapter.start();
   expect(adapter.isRunning()).toBe(true);
-  // Client still created (without crypto provider)
+  // Client created, but without a crypto provider (graceful fallback)
   expect(FakeMatrixClient.instances).toHaveLength(1);
+  expect(getFakeClient().cryptoProviderArg).toBeUndefined();
 });
