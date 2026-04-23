@@ -10,6 +10,7 @@
  * plugin.messageActions, following the OpenClaw-style architecture.
  */
 
+import { marked } from "marked";
 import {
   isSupportedChannelId,
   loadChannelPlugin,
@@ -436,6 +437,29 @@ export function markdownToSlackMrkdwn(text: string): string {
   return formatSlackText(text);
 }
 
+export function markdownToMatrixHtml(text: string): string {
+  // marked.parse returns a string synchronously when given a string with no async extensions
+  const html = marked.parse(text, { async: false }) as string;
+  // Trim trailing newline that marked appends
+  return html.trimEnd();
+}
+
+export function stripMarkdownToPlainText(text: string): string {
+  // Remove headings
+  let result = text.replace(/^#{1,6}\s+/gm, "");
+  // Remove bold/italic (**, __, *, _)
+  result = result.replace(/(\*{1,2}|_{1,2})(.+?)\1/g, "$2");
+  // Remove inline code
+  result = result.replace(/`([^`]+)`/g, "$1");
+  // Remove fenced code blocks — keep content
+  result = result.replace(/```[^\n]*\n([\s\S]*?)```/g, "$1");
+  // Remove links — keep label
+  result = result.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  // Collapse multiple blank lines
+  result = result.replace(/\n{3,}/g, "\n\n");
+  return result.trim();
+}
+
 const CHANNEL_OUTBOUND_FORMATTERS: Partial<
   Record<string, OutboundChannelFormatter>
 > = {
@@ -448,6 +472,12 @@ const CHANNEL_OUTBOUND_FORMATTERS: Partial<
   slack(text) {
     return {
       text: markdownToSlackMrkdwn(text),
+    };
+  },
+  matrix(text) {
+    return {
+      text: stripMarkdownToPlainText(text),
+      parseMode: "HTML",
     };
   },
 };
