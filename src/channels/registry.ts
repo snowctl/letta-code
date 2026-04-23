@@ -216,6 +216,14 @@ export type ChannelRegistryEvent =
       agentId: string;
       conversationId: string;
       defaultPermissionMode: SlackDefaultPermissionMode;
+    }
+  | {
+      type: "channel_permission_mode_set";
+      channelId: string;
+      accountId: string;
+      agentId: string;
+      conversationId: string;
+      defaultPermissionMode: SlackDefaultPermissionMode;
     };
 
 // ── Registry ──────────────────────────────────────────────────────
@@ -853,10 +861,24 @@ export class ChannelRegistry {
       return;
     }
 
-    // 3. Format as XML
+    // 3. Apply account-level default permission mode if configured.
+    const mode = (config as { defaultPermissionMode?: SlackDefaultPermissionMode })
+      .defaultPermissionMode;
+    if (mode && mode !== "default") {
+      this.eventHandler?.({
+        type: "channel_permission_mode_set",
+        channelId: msg.channel,
+        accountId,
+        agentId: route.agentId,
+        conversationId: route.conversationId,
+        defaultPermissionMode: mode,
+      });
+    }
+
+    // 4. Format as XML
     const content = formatChannelNotification(msg);
 
-    // 4. Deliver or buffer
+    // 5. Deliver or buffer
     this.deliverOrBuffer({
       route,
       content,

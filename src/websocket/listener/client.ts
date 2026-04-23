@@ -3308,6 +3308,8 @@ function handleChannelRegistryEvent(
     return;
   }
 
+  // Both slack_conversation_created and channel_permission_mode_set carry
+  // agentId, conversationId, and defaultPermissionMode.
   const permissionModeState = getOrCreateConversationPermissionModeStateRef(
     runtime,
     event.agentId,

@@ -7,6 +7,7 @@ import {
 import type {
   ChannelAccount,
   DiscordChannelAccount,
+  MatrixChannelAccount,
   SlackChannelAccount,
   SlackDefaultPermissionMode,
   SupportedChannelId,
@@ -60,6 +61,16 @@ function normalizeLoadedAccount<T extends ChannelAccount>(account: T): T {
     (next as SlackChannelAccount).defaultPermissionMode = ((
       next as SlackChannelAccount
     ).defaultPermissionMode ?? "default") as SlackDefaultPermissionMode;
+  }
+  if (next.channel === "telegram") {
+    (next as TelegramChannelAccount).defaultPermissionMode =
+      ((next as TelegramChannelAccount).defaultPermissionMode ??
+        "default") as SlackDefaultPermissionMode;
+  }
+  if (next.channel === "matrix") {
+    (next as MatrixChannelAccount).defaultPermissionMode =
+      ((next as MatrixChannelAccount).defaultPermissionMode ??
+        "default") as SlackDefaultPermissionMode;
   }
   return next;
 }

@@ -308,6 +308,7 @@ export interface TelegramChannelAccount extends ChannelAccountBase {
   channel: "telegram";
   token: string;
   binding: ChannelAccountBinding;
+  defaultPermissionMode?: SlackDefaultPermissionMode;
   /** When true and OPENAI_API_KEY is set, voice memos are auto-transcribed. */
   transcribeVoice?: boolean;
 }
@@ -336,6 +337,7 @@ export interface MatrixChannelAccount extends ChannelAccountBase {
   e2ee: boolean;
   transcribeVoice?: boolean;
   maxMediaDownloadBytes?: number;
+  defaultPermissionMode?: SlackDefaultPermissionMode;
 }
 
 export type ChannelAccount =
