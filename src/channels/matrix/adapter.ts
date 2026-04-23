@@ -22,6 +22,8 @@ import { loadMatrixBotSdkModule } from "./runtime";
 
 // ── Markdown helper ───────────────────────────────────────────────────────────
 
+// Inlined here rather than imported from MessageChannel.ts to avoid the transitive import
+// chain (registry → accounts → config) that conflicts with mock.module() in tests.
 function markdownToMatrixHtml(text: string): string {
   return (marked.parse(text) as string).trimEnd();
 }
@@ -42,7 +44,7 @@ type PendingReactionRequest = {
   requestId: string;
   kind: ChannelControlRequestKind;
   chatId: string;
-  senderId: string;
+  senderId: string | null;
   sentEmojis: string[];
   sentReactionEventIds: Map<string, string>;
   awaitingFreeform: boolean;
@@ -409,13 +411,13 @@ export function createMatrixAdapter(
         }
       }
 
-      // We don't have a senderId from ChannelTurnSource, so leave it empty.
-      // Reaction handling will validate against the sender of the reaction event.
+      // senderId is null when the control request originates from a tool call
+      // (no associated Matrix user). Reaction handling skips the sender check in that case.
       pendingReactionRequests.set(String(promptEventId), {
         requestId: event.requestId,
         kind: event.kind,
         chatId,
-        senderId: "",
+        senderId: null,
         sentEmojis: emojis,
         sentReactionEventIds,
         awaitingFreeform: false,
@@ -472,8 +474,8 @@ export function createMatrixAdapter(
     // Check if this targets a pending control request
     const pending = pendingReactionRequests.get(targetEventId);
     if (pending) {
-      // If senderId is set, validate the reactor matches
-      if (pending.senderId && senderIdStr !== pending.senderId) return;
+      // If senderId is known, validate the reactor matches
+      if (pending.senderId !== null && senderIdStr !== pending.senderId) return;
 
       if (emoji === "📝") {
         const client = await ensureClient();
