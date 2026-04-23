@@ -13,7 +13,7 @@
     "scripts",
     "skills",
     "vendor",
-    "dist/types"
+    "dist/types",
     "src",
     "build.js"
   ],
