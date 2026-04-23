@@ -92,6 +92,13 @@ export type ChannelTurnLifecycleEvent =
       sources: ChannelTurnSource[];
     }
   | {
+      type: "tool_call";
+      batchId: string;
+      toolName: string;
+      description?: string;
+      sources: ChannelTurnSource[];
+    }
+  | {
       type: "finished";
       batchId: string;
       sources: ChannelTurnSource[];
