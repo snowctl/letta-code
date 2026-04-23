@@ -127,9 +127,24 @@ beforeEach(() => {
     ensureMatrixRuntimeInstalled: async () => true,
   }));
 
+  // Include all config.ts exports so transitive imports (accounts.ts etc.)
+  // don't fail with "export not found" when this mock leaks across test files.
   mock.module("../../channels/config", () => ({
-    getChannelDir: (channelId: string) => join(channelRoot, channelId),
     getChannelsRoot: () => channelRoot,
+    getChannelDir: (channelId: string) => join(channelRoot, channelId),
+    getChannelConfigPath: (channelId: string) =>
+      join(channelRoot, channelId, "config.yaml"),
+    getChannelAccountsPath: (channelId: string) =>
+      join(channelRoot, channelId, "accounts.json"),
+    getChannelRoutingPath: (channelId: string) =>
+      join(channelRoot, channelId, "routing.json"),
+    getChannelPairingPath: (channelId: string) =>
+      join(channelRoot, channelId, "pairing.json"),
+    getChannelTargetsPath: (channelId: string) =>
+      join(channelRoot, channelId, "targets.json"),
+    getPendingChannelControlRequestsPath: () =>
+      join(channelRoot, "pending-control-requests.json"),
+    readChannelConfig: () => null,
   }));
 });
 
