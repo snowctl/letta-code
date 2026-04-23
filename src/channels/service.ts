@@ -1088,7 +1088,7 @@ export function bindChannelAccountLive(
       updatedAt: new Date().toISOString(),
     });
   } else if (existing.channel === "matrix") {
-    // Matrix doesn't support binding - just return the existing account
+    // Matrix uses per-route bindings via the channel registry (not a top-level agentId field).
     updated = existing;
   } else {
     // Slack and Discord both use a top-level agentId
@@ -1122,7 +1122,7 @@ export function unbindChannelAccountLive(
       updatedAt: new Date().toISOString(),
     });
   } else if (existing.channel === "matrix") {
-    // Matrix doesn't support binding - just return the existing account
+    // Matrix uses per-route bindings via the channel registry (not a top-level agentId field).
     updated = existing;
   } else {
     // Slack and Discord both use a top-level agentId

@@ -170,6 +170,8 @@ const discordConfigCodec: ChannelConfigCodec<DiscordChannelConfig> = {
 
 const matrixConfigCodec: ChannelConfigCodec<ChannelConfig> = {
   parse(parsed) {
+    // MatrixChannelAccount is not in the ChannelConfig union (Matrix uses accounts.json directly,
+    // not YAML config), so we cast through unknown to satisfy the codec's return type.
     return {
       channel: "matrix",
       enabled: parsed.enabled !== false,
