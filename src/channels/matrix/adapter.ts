@@ -236,6 +236,28 @@ export function createMatrixAdapter(
       .catch(() => {})
       .then(async () => {
         if (!matrixClient) return;
+
+        // Send thinking placeholder before tool block to guarantee ordering
+        if (account.showReasoning !== false && !reasoningMessageIdByChatId.has(chatId)) {
+          reasoningMessageIdByChatId.set(chatId, "__pending__");
+          try {
+            const eventId = await matrixClient.sendMessage(chatId, {
+              msgtype: "m.text",
+              body: "Thinking...",
+              format: "org.matrix.custom.html",
+              formatted_body: "<details><summary>Thinking...</summary></details>",
+            });
+            reasoningMessageIdByChatId.set(chatId, String(eventId));
+            startReasoningFlush(chatId);
+          } catch (error) {
+            reasoningMessageIdByChatId.delete(chatId);
+            console.warn(
+              "[Matrix] Failed to send thinking placeholder:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
+
         const state = toolBlockStateByChatId.get(chatId);
         const newGroups = upsertToolCallGroup(
           state?.groups ?? [],
@@ -764,6 +786,18 @@ export function createMatrixAdapter(
         if (pending) await pending.catch(() => {});
         toolBlockStateByChatId.delete(source.chatId);
         toolBlockOperationByChatId.delete(source.chatId);
+
+        // Redact thinking placeholder if turn ended without a response
+        const reasoningMsgId = reasoningMessageIdByChatId.get(source.chatId);
+        if (reasoningMsgId && reasoningMsgId !== "__pending__" && matrixClient) {
+          await matrixClient.redactEvent(source.chatId, reasoningMsgId).catch((error) => {
+            console.warn(
+              "[Matrix] Failed to redact thinking placeholder on turn end:",
+              error instanceof Error ? error.message : error,
+            );
+          });
+        }
+
         clearReasoningState(source.chatId);
       }
     },

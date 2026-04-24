@@ -1050,11 +1050,13 @@ test("Matrix typing indicator: setTyping(false) called on finished event", async
   );
 });
 
-test("Matrix tool block: first tool_call sends a new message", async () => {
+test("Matrix tool block: first tool_call sends thinking placeholder then tool block", async () => {
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
-  client.sendMessage.mockResolvedValueOnce("$tool-block-1");
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$tool-block-1");
 
   await adapter.handleTurnLifecycleEvent!({
     type: "tool_call",
@@ -1066,20 +1068,29 @@ test("Matrix tool block: first tool_call sends a new message", async () => {
 
   await new Promise((r) => setTimeout(r, 10));
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const [roomId, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
-  expect(roomId).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
-  expect(content.msgtype).toBe("m.text");
-  expect(content.body).toContain("bash");
-  // First message has no m.relates_to (it's a new message, not an edit)
-  expect(content["m.relates_to"]).toBeUndefined();
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  // First call: thinking placeholder (no m.relates_to = new message)
+  const [room0, content0] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  expect(room0).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+  expect((content0 as Record<string, unknown>).formatted_body as string).toContain(
+    "<details><summary>Thinking...</summary>",
+  );
+  expect((content0 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+
+  // Second call: tool block (no m.relates_to = new message)
+  const [room1, content1] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  expect(room1).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+  expect((content1 as Record<string, unknown>).body).toContain("bash");
+  expect((content1 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
 });
 
-test("Matrix tool block: second tool_call edits via m.replace", async () => {
+test("Matrix tool block: second tool_call edits tool block via m.replace", async () => {
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
   client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
     .mockResolvedValueOnce("$tool-block-1")
     .mockResolvedValueOnce("$tool-block-edit-1");
 
@@ -1099,15 +1110,16 @@ test("Matrix tool block: second tool_call edits via m.replace", async () => {
 
   await new Promise((r) => setTimeout(r, 10));
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  // 3 calls: thinking placeholder + tool block create + tool block edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(3);
 
-  const secondCall = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
-  const secondContent = secondCall[1];
-  const relatesTo = secondContent["m.relates_to"] as Record<string, unknown> | undefined;
+  const thirdCall = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
+  const thirdContent = thirdCall[1];
+  const relatesTo = thirdContent["m.relates_to"] as Record<string, unknown> | undefined;
   expect(relatesTo?.rel_type).toBe("m.replace");
   expect(relatesTo?.event_id).toBe("$tool-block-1");
 
-  const newContent = secondContent["m.new_content"] as Record<string, unknown> | undefined;
+  const newContent = thirdContent["m.new_content"] as Record<string, unknown> | undefined;
   expect(newContent?.body).toContain("bash");
   expect(newContent?.body).toContain("read_file");
 });
@@ -1116,8 +1128,6 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
-
-  // First call returns an event ID; subsequent ones return edits
   client.sendMessage.mockResolvedValue("$tool-block-main");
 
   for (let i = 0; i < 150; i++) {
@@ -1133,26 +1143,30 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
   await new Promise((r) => setTimeout(r, 200));
 
   const calls = client.sendMessage.mock.calls as Array<[string, Record<string, unknown>]>;
-  // First call has no m.relates_to
+  // calls[0]: thinking placeholder (no m.relates_to)
   expect(calls[0]![1]["m.relates_to"]).toBeUndefined();
-  // All subsequent calls are edits (have m.relates_to)
-  for (let i = 1; i < calls.length; i++) {
+  expect((calls[0]![1] as Record<string, unknown>).formatted_body as string).toContain("Thinking...");
+  // calls[1]: tool block create (no m.relates_to)
+  expect(calls[1]![1]["m.relates_to"]).toBeUndefined();
+  // calls[2..150]: tool block edits
+  for (let i = 2; i < calls.length; i++) {
     const relatesTo = calls[i]![1]["m.relates_to"] as Record<string, unknown> | undefined;
     expect(relatesTo?.rel_type).toBe("m.replace");
   }
-  // All 150 events processed — first is create, rest are edits (no new creates like Telegram would do)
-  expect(calls).toHaveLength(150);
+  // 1 thinking placeholder + 1 tool block create + 149 edits = 151
+  expect(calls).toHaveLength(151);
 });
 
-test("Matrix tool block: cleared on finished", async () => {
+test("Matrix tool block: cleared on finished, thinking placeholder redacted", async () => {
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
   client.sendMessage
+    .mockResolvedValueOnce("$thinking-first")
     .mockResolvedValueOnce("$block-first")
+    .mockResolvedValueOnce("$thinking-second")
     .mockResolvedValueOnce("$block-second");
 
-  // First tool_call
   await adapter.handleTurnLifecycleEvent!({
     type: "tool_call",
     batchId: "batch-1",
@@ -1161,13 +1175,18 @@ test("Matrix tool block: cleared on finished", async () => {
   });
   await new Promise((r) => setTimeout(r, 10));
 
-  // Finish the turn — clears tool block state
+  // Finish with no response — clears tool block state, redacts thinking placeholder
   await adapter.handleTurnLifecycleEvent!({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
     outcome: "completed",
   });
+
+  expect(client.redactEvent).toHaveBeenCalledWith(
+    MATRIX_LIFECYCLE_SOURCE.chatId,
+    "$thinking-first",
+  );
 
   // Second tool_call in a new turn
   await adapter.handleTurnLifecycleEvent!({
@@ -1178,9 +1197,41 @@ test("Matrix tool block: cleared on finished", async () => {
   });
   await new Promise((r) => setTimeout(r, 10));
 
-  // Second tool_call's sendMessage should have no m.relates_to (fresh block)
-  const secondCreate = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
-  expect(secondCreate[1]["m.relates_to"]).toBeUndefined();
+  // Second turn's thinking placeholder is a new message (no m.relates_to)
+  const secondThinking = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
+  expect(secondThinking[1]["m.relates_to"]).toBeUndefined();
+  expect((secondThinking[1] as Record<string, unknown>).formatted_body as string).toContain("Thinking...");
+  // Second turn's tool block is also a new message
+  const secondTool = client.sendMessage.mock.calls[3] as [string, Record<string, unknown>];
+  expect(secondTool[1]["m.relates_to"]).toBeUndefined();
+});
+
+test("Matrix tool block: no thinking placeholder when showReasoning is false", async () => {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  const adapter = createMatrixAdapter({
+    ...MATRIX_LIFECYCLE_ACCOUNT,
+    showReasoning: false,
+  });
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$tool-block-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Only 1 message (tool block only, no thinking placeholder)
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  expect((content as Record<string, unknown>).body).toContain("bash");
+  expect((content as Record<string, unknown>).formatted_body).toBeUndefined();
+
+  await adapter.stop();
 });
 
 // ── Reasoning display tests ───────────────────────────────────────────────────
