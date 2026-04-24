@@ -170,13 +170,18 @@ export function createMatrixAdapter(
           state.currentInterval * 2,
           MATRIX_STREAM_INTERVAL_MAX_MS,
         );
+        const delay = state.currentInterval;
         if (state.pendingTimer) clearTimeout(state.pendingTimer);
         state.pendingTimer = setTimeout(() => {
           state.pendingTimer = null;
           void editStreamMessage(roomId, state.lastText);
-        }, state.currentInterval);
+        }, delay);
+      } else {
+        console.warn(
+          "[Matrix] Edit message failed (non-rate-limit):",
+          error instanceof Error ? error.message : error,
+        );
       }
-      // other errors: silently drop (streaming edit failures are non-fatal)
     }
   }
 
