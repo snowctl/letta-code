@@ -47,6 +47,7 @@ import {
   getRoutesForChannel,
   loadRoutes,
   removeRouteInMemory,
+  saveRoutes,
   setRouteInMemory,
 } from "./routing";
 import { loadTargetStore, upsertChannelTarget } from "./targets";
@@ -244,6 +245,7 @@ export class ChannelRegistry {
     PendingChannelControlRequest
   >();
   private readonly pendingControlRequestIdByScope = new Map<string, string>();
+  private cancelHandler: ((agentId: string, conversationId: string) => boolean) | null = null;
 
   constructor() {
     if (instance) {
@@ -494,6 +496,26 @@ export class ChannelRegistry {
     handler: ChannelApprovalResponseHandler | null,
   ): void {
     this.approvalResponseHandler = handler;
+  }
+
+  setCancelHandler(fn: (agentId: string, conversationId: string) => boolean): void {
+    this.cancelHandler = fn;
+  }
+
+  cancelActiveRun(agentId: string, conversationId: string): boolean {
+    return this.cancelHandler?.(agentId, conversationId) ?? false;
+  }
+
+  updateRouteConversation(
+    channel: string,
+    chatId: string,
+    accountId: string,
+    conversationId: string,
+  ): void {
+    const route = getRouteFromStore(channel, chatId, accountId);
+    if (!route) return;
+    setRouteInMemory(channel, { ...route, conversationId });
+    saveRoutes(channel);
   }
 
   setEventHandler(
