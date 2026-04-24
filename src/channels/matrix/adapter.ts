@@ -661,7 +661,7 @@ export function createMatrixAdapter(
       if (pendingReasoningMsgId) {
         await waitForPendingPlaceholder(msg.chatId);
         stopReasoningFlush(msg.chatId);
-        void stopTypingInterval(msg.chatId);
+        void stopTypingInterval(msg.chatId); // fire-and-forget: don't block the answer send on typing clearance
         await finalizeReasoningMessage(msg.chatId);
         clearReasoningState(msg.chatId);
         // Fall through to plain send below — answer goes as a separate new message
