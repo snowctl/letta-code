@@ -1391,7 +1391,7 @@ test("tool block: first tool_call sends a new message", async () => {
     string,
   ];
   expect(chatId).toBe("chat-42");
-  expect(text).toBe("🔧 Tools used:\n• read_file");
+  expect(text).toBe("🔧 Tools used:\nread_file");
   await adapter.stop();
 });
 
@@ -1421,7 +1421,7 @@ test("tool block: second tool_call edits the existing message", async () => {
   const [chatId, _msgId, text] = bot.api.editMessageText.mock
     .calls[0]! as unknown as [string, number, string];
   expect(chatId).toBe("chat-42");
-  expect(text).toBe("🔧 Tools used:\n• read_file ×2");
+  expect(text).toBe("🔧 Tools used:\nread_file (x2)");
   await adapter.stop();
 });
 
@@ -1450,7 +1450,7 @@ test("tool block: tool with description grouped correctly", async () => {
 
   const [, _msgId, text] = bot.api.editMessageText.mock
     .calls[0]! as unknown as [string, number, string];
-  expect(text).toBe("🔧 Tools used:\n• bash — Run tests ×2");
+  expect(text).toBe("🔧 Tools used:\nbash — Run tests (x2)");
   await adapter.stop();
 });
 
