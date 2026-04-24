@@ -755,6 +755,7 @@ export function createTelegramAdapter(
       }
 
       if (event.type === "tool_call") {
+        if (event.toolName === "MessageChannel") return;
         for (const source of event.sources) {
           scheduleToolBlockUpdate(source.chatId, event.toolName, event.description);
         }
