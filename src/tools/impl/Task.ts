@@ -53,7 +53,7 @@ interface TaskArgs {
 }
 
 // Valid subagent_types when deploying an existing agent
-const VALID_DEPLOY_TYPES = new Set(["explore", "general-purpose"]);
+const VALID_DEPLOY_TYPES = new Set(["general-purpose"]);
 const BACKGROUND_STARTUP_POLL_MS = 50;
 
 type TaskRunResult = {
@@ -370,6 +370,13 @@ export function spawnBackgroundSubagentTask(
   // Intentionally fire-and-forget: background tasks own their lifecycle and
   // capture failures in task state/transcripts instead of surfacing a promise
   // back to the caller.
+  //
+  // Capture parentAgentId synchronously here (not inside spawnSubagent, which
+  // runs after async yields and can see a drifted in-process context if the
+  // listener is processing another agent's turn). resolvedParentScope.agentId
+  // is the authoritative value — the listener and App.tsx both derive it
+  // from their own closure-captured agentId.
+  const parentAgentIdForSpawn = resolvedParentScope?.agentId;
   spawnSubagentFn(
     subagentType,
     prompt,
@@ -380,6 +387,7 @@ export function spawnBackgroundSubagentTask(
     existingConversationId,
     maxTurns,
     forkedContext,
+    parentAgentIdForSpawn,
   )
     .then(async (result) => {
       bgTask.status = result.success ? "completed" : "failed";
@@ -629,9 +637,9 @@ export async function task(args: TaskArgs): Promise<string> {
     return `Error: Invalid subagent type "${subagent_type}". Available types: ${available}`;
   }
 
-  // For existing agents, only allow explore or general-purpose
+  // For existing agents, only allow general-purpose
   if (isDeployingExisting && !VALID_DEPLOY_TYPES.has(subagent_type)) {
-    return `Error: When deploying an existing agent, subagent_type must be "explore" (read-only) or "general-purpose" (read-write). Got: "${subagent_type}"`;
+    return `Error: When deploying an existing agent, subagent_type must be "general-purpose". Got: "${subagent_type}"`;
   }
 
   // If subagent config requires forked context, fork the parent conversation
@@ -723,6 +731,9 @@ export async function task(args: TaskArgs): Promise<string> {
   writeTaskTranscriptStart(outputFile, description, subagent_type);
 
   try {
+    // See spawnBackgroundSubagentTask for rationale: capture parentAgentId
+    // synchronously here to avoid the async-drift race inside spawnSubagent.
+    const parentAgentIdForSpawn = resolvedParentScope?.agentId;
     const result = await spawnSubagent(
       subagent_type,
       prompt,
@@ -733,6 +744,7 @@ export async function task(args: TaskArgs): Promise<string> {
       effectiveConversationId,
       args.max_turns,
       config.fork,
+      parentAgentIdForSpawn,
     );
 
     // Mark subagent as completed in state store

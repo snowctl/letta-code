@@ -81,7 +81,6 @@ import { SessionStats } from "../agent/stats";
 import {
   DEFAULT_SUMMARIZATION_MODEL,
   INTERRUPTED_BY_USER,
-  MEMFS_CONFLICT_CHECK_INTERVAL,
   SYSTEM_ALERT_CLOSE,
   SYSTEM_ALERT_OPEN,
   SYSTEM_REMINDER_CLOSE,
@@ -96,6 +95,7 @@ import {
   runUserPromptSubmitHooks,
 } from "../hooks";
 import type { ApprovalContext } from "../permissions/analyzer";
+import { formatPermissionDenial } from "../permissions/formatDenial";
 import { type PermissionMode, permissionMode } from "../permissions/mode";
 import { OPENAI_CODEX_PROVIDER_NAME } from "../providers/openai-codex-provider";
 import {
@@ -285,6 +285,7 @@ import {
   toQueuedMsg,
 } from "./helpers/queuedMessageParts";
 import { resolveReasoningTabToggleCommand } from "./helpers/reasoningTabToggle";
+import { isReflectionSubagentActive } from "./helpers/reflectionGate";
 import {
   appendTranscriptDeltaJsonl,
   buildAutoReflectionPayload,
@@ -294,7 +295,6 @@ import {
 } from "./helpers/reflectionTranscript";
 import { safeJsonParseOr } from "./helpers/safeJsonParse";
 import { getDeviceType, getLocalTime } from "./helpers/sessionContext";
-import { buildStartupSystemPromptWarning } from "./helpers/startupSystemPromptWarning";
 import {
   resolvePromptChar,
   resolveStatusLineConfig,
@@ -319,6 +319,7 @@ import {
   getActiveBackgroundAgents,
   getSubagentByToolCallId,
   getSnapshot as getSubagentSnapshot,
+  getSubagents,
   hasActiveSubagents,
   interruptActiveSubagents,
   subscribe as subscribeToSubagents,
@@ -327,6 +328,11 @@ import {
   flushEligibleLinesBeforeReentry,
   shouldClearCompletedSubagentsOnTurnStart,
 } from "./helpers/subagentTurnStart";
+import {
+  buildStartupSystemPromptWarning,
+  estimateSystemTokens,
+  setSystemPromptDoctorState,
+} from "./helpers/systemPromptWarning.ts";
 import {
   appendTaskNotificationEventsToBuffer,
   extractTaskNotificationsForDisplay,
@@ -1073,13 +1079,11 @@ function formatReflectionSettings(settings: ReflectionSettings): string {
 
 const AUTO_REFLECTION_DESCRIPTION = "Reflect on recent conversations";
 
-function hasActiveReflectionSubagent(): boolean {
-  const snapshot = getSubagentSnapshot();
-  return snapshot.agents.some(
-    (agent) =>
-      agent.type.toLowerCase() === "reflection" &&
-      (agent.status === "pending" || agent.status === "running"),
-  );
+function hasActiveReflectionSubagent(
+  agentId: string,
+  conversationId: string,
+): boolean {
+  return isReflectionSubagentActive(getSubagents(), agentId, conversationId);
 }
 
 function buildTextParts(
@@ -1610,7 +1614,6 @@ export default function App({
   const memfsWatcherRef = useRef<ReturnType<
     typeof import("node:fs").watch
   > | null>(null);
-  const memfsGitCheckInFlightRef = useRef(false);
   const pendingGitReminderRef = useRef<{
     dirty: boolean;
     aheadOfRemote: boolean;
@@ -2180,19 +2183,19 @@ export default function App({
       const workingDirectory = getCurrentWorkingDirectory();
       const desiredModel = overrideModel ?? currentModelHandle;
 
-      if (desiredModel) {
-        return prepareToolExecutionContextForResolvedTarget({
-          modelIdentifier: desiredModel,
-          toolsetPreference: currentToolsetPreference,
-          workingDirectory,
-        });
-      }
-
       if (agentIdRef.current) {
         return prepareToolExecutionContextForScope({
           agentId: agentIdRef.current,
           conversationId: conversationIdRef.current,
-          overrideModel,
+          overrideModel: desiredModel,
+          workingDirectory,
+        });
+      }
+
+      if (desiredModel) {
+        return prepareToolExecutionContextForResolvedTarget({
+          modelIdentifier: desiredModel,
+          toolsetPreference: currentToolsetPreference,
           workingDirectory,
         });
       }
@@ -2221,9 +2224,6 @@ export default function App({
 
   // Restored input value - set when we need to restore a message to the input after error
   const [restoredInput, setRestoredInput] = useState<string | null>(null);
-
-  // Track current input draft for approval dialogs
-  const currentDraftRef = useRef<string>("");
 
   // Helper to check if agent is busy (streaming, executing tool, or running command)
   // Uses refs for synchronous access outside React's closure system
@@ -3906,35 +3906,6 @@ export default function App({
     [refreshDerived],
   );
 
-  const maybeCheckMemoryGitStatus = useCallback(async () => {
-    // Only check if memfs is enabled for this agent
-    if (!agentId || agentId === "loading") return;
-    if (!settingsManager.isMemfsEnabled(agentId)) return;
-
-    // Git-backed memory: check status periodically (fire-and-forget).
-    // Runs every N turns to detect uncommitted changes or unpushed commits.
-    const isIntervalTurn =
-      sharedReminderStateRef.current.turnCount > 0 &&
-      sharedReminderStateRef.current.turnCount %
-        MEMFS_CONFLICT_CHECK_INTERVAL ===
-        0;
-
-    if (isIntervalTurn && !memfsGitCheckInFlightRef.current) {
-      memfsGitCheckInFlightRef.current = true;
-
-      import("../agent/memoryGit")
-        .then(({ getMemoryGitStatus }) => getMemoryGitStatus(agentId))
-        .then((status) => {
-          pendingGitReminderRef.current =
-            status.dirty || status.aheadOfRemote ? status : null;
-        })
-        .catch(() => {})
-        .finally(() => {
-          memfsGitCheckInFlightRef.current = false;
-        });
-    }
-  }, [agentId]);
-
   useEffect(() => {
     if (loadingState !== "ready") {
       return;
@@ -5191,8 +5162,6 @@ export default function App({
               queueSnapshotRef.current = [];
             }
 
-            await maybeCheckMemoryGitStatus();
-
             // === RALPH WIGGUM CONTINUATION CHECK ===
             // Check if ralph mode is active and should auto-continue
             // This happens at the very end, right before we'd release input
@@ -5495,13 +5464,7 @@ export default function App({
 
               // Create denial results for auto-denied tools and update buffers
               autoDeniedResults = autoDenied.map((ac) => {
-                // Prefer the detailed reason over the short matchedRule name
-                // (e.g., reason contains plan file path info, matchedRule is just "plan mode")
-                const reason = ac.permission.reason
-                  ? `Permission denied: ${ac.permission.reason}`
-                  : "matchedRule" in ac.permission && ac.permission.matchedRule
-                    ? `Permission denied by rule: ${ac.permission.matchedRule}`
-                    : "Permission denied: Unknown reason";
+                const reason = formatPermissionDenial(ac.permission);
 
                 // Update buffers with tool rejection for UI
                 onChunk(buffersRef.current, {
@@ -6396,7 +6359,6 @@ export default function App({
       queueApprovalResults,
       consumeQueuedMessages,
       appendTaskNotificationEvents,
-      maybeCheckMemoryGitStatus,
       clearApprovalToolContext,
       openTrajectorySegment,
       syncTrajectoryTokenBase,
@@ -7354,8 +7316,9 @@ export default function App({
           memoryPromptMode: willAutoEnableMemfs ? "memfs" : undefined,
         });
 
-        // Enable memfs on Letta Cloud (tags, repo clone, tool detach).
-        await enableMemfsIfCloud(agent.id);
+        // Enable memfs on Letta Cloud (tags, repo clone, tool detach)
+        // without blocking the new-agent UX on the initial clone.
+        void enableMemfsIfCloud(agent.id);
 
         // Update project settings with new agent
         await updateProjectSettings({ lastAgent: agent.id });
@@ -8679,9 +8642,13 @@ export default function App({
               currentConversationId === "default"
                 ? { agent_id: agentId }
                 : undefined;
-            await client.conversations.recompile(
+            const compiledSystemPrompt = await client.conversations.recompile(
               currentConversationId,
               conversationParams,
+            );
+            setSystemPromptDoctorState(
+              agentId,
+              estimateSystemTokens(compiledSystemPrompt),
             );
 
             cmd.finish(
@@ -10358,7 +10325,8 @@ export default function App({
             return { submitted: true };
           }
 
-          if (hasActiveReflectionSubagent()) {
+          const reflectConversationId = conversationIdRef.current ?? "default";
+          if (hasActiveReflectionSubagent(agentId, reflectConversationId)) {
             cmd.fail(
               "A reflection agent is already running in the background.",
             );
@@ -10408,6 +10376,10 @@ export default function App({
               prompt: reflectionPrompt,
               description: "Reflecting on conversation",
               silentCompletion: true,
+              parentScope: {
+                agentId,
+                conversationId: reflectionConversationId,
+              },
               onComplete: async ({
                 success,
                 error,
@@ -10851,7 +10823,9 @@ ${SYSTEM_REMINDER_CLOSE}
         if (!memfsEnabledForAgent) {
           return false;
         }
-        if (hasActiveReflectionSubagent()) {
+        const autoReflectConversationId =
+          conversationIdRef.current ?? "default";
+        if (hasActiveReflectionSubagent(agentId, autoReflectConversationId)) {
           debugLog(
             "memory",
             `Skipping auto reflection launch (${triggerSource}) because one is already active`,
@@ -10903,6 +10877,10 @@ ${SYSTEM_REMINDER_CLOSE}
             prompt: reflectionPrompt,
             description: AUTO_REFLECTION_DESCRIPTION,
             silentCompletion: true,
+            parentScope: {
+              agentId,
+              conversationId: reflectionConversationId,
+            },
             onComplete: async ({
               success,
               error,
@@ -13595,11 +13573,6 @@ ${SYSTEM_REMINDER_CLOSE}
     queueApprovalResults,
   ]);
 
-  const handleConsumeDraft = useCallback(() => {
-    currentDraftRef.current = "";
-    setRestoredInput("");
-  }, []);
-
   const handleQuestionSubmit = useCallback(
     async (answers: Record<string, string>) => {
       const currentIndex = approvalResults.length;
@@ -14217,8 +14190,6 @@ If using apply_patch, use this exact relative patch path: ${applyPatchRelativePa
                                 : undefined
                             }
                             agentName={agentName ?? undefined}
-                            initialDraft={currentDraftRef.current || undefined}
-                            onConsumeDraft={handleConsumeDraft}
                           />
                         ) : ln.kind === "user" ? (
                           <UserMessage line={ln} prompt={statusLine.prompt} />
@@ -14316,8 +14287,6 @@ If using apply_patch, use this exact relative patch path: ${applyPatchRelativePa
                         : undefined
                     }
                     agentName={agentName ?? undefined}
-                    initialDraft={currentDraftRef.current || undefined}
-                    onConsumeDraft={handleConsumeDraft}
                   />
                 </Box>
               )}
@@ -14440,9 +14409,6 @@ If using apply_patch, use this exact relative patch path: ${applyPatchRelativePa
                 onPasteError={handlePasteError}
                 restoredInput={restoredInput}
                 onRestoredInputConsumed={() => setRestoredInput(null)}
-                onDraftChange={(draft) => {
-                  currentDraftRef.current = draft;
-                }}
                 networkPhase={networkPhase}
                 terminalWidth={chromeColumns}
                 shouldAnimate={shouldAnimate}

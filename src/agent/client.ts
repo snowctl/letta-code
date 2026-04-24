@@ -21,6 +21,13 @@ let lastSDKDiagnostic: SDKDiagnostic | null = null;
 // whenever the OAuth refresh obtains a new token. Used as a fallback so
 // transient keychain failures don't crash the process mid-session.
 let _cachedApiKey: string | undefined;
+let _testClientOverride: (() => Promise<unknown>) | null = null;
+
+export function __testOverrideGetClient(
+  factory: (() => Promise<unknown>) | null,
+): void {
+  _testClientOverride = factory;
+}
 
 function safeDiagnosticString(value: unknown): string {
   if (value === null || value === undefined) {
@@ -110,7 +117,30 @@ export function getServerUrl(): string {
   );
 }
 
+/**
+ * Get the current Letta memfs server URL from environment or settings.
+ * Falls back to Letta Cloud when no memfs-specific URL is set.
+ */
+export function getMemfsServerUrl(): string {
+  let settings: Settings | null = null;
+  try {
+    settings = settingsManager.getSettings();
+  } catch {
+    // Settings may be unavailable in isolated tests that only rely on env.
+  }
+
+  return (
+    process.env.LETTA_MEMFS_BASE_URL ||
+    settings?.env?.LETTA_MEMFS_BASE_URL ||
+    LETTA_CLOUD_API_URL
+  );
+}
+
 export async function getClient() {
+  if (_testClientOverride) {
+    return (await _testClientOverride()) as Letta;
+  }
+
   const baseSettings = settingsManager.getSettings();
   const cachedTokens = settingsManager.getCachedSecureTokens();
   const cachedSettings: Settings = {

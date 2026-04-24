@@ -94,8 +94,14 @@ async function maybeResolveDynamicChannelTool(
 function withDynamicMessageChannelCache(registry: ToolRegistry): ToolRegistry {
   const nextRegistry = new Map(registry);
   const existing = nextRegistry.get("MessageChannel");
+
+  // Only update an existing entry — never inject MessageChannel into a registry
+  // that deliberately excluded it (e.g. a conversation with no channel routes).
+  if (!existing) {
+    return nextRegistry;
+  }
+
   if (
-    existing &&
     existing.schema.description !== TOOL_DEFINITIONS.MessageChannel.description
   ) {
     return nextRegistry;
@@ -1136,16 +1142,12 @@ async function resolveBaseToolNamesForModel(
   if (
     !toolFilter.isActive() &&
     modelIdentifier &&
-    isGeminiModel(modelIdentifier)
-  ) {
-    baseToolNames = GEMINI_PASCAL_TOOLS;
-  } else if (
-    !toolFilter.isActive() &&
-    modelIdentifier &&
     isOpenAIModel(modelIdentifier)
   ) {
     baseToolNames = OPENAI_PASCAL_TOOLS;
   } else if (!toolFilter.isActive()) {
+    // Temporary rollback: Gemini models should use the default Claude-style
+    // toolset until we intentionally restore the Gemini-specific toolset.
     baseToolNames = ANTHROPIC_DEFAULT_TOOLS;
   } else {
     baseToolNames = TOOL_NAMES;
