@@ -151,6 +151,19 @@ beforeEach(() => {
       join(channelRoot, "pending-control-requests.json"),
     readChannelConfig: () => null,
   }));
+
+  // Default stubs for operator-command deps — tests override per-test as needed
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({}),
+  }));
+
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => null,
+  }));
+
+  mock.module("../../agent/modify", () => ({
+    recompileAgentSystemPrompt: async () => "ok",
+  }));
 });
 
 afterEach(() => {
@@ -1283,4 +1296,176 @@ test("matrix adapter skips reasoning drawer when showReasoning is false", async 
   expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
 
   await adapter.stop();
+});
+
+// ── Operator command tests ────────────────────────────────────────────────────
+
+test("matrix adapter !cancel replies Cancelled. when run is active", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-1",
+      }),
+      cancelActiveRun: () => true,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1", agent_id: "agent-1" }),
+        fork: async () => ({ id: "cf", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$cancel1",
+    content: { msgtype: "m.text", body: "!cancel" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Cancelled.",
+  );
+  expect(call).toBeDefined();
+  expect(call?.[0]).toBe("!room:example.com");
+});
+
+test("matrix adapter !cancel replies No active run. when no run", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-1",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$cancel2",
+    content: { msgtype: "m.text", body: "!cancel" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "No active run.",
+  );
+  expect(call).toBeDefined();
+});
+
+test("matrix adapter !conv list replies with Conversations: list", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv1",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.startsWith(
+      "Conversations:",
+    ),
+  );
+  expect(call).toBeDefined();
+  const body = (call?.[1] as Record<string, unknown>).body as string;
+  expect(body).toContain("1. default (current)");
+});
+
+test("matrix adapter !compact replies Compaction triggered.", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$compact1",
+    content: { msgtype: "m.text", body: "!compact" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) =>
+      (c[1] as Record<string, unknown>).body === "Compaction triggered.",
+  );
+  expect(call).toBeDefined();
 });

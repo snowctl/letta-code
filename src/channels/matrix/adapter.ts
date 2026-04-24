@@ -1,8 +1,15 @@
 // src/channels/matrix/adapter.ts
 import { join } from "node:path";
 import { marked } from "marked";
+import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
+import { getClient } from "../../agent/client";
 import { getChannelDir } from "../config";
 import { formatChannelControlRequestPrompt } from "../interactive";
+import {
+  handleOperatorCommand,
+  type OperatorCommandContext,
+} from "../operator-commands";
+import { getChannelRegistry } from "../registry";
 import {
   renderToolBlock,
   type ToolCallGroup,
@@ -109,6 +116,9 @@ export function createMatrixAdapter(
 
   let matrixClient: MatrixClientLike | null = null;
   let running = false;
+
+  // Per-adapter conv list cache keyed by chatId
+  const convListCache = new Map<string, Conversation[]>();
 
   // Map from promptMessageEventId → PendingReactionRequest
   const pendingReactionRequests = new Map<string, PendingReactionRequest>();
@@ -522,6 +532,7 @@ export function createMatrixAdapter(
       reasoningFlushIntervalByChatId.clear();
       reasoningMessageIdByChatId.clear();
       reasoningBufferByChatId.clear();
+      convListCache.clear();
 
       await matrixClient?.stop();
       running = false;
@@ -788,13 +799,59 @@ export function createMatrixAdapter(
 
   // ── Internal helpers ──────────────────────────────────────────────────────
 
+  async function dispatchOperatorCommand(
+    command: string,
+    args: string[],
+    chatId: string,
+  ): Promise<string> {
+    const registry = getChannelRegistry();
+    const route = registry?.getRoute("matrix", chatId, accountId);
+    if (!route) return "This chat is not connected to an agent.";
+    const client = await getClient();
+    const opCtx: OperatorCommandContext = {
+      agentId: route.agentId,
+      chatId,
+      commandPrefix: "!",
+      client,
+      getCurrentConvId: () =>
+        getChannelRegistry()
+          ?.getRoute("matrix", chatId, accountId)
+          ?.conversationId ?? "default",
+      setCurrentConvId: async (id) => {
+        getChannelRegistry()?.updateRouteConversation(
+          "matrix",
+          chatId,
+          accountId,
+          id,
+        );
+      },
+      requestCancel: () => {
+        const liveConvId =
+          getChannelRegistry()
+            ?.getRoute("matrix", chatId, accountId)
+            ?.conversationId ?? "default";
+        return registry?.cancelActiveRun(route.agentId, liveConvId) ?? false;
+      },
+      getConvListCache: () => convListCache.get(chatId) ?? null,
+      setConvListCache: (list) => {
+        if (list === null) {
+          convListCache.delete(chatId);
+        } else {
+          convListCache.set(chatId, list);
+        }
+      },
+    };
+    return handleOperatorCommand(command, args, opCtx);
+  }
+
   async function handleBotCommand(
     roomId: string,
     body: string,
     _event: Record<string, unknown>,
   ): Promise<void> {
     const client = await ensureClient();
-    const command = body.split(/\s+/)[0]?.toLowerCase();
+    const parts = body.trim().split(/\s+/);
+    const command = parts[0]?.toLowerCase();
 
     if (command === "!start") {
       await client.sendMessage(roomId, {
@@ -809,6 +866,31 @@ export function createMatrixAdapter(
         msgtype: "m.text",
         body: `Bot: ${userId}\nDM Policy: ${dmPolicy}`,
       });
+      return;
+    }
+
+    if (command === "!cancel") {
+      const reply = await dispatchOperatorCommand("cancel", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!compact") {
+      const reply = await dispatchOperatorCommand("compact", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!recompile") {
+      const reply = await dispatchOperatorCommand("recompile", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!conv") {
+      const args = parts.slice(1).filter(Boolean);
+      const reply = await dispatchOperatorCommand("conv", args, roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
       return;
     }
   }
