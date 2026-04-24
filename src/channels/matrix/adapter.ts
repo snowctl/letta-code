@@ -13,6 +13,7 @@ import type {
   ChannelControlRequestEvent,
   ChannelControlRequestKind,
   ChannelTurnLifecycleEvent,
+  ChannelTurnSource,
   InboundChannelMessage,
   MatrixChannelAccount,
   OutboundChannelMessage,
@@ -37,6 +38,14 @@ import {
 // chain (registry → accounts → config) that conflicts with mock.module() in tests.
 function markdownToMatrixHtml(text: string): string {
   return (marked.parse(text) as string).trimEnd();
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 // ── Control request state ─────────────────────────────────────────────────────
@@ -120,6 +129,14 @@ export function createMatrixAdapter(
   const toolBlockStateByChatId = new Map<string, MatrixToolBlockState>();
   const toolBlockOperationByChatId = new Map<string, Promise<void>>();
 
+  // ── Reasoning display state ───────────────────────────────────────────────
+  const reasoningMessageIdByChatId = new Map<string, string>();
+  const reasoningBufferByChatId = new Map<string, string>();
+  const reasoningFlushIntervalByChatId = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >();
+
   // ── Typing interval helpers ───────────────────────────────────────
 
   function startTypingInterval(chatId: string): void {
@@ -141,6 +158,52 @@ export function createMatrixAdapter(
         await matrixClient.setTyping(chatId, false).catch(() => {});
       }
     }
+  }
+
+  function startReasoningFlush(chatId: string): void {
+    if (reasoningFlushIntervalByChatId.has(chatId)) return;
+    let lastFlushed = "";
+    const interval = setInterval(async () => {
+      const messageId = reasoningMessageIdByChatId.get(chatId);
+      const buffer = reasoningBufferByChatId.get(chatId) ?? "";
+      if (!messageId || buffer === lastFlushed || !matrixClient) return;
+      lastFlushed = buffer;
+      const html = `<details><summary>Thinking...</summary>\n${escapeHtml(buffer)}</details>`;
+      await matrixClient
+        .sendMessage(chatId, {
+          msgtype: "m.text",
+          body: "* Thinking...",
+          format: "org.matrix.custom.html",
+          "m.new_content": {
+            msgtype: "m.text",
+            body: "* Thinking...",
+            format: "org.matrix.custom.html",
+            formatted_body: html,
+          },
+          "m.relates_to": { rel_type: "m.replace", event_id: messageId },
+        })
+        .catch((error) => {
+          console.warn(
+            "[Matrix] Failed to flush reasoning:",
+            error instanceof Error ? error.message : error,
+          );
+        });
+    }, 500);
+    reasoningFlushIntervalByChatId.set(chatId, interval);
+  }
+
+  function stopReasoningFlush(chatId: string): void {
+    const interval = reasoningFlushIntervalByChatId.get(chatId);
+    if (interval !== undefined) {
+      clearInterval(interval);
+      reasoningFlushIntervalByChatId.delete(chatId);
+    }
+  }
+
+  function clearReasoningState(chatId: string): void {
+    stopReasoningFlush(chatId);
+    reasoningMessageIdByChatId.delete(chatId);
+    reasoningBufferByChatId.delete(chatId);
   }
 
   // ── Tool block helper ─────────────────────────────────────────────
@@ -447,6 +510,12 @@ export function createMatrixAdapter(
       typingIntervalByChatId.clear();
       toolBlockStateByChatId.clear();
       toolBlockOperationByChatId.clear();
+      for (const [, timer] of reasoningFlushIntervalByChatId) {
+        clearInterval(timer);
+      }
+      reasoningFlushIntervalByChatId.clear();
+      reasoningMessageIdByChatId.clear();
+      reasoningBufferByChatId.clear();
 
       await matrixClient?.stop();
       running = false;
@@ -497,6 +566,43 @@ export function createMatrixAdapter(
           info: { mimetype: mimeType, size: buffer.byteLength },
         });
         return { messageId: String(eventId) };
+      }
+
+      // Reasoning display — combine drawer + answer into one edited message
+      const pendingReasoningMsgId = reasoningMessageIdByChatId.get(msg.chatId);
+      if (pendingReasoningMsgId) {
+        stopReasoningFlush(msg.chatId);
+        const buffer = reasoningBufferByChatId.get(msg.chatId) ?? "";
+        const answerHtml =
+          msg.parseMode === "HTML"
+            ? markdownToMatrixHtml(msg.text ?? "")
+            : escapeHtml(msg.text ?? "");
+        const html = `<details><summary>Thinking</summary>\n${escapeHtml(buffer)}</details><hr>${answerHtml}`;
+        const plainFallback = `Thinking\n---\n${msg.text ?? ""}`;
+        await client
+          .sendMessage(msg.chatId, {
+            msgtype: "m.text",
+            body: plainFallback,
+            format: "org.matrix.custom.html",
+            "m.new_content": {
+              msgtype: "m.text",
+              body: plainFallback,
+              format: "org.matrix.custom.html",
+              formatted_body: html,
+            },
+            "m.relates_to": {
+              rel_type: "m.replace",
+              event_id: pendingReasoningMsgId,
+            },
+          })
+          .catch((error) => {
+            console.error(
+              "[Matrix] Failed to write final reasoning+answer message:",
+              error instanceof Error ? error.message : error,
+            );
+          });
+        clearReasoningState(msg.chatId);
+        return { messageId: pendingReasoningMsgId };
       }
 
       // Plain text or HTML
@@ -626,6 +732,41 @@ export function createMatrixAdapter(
         if (pending) await pending.catch(() => {});
         toolBlockStateByChatId.delete(source.chatId);
         toolBlockOperationByChatId.delete(source.chatId);
+        clearReasoningState(source.chatId);
+      }
+    },
+
+    async handleStreamReasoning(
+      chunk: string,
+      sources: ChannelTurnSource[],
+    ): Promise<void> {
+      if (account.showReasoning === false) return;
+      const client = await ensureClient();
+
+      for (const source of sources) {
+        const { chatId } = source;
+        reasoningBufferByChatId.set(
+          chatId,
+          (reasoningBufferByChatId.get(chatId) ?? "") + chunk,
+        );
+
+        if (!reasoningMessageIdByChatId.has(chatId)) {
+          try {
+            const eventId = await client.sendMessage(chatId, {
+              msgtype: "m.text",
+              body: "Thinking...",
+              format: "org.matrix.custom.html",
+              formatted_body: "<details><summary>Thinking...</summary></details>",
+            });
+            reasoningMessageIdByChatId.set(chatId, String(eventId));
+            startReasoningFlush(chatId);
+          } catch (error) {
+            console.warn(
+              "[Matrix] Failed to send initial reasoning message:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
       }
     },
 
