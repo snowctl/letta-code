@@ -115,11 +115,15 @@ export async function ensureCrossSigning(
     );
   }
 
-  const status = await machine.crossSigningStatus();
-  if (status.hasMaster && status.hasSelfSigning && status.hasUserSigning) {
-    return "already-bootstrapped";
-  }
-
+  // We always re-run bootstrapCrossSigning(false). When keys already exist
+  // locally it's effectively a read — it returns the upload requests without
+  // regenerating keys. This lets us recover from partial failures: e.g. the
+  // master/SSK/USK uploaded on a prior run but the signatures upload got
+  // rejected (/keys/signatures/upload's per-key-failure path), leaving the
+  // device unsigned server-side. Re-uploading duplicates is cheap: Synapse
+  // short-circuits identical cross-signing keys and no-ops on already-applied
+  // signatures.
+  const statusBefore = await machine.crossSigningStatus();
   const requests = await machine.bootstrapCrossSigning(false);
 
   // CrossSigningBootstrapRequests is undefined at runtime if we're on the
@@ -167,17 +171,45 @@ export async function ensureCrossSigning(
   }
 
   // (c) Upload the self-signing signature over the current device.
+  //
+  // The Rust binding serialises the body as `{"signed_keys": {...}}`, matching
+  // its internal struct. But the Matrix HTTP endpoint expects the inner map
+  // directly — top-level keys must be user IDs. If we POST with the wrapper,
+  // Synapse returns 200 with a per-key failure:
+  //   "Expected UserID string to start with '@'"
+  // …and our signature silently doesn't apply. Unwrap before POSTing.
+  const rawSignaturesBody = JSON.parse(requests.uploadSignaturesReq.body) as {
+    signed_keys?: Record<string, unknown>;
+    [k: string]: unknown;
+  };
+  const unwrappedSignaturesBody = rawSignaturesBody.signed_keys
+    ? rawSignaturesBody.signed_keys
+    : rawSignaturesBody;
+
   const signaturesResp = await postJson(
     homeserverUrl,
     accessToken,
     "/_matrix/client/v3/keys/signatures/upload",
-    requests.uploadSignaturesReq.body,
+    JSON.stringify(unwrappedSignaturesBody),
   );
   if (signaturesResp.status !== 200) {
     throw new Error(
       `[matrix] cross-signing: /keys/signatures/upload returned ${signaturesResp.status}: ${JSON.stringify(signaturesResp.json)}`,
     );
   }
+  // `/keys/signatures/upload` always returns 200; actual per-key failures
+  // come back in a `failures` map. If non-empty, the upload didn't apply.
+  const failures = (signaturesResp.json as { failures?: Record<string, unknown> } | null)
+    ?.failures;
+  if (failures && Object.keys(failures).length > 0) {
+    throw new Error(
+      `[matrix] cross-signing: /keys/signatures/upload partial failure: ${JSON.stringify(failures)}`,
+    );
+  }
 
-  return "bootstrapped";
+  return statusBefore.hasMaster &&
+    statusBefore.hasSelfSigning &&
+    statusBefore.hasUserSigning
+    ? "already-bootstrapped"
+    : "bootstrapped";
 }
