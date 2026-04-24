@@ -182,6 +182,16 @@ export interface ChannelAdapter {
   handleStreamReset?(sources: ChannelTurnSource[]): Promise<void>;
 
   /**
+   * Optional hook called when the agent emits a reasoning chunk during a turn.
+   * Called with each new chunk as it arrives; adapters accumulate their own
+   * buffers. Errors thrown here are caught and logged by the dispatcher.
+   */
+  handleStreamReasoning?(
+    chunk: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void>;
+
+  /**
    * Called by the registry when the adapter receives an inbound message.
    * Set by ChannelRegistry during initialization.
    */
@@ -295,6 +305,8 @@ interface ChannelAccountBase {
   allowedUsers: string[];
   createdAt: string;
   updatedAt: string;
+  /** When false, reasoning display is disabled. Defaults to true. */
+  showReasoning?: boolean;
 }
 
 export interface TelegramChannelConfig {
