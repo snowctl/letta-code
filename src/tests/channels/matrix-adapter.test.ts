@@ -1469,3 +1469,413 @@ test("matrix adapter !compact replies Compaction triggered.", async () => {
   );
   expect(call).toBeDefined();
 });
+
+test("matrix adapter !recompile replies System prompt recompiled.", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$recompile1",
+    content: { msgtype: "m.text", body: "!recompile" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) =>
+      (c[1] as Record<string, unknown>).body === "System prompt recompiled.",
+  );
+  expect(call).toBeDefined();
+  expect(call?.[0]).toBe("!room:example.com");
+});
+
+test("matrix adapter !conv new replies New conversation started and calls updateRouteConversation", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "new-conv-id", agent_id: "agent-1" }),
+        fork: async () => ({ id: "cf", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-new1",
+    content: { msgtype: "m.text", body: "!conv new" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.startsWith(
+      "New conversation started",
+    ),
+  );
+  expect(call).toBeDefined();
+  const body = (call?.[1] as Record<string, unknown>).body as string;
+  expect(body).toContain("new-conv-id");
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv fork replies Conversation forked when not on default", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-existing",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1", agent_id: "agent-1" }),
+        fork: async () => ({ id: "forked-conv-id", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-fork1",
+    content: { msgtype: "m.text", body: "!conv fork" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.startsWith(
+      "Conversation forked",
+    ),
+  );
+  expect(call).toBeDefined();
+  const body = (call?.[1] as Record<string, unknown>).body as string;
+  expect(body).toContain("forked-conv-id");
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv fork refuses default conversation", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-fork-default",
+    content: { msgtype: "m.text", body: "!conv fork" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.includes(
+      "Cannot fork the default",
+    ),
+  );
+  expect(call).toBeDefined();
+});
+
+test("matrix adapter !conv switch 1 always works without cache", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-some",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // No !conv list first — switch 1 (default) always works
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-1",
+    content: { msgtype: "m.text", body: "!conv switch 1" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Switched to: default.",
+  );
+  expect(call).toBeDefined();
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv switch 2 uses cached list", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [
+          { id: "named-conv-1", agent_id: "agent-1", summary: "My Conv" } as unknown as Record<string, unknown>,
+        ],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Populate cache first via !conv list
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-list-for-switch",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  // Now switch to position 2 (the named conv)
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-2",
+    content: { msgtype: "m.text", body: "!conv switch 2" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) =>
+      (c[1] as Record<string, unknown>).body === "Switched to: My Conv.",
+  );
+  expect(call).toBeDefined();
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv delete 2 deletes named conv and replies Deleted.", async () => {
+  const deleteMock = mock(async () => ({}));
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [
+          { id: "named-conv-del", agent_id: "agent-1", summary: "To Delete" } as unknown as Record<string, unknown>,
+        ],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: deleteMock,
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Populate cache first via !conv list
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-list-for-delete",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  // Delete position 2 (the named conv)
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-delete-2",
+    content: { msgtype: "m.text", body: "!conv delete 2" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Deleted.",
+  );
+  expect(call).toBeDefined();
+  expect(deleteMock).toHaveBeenCalled();
+});
+
+test("matrix adapter stop() clears convListCache", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [
+          { id: "conv-cached", agent_id: "agent-1", summary: "Cached" } as unknown as Record<string, unknown>,
+        ],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Populate the cache via !conv list
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-list-cache",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  // Verify cache is populated: switch 2 should work (returns label not "Run conv list first")
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-before-stop",
+    content: { msgtype: "m.text", body: "!conv switch 2" },
+  });
+  const switchBeforeStop = client.sendMessage.mock.calls.find(
+    (c) =>
+      (c[1] as Record<string, unknown>).body === "Switched to: Cached.",
+  );
+  expect(switchBeforeStop).toBeDefined();
+
+  // Stop the adapter — this clears convListCache
+  await adapter.stop();
+
+  // Restart so we can emit messages again
+  await adapter.start();
+  // getFakeClient() returns instances[0] (the first client), but stop+start
+  // creates a new FakeMatrixClient at instances[1]. Grab the newest one.
+  const client2 =
+    FakeMatrixClient.instances[FakeMatrixClient.instances.length - 1]!;
+
+  // After stop+restart, cache is cleared: switch 2 without a prior list should fail
+  await client2.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-after-stop",
+    content: { msgtype: "m.text", body: "!conv switch 2" },
+  });
+  const switchAfterStop = client2.sendMessage.mock.calls.find(
+    (c) =>
+      ((c[1] as Record<string, unknown>).body as string)?.includes(
+        "Run conv list first",
+      ),
+  );
+  expect(switchAfterStop).toBeDefined();
+});
