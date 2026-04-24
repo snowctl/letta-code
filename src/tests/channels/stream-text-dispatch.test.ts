@@ -62,12 +62,34 @@ describe("ChannelRegistry.dispatchStreamText", () => {
     const registry = new ChannelRegistry();
     const adapter = makeMockAdapter();
     (adapter.handleStreamText as ReturnType<typeof mock>).mockImplementation(
-      async () => { throw new Error("API down"); }
+      async () => {
+        throw new Error("API down");
+      },
     );
     registry.registerAdapter(adapter);
 
     await expect(
-      registry.dispatchStreamText("hello", [makeSource("chat-1")])
+      registry.dispatchStreamText("hello", [makeSource("chat-1")]),
     ).resolves.toBeUndefined();
+  });
+
+  test("dispatches to multiple adapters with separate sources", async () => {
+    const registry = new ChannelRegistry();
+    const adapterA = makeMockAdapter("acc-a");
+    const adapterB = makeMockAdapter("acc-b");
+    registry.registerAdapter(adapterA);
+    registry.registerAdapter(adapterB);
+
+    const sourceA = makeSource("chat-a");
+    sourceA.accountId = "acc-a";
+    const sourceB = makeSource("chat-b");
+    sourceB.accountId = "acc-b";
+
+    await registry.dispatchStreamText("hello", [sourceA, sourceB]);
+
+    expect(adapterA.handleStreamText).toHaveBeenCalledTimes(1);
+    expect(adapterA.handleStreamText).toHaveBeenCalledWith("hello", [sourceA]);
+    expect(adapterB.handleStreamText).toHaveBeenCalledTimes(1);
+    expect(adapterB.handleStreamText).toHaveBeenCalledWith("hello", [sourceB]);
   });
 });

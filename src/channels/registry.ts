@@ -383,7 +383,7 @@ export class ChannelRegistry {
       const { handleStreamText } = adapter;
       if (!handleStreamText) continue;
       try {
-        await handleStreamText.call(adapter, text, groupedSources);
+        await handleStreamText(text, groupedSources);
       } catch (error) {
         console.error(
           `[Channels] Failed to dispatch stream text for ${adapter.channelId ?? adapter.id}/${adapter.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID}:`,
