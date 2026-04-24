@@ -16,6 +16,7 @@ import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
   ChannelTurnLifecycleEvent,
+  ChannelTurnSource,
   InboundChannelMessage,
   OutboundChannelMessage,
   TelegramChannelAccount,
@@ -241,6 +242,8 @@ export function createTelegramAdapter(
     string,
     { requestId: string; action: "deny_reason" | "freeform"; buttonKey: string }
   >();
+  const pendingReasoningByChatId = new Map<string, string>();
+  const reasoningByKey = new Map<string, string>();
 
   function startTypingInterval(chatId: string): void {
     if (typingIntervalByChatId.has(chatId) || !bot) return;
@@ -567,7 +570,8 @@ export function createTelegramAdapter(
       type CallbackPayload =
         | { k: string; a: "approve" | "deny" }
         | { k: string; a: "option"; i: number }
-        | { k: string; a: "deny_reason" | "freeform" };
+        | { k: string; a: "deny_reason" | "freeform" }
+        | { k: string; a: "show_reasoning" };
 
       let payload: CallbackPayload;
       try {
@@ -578,6 +582,25 @@ export function createTelegramAdapter(
       }
 
       const { k, a: action } = payload;
+
+      if (action === "show_reasoning") {
+        const reasoning = reasoningByKey.get(k);
+        if (!reasoning) return;
+        const chatId = String(query.message?.chat.id ?? "");
+        const messageId = query.message?.message_id;
+        await instance.api
+          .sendMessage(chatId, reasoning, {
+            ...(messageId ? { reply_parameters: { message_id: messageId } } : {}),
+          })
+          .catch((error) => {
+            console.error(
+              "[Telegram] Failed to send reasoning reply:",
+              error instanceof Error ? error.message : error,
+            );
+          });
+        return;
+      }
+
       const buttonEntry = buttonMessages.get(k);
       if (!buttonEntry) return;
 
@@ -729,6 +752,8 @@ export function createTelegramAdapter(
       bufferedMediaGroups.clear();
       buttonMessages.clear();
       awaitingFeedback.clear();
+      pendingReasoningByChatId.clear();
+      reasoningByKey.clear();
 
       if (!running || !bot) return;
       await bot.stop();
@@ -738,6 +763,19 @@ export function createTelegramAdapter(
 
     isRunning(): boolean {
       return running;
+    },
+
+    async handleStreamReasoning(
+      chunk: string,
+      sources: ChannelTurnSource[],
+    ): Promise<void> {
+      if (config.showReasoning === false) return;
+      for (const source of sources) {
+        pendingReasoningByChatId.set(
+          source.chatId,
+          (pendingReasoningByChatId.get(source.chatId) ?? "") + chunk,
+        );
+      }
     },
 
     async handleTurnLifecycleEvent(
@@ -777,6 +815,7 @@ export function createTelegramAdapter(
         if (pending) await pending.catch(() => {});
         toolBlockStateByChatId.delete(source.chatId);
         toolBlockOperationByChatId.delete(source.chatId);
+        pendingReasoningByChatId.delete(source.chatId);
       }
     },
 
@@ -876,6 +915,23 @@ export function createTelegramAdapter(
       }
       if (msg.parseMode) {
         opts.parse_mode = msg.parseMode;
+      }
+
+      const pendingReasoning = pendingReasoningByChatId.get(msg.chatId);
+      if (pendingReasoning) {
+        const key = (callbackKeyCounter++).toString(36);
+        reasoningByKey.set(key, pendingReasoning);
+        pendingReasoningByChatId.delete(msg.chatId);
+        opts.reply_markup = {
+          inline_keyboard: [
+            [
+              {
+                text: "🧠 Show reasoning",
+                callback_data: JSON.stringify({ k: key, a: "show_reasoning" }),
+              },
+            ],
+          ],
+        };
       }
 
       const result = await telegramBot.api.sendMessage(
