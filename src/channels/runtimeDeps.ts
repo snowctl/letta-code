@@ -150,6 +150,10 @@ async function writeChannelRuntimeManifest(
   ) {
     manifest.trustedDependencies = [...spec.runtimeTrustedDependencies];
   }
+  if (spec.runtimeOverrides && Object.keys(spec.runtimeOverrides).length > 0) {
+    manifest.overrides = { ...spec.runtimeOverrides };
+    manifest.resolutions = { ...spec.runtimeOverrides };
+  }
 
   await writeFile(
     getChannelRuntimePackagePath(channelId),

@@ -19,6 +19,14 @@ export interface ChannelPluginMetadata {
    * (e.g. `@matrix-org/matrix-sdk-crypto-nodejs`'s `download-lib.js`).
    */
   runtimeTrustedDependencies?: readonly string[];
+  /**
+   * Version pins to force onto transitive dependencies. Written into the
+   * runtime manifest as `overrides` (respected by bun, npm, and pnpm). Used
+   * when we need a newer binding than a SDK declares — e.g. matrix-bot-sdk
+   * 0.8.0 declares ^0.4.0 for matrix-sdk-crypto-nodejs but we need 0.5.x for
+   * cross-signing bootstrap to return upload requests.
+   */
+  runtimeOverrides?: Readonly<Record<string, string>>;
 }
 
 export type ChannelMessageActionName = "send" | "react" | "upload-file";

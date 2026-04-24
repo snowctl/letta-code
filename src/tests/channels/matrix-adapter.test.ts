@@ -29,7 +29,7 @@ class FakeMatrixClient {
   sendMessage = mock(
     async (_roomId: string, _content: unknown) => "$fake-event-id",
   );
-  sendTyping = mock(
+  setTyping = mock(
     async (_roomId: string, _isTyping: boolean, _timeout?: number) => {},
   );
   sendEvent = mock(
@@ -127,7 +127,9 @@ beforeEach(() => {
       RustSdkCryptoStorageProvider: FakeRustSdkCryptoStorageProvider,
       RustSdkCryptoStoreType: { Sled: "sled" },
     }),
+    loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
     ensureMatrixRuntimeInstalled: async () => true,
+    ensureMatrixCryptoUpToDate: async () => false,
   }));
 
   // Include all config.ts exports so transitive imports (accounts.ts etc.)
@@ -942,7 +944,9 @@ test("adapter starts without E2EE when crypto addon throws", async () => {
       },
       RustSdkCryptoStoreType: { Sled: "sled" },
     }),
+    loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
     ensureMatrixRuntimeInstalled: async () => true,
+    ensureMatrixCryptoUpToDate: async () => false,
   }));
 
   const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
@@ -993,7 +997,7 @@ function getLifecycleFakeClient(): FakeMatrixClient {
   return client;
 }
 
-test("Matrix typing indicator: sendTyping(true) called on queued event", async () => {
+test("Matrix typing indicator: setTyping(true) called on queued event", async () => {
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
@@ -1003,14 +1007,14 @@ test("Matrix typing indicator: sendTyping(true) called on queued event", async (
     source: MATRIX_LIFECYCLE_SOURCE,
   });
 
-  expect(client.sendTyping).toHaveBeenCalledWith(
+  expect(client.setTyping).toHaveBeenCalledWith(
     MATRIX_LIFECYCLE_SOURCE.chatId,
     true,
     8000,
   );
 });
 
-test("Matrix typing indicator: sendTyping(false) called on finished event", async () => {
+test("Matrix typing indicator: setTyping(false) called on finished event", async () => {
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
@@ -1027,7 +1031,7 @@ test("Matrix typing indicator: sendTyping(false) called on finished event", asyn
     outcome: "completed",
   });
 
-  expect(client.sendTyping).toHaveBeenCalledWith(
+  expect(client.setTyping).toHaveBeenCalledWith(
     MATRIX_LIFECYCLE_SOURCE.chatId,
     false,
   );

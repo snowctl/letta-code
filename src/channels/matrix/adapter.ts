@@ -5,8 +5,8 @@ import { getChannelDir } from "../config";
 import { formatChannelControlRequestPrompt } from "../interactive";
 import {
   renderToolBlock,
-  upsertToolCallGroup,
   type ToolCallGroup,
+  upsertToolCallGroup,
 } from "../tool-block";
 import type {
   ChannelAdapter,
@@ -17,6 +17,7 @@ import type {
   MatrixChannelAccount,
   OutboundChannelMessage,
 } from "../types";
+import { ensureCrossSigning } from "./crossSigning";
 import {
   collectMatrixMediaCandidate,
   downloadMatrixAttachment,
@@ -24,7 +25,11 @@ import {
   kindToMatrixMsgtype,
   MATRIX_DEFAULT_MAX_DOWNLOAD_BYTES,
 } from "./media";
-import { loadMatrixBotSdkModule, loadMatrixCryptoModule } from "./runtime";
+import {
+  ensureMatrixCryptoUpToDate,
+  loadMatrixBotSdkModule,
+  loadMatrixCryptoModule,
+} from "./runtime";
 
 // ── Markdown helper ───────────────────────────────────────────────────────────
 
@@ -74,7 +79,7 @@ interface MatrixClientLike {
   mxcToHttp(mxc: string): string;
   getUserProfile(userId: string): Promise<{ displayname?: string }>;
   getJoinedRoomMembers(roomId: string): Promise<string[]>;
-  sendTyping(roomId: string, isTyping: boolean, timeout?: number): Promise<void>;
+  setTyping(roomId: string, isTyping: boolean, timeout?: number): Promise<void>;
 }
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
@@ -102,7 +107,10 @@ export function createMatrixAdapter(
   const awaitingFreeformByChat = new Map<string, string>();
 
   // ── Typing indicator state ────────────────────────────────────────
-  const typingIntervalByChatId = new Map<string, ReturnType<typeof setInterval>>();
+  const typingIntervalByChatId = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >();
 
   // ── Tool block state ─────────────────────────────────────────────
   interface MatrixToolBlockState {
@@ -118,7 +126,7 @@ export function createMatrixAdapter(
     if (typingIntervalByChatId.has(chatId) || !matrixClient) return;
     const fire = () => {
       if (!matrixClient) return;
-      void matrixClient.sendTyping(chatId, true, 8000).catch(() => {});
+      void matrixClient.setTyping(chatId, true, 8000).catch(() => {});
     };
     fire();
     typingIntervalByChatId.set(chatId, setInterval(fire, 4000));
@@ -130,21 +138,30 @@ export function createMatrixAdapter(
       clearInterval(timer);
       typingIntervalByChatId.delete(chatId);
       if (matrixClient) {
-        await matrixClient.sendTyping(chatId, false).catch(() => {});
+        await matrixClient.setTyping(chatId, false).catch(() => {});
       }
     }
   }
 
   // ── Tool block helper ─────────────────────────────────────────────
 
-  function scheduleToolBlockUpdate(chatId: string, toolName: string, description?: string): void {
-    const previous = toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
+  function scheduleToolBlockUpdate(
+    chatId: string,
+    toolName: string,
+    description?: string,
+  ): void {
+    const previous =
+      toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
     const operation = previous
       .catch(() => {})
       .then(async () => {
         if (!matrixClient) return;
         const state = toolBlockStateByChatId.get(chatId);
-        const newGroups = upsertToolCallGroup(state?.groups ?? [], toolName, description);
+        const newGroups = upsertToolCallGroup(
+          state?.groups ?? [],
+          toolName,
+          description,
+        );
         const text = renderToolBlock(newGroups);
 
         if (!state) {
@@ -153,7 +170,10 @@ export function createMatrixAdapter(
             msgtype: "m.text",
             body: text,
           });
-          toolBlockStateByChatId.set(chatId, { messageId: String(eventId), groups: newGroups });
+          toolBlockStateByChatId.set(chatId, {
+            messageId: String(eventId),
+            groups: newGroups,
+          });
         } else {
           // Edit via m.relates_to / m.replace
           await matrixClient.sendMessage(chatId, {
@@ -165,7 +185,10 @@ export function createMatrixAdapter(
               event_id: state.messageId,
             },
           });
-          toolBlockStateByChatId.set(chatId, { messageId: state.messageId, groups: newGroups });
+          toolBlockStateByChatId.set(chatId, {
+            messageId: state.messageId,
+            groups: newGroups,
+          });
         }
       })
       .catch((error) => {
@@ -183,6 +206,10 @@ export function createMatrixAdapter(
   }
 
   async function createClient(): Promise<MatrixClientLike> {
+    // If the installed crypto-nodejs predates 0.5.0, it can't expose the
+    // cross-signing upload requests. Upgrade before loading the SDK.
+    await ensureMatrixCryptoUpToDate();
+
     const {
       MatrixClient,
       SimpleFsStorageProvider,
@@ -219,7 +246,10 @@ export function createMatrixAdapter(
           );
         }
 
-        cryptoProvider = new RustSdkCryptoStorageProvider(cryptoPath, storeValue);
+        cryptoProvider = new RustSdkCryptoStorageProvider(
+          cryptoPath,
+          storeValue,
+        );
       } catch (err) {
         console.warn(
           "[matrix] E2EE unavailable (Rust crypto addon failed to load); running unencrypted:",
@@ -379,6 +409,30 @@ export function createMatrixAdapter(
       });
 
       await client.start();
+
+      // Ensure the bot's own device is cross-signed by its owner's SSK so
+      // Element X doesn't show "Encrypted by a device not verified by its
+      // owner" on every bot message. Idempotent; no-op after first success.
+      if (e2ee) {
+        try {
+          const outcome = await ensureCrossSigning(
+            client as unknown as Parameters<typeof ensureCrossSigning>[0],
+            homeserverUrl,
+            accessToken,
+          );
+          if (outcome === "bootstrapped") {
+            console.log(
+              `[matrix] cross-signing bootstrapped for ${userId} — Element X should now show verified shield`,
+            );
+          }
+        } catch (err) {
+          console.warn(
+            `[matrix] cross-signing bootstrap failed for ${userId} (continuing; will retry on next start):`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
       running = true;
     },
 
@@ -387,7 +441,7 @@ export function createMatrixAdapter(
       for (const [chatId, timer] of typingIntervalByChatId) {
         clearInterval(timer);
         if (matrixClient) {
-          await matrixClient.sendTyping(chatId, false).catch(() => {});
+          await matrixClient.setTyping(chatId, false).catch(() => {});
         }
       }
       typingIntervalByChatId.clear();
@@ -535,7 +589,9 @@ export function createMatrixAdapter(
       });
     },
 
-    async handleTurnLifecycleEvent(event: ChannelTurnLifecycleEvent): Promise<void> {
+    async handleTurnLifecycleEvent(
+      event: ChannelTurnLifecycleEvent,
+    ): Promise<void> {
       if (!running) return;
 
       if (event.type === "queued") {
@@ -553,7 +609,11 @@ export function createMatrixAdapter(
       if (event.type === "tool_call") {
         if (event.toolName === "MessageChannel") return;
         for (const source of event.sources) {
-          scheduleToolBlockUpdate(source.chatId, event.toolName, event.description);
+          scheduleToolBlockUpdate(
+            source.chatId,
+            event.toolName,
+            event.description,
+          );
         }
         return;
       }

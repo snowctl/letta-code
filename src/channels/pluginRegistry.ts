@@ -51,9 +51,20 @@ const CHANNEL_PLUGIN_REGISTRATIONS: Record<
     metadata: {
       id: "matrix",
       displayName: "Matrix",
-      runtimePackages: ["matrix-bot-sdk@0.8.0"],
+      runtimePackages: [
+        "matrix-bot-sdk@0.8.0",
+        "@matrix-org/matrix-sdk-crypto-nodejs@0.5.1",
+      ],
       runtimeModules: ["matrix-bot-sdk"],
       runtimeTrustedDependencies: ["@matrix-org/matrix-sdk-crypto-nodejs"],
+      // matrix-bot-sdk@0.8.0 declares ^0.4.0 for crypto-nodejs but 0.5.x is
+      // required for `OlmMachine.bootstrapCrossSigning` to return the upload
+      // requests (the 0.4.0 binding drops the return value). Tested
+      // compatible: same RequestType enum, same OlmMachine.initialize
+      // signature, same CryptoClient surface.
+      runtimeOverrides: {
+        "@matrix-org/matrix-sdk-crypto-nodejs": "0.5.1",
+      },
     },
     load: async () => {
       const { matrixChannelPlugin } = await import("./matrix/plugin");
