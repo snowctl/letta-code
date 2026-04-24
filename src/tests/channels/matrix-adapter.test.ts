@@ -1394,6 +1394,41 @@ test("matrix adapter: thinking placeholder deleted when response arrives with em
   await adapter.stop();
 });
 
+test("matrix adapter: thinking placeholder redacted when turn ends without response", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$thinking-1");
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // Reasoning arrives — thinking message sent
+  await adapter.handleStreamReasoning!("Reasoning about this...", [source]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  // Turn ends WITHOUT adapter.sendMessage being called
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  // Thinking message must be redacted
+  expect(client.redactEvent).toHaveBeenCalledWith("!room1:example.com", "$thinking-1");
+  expect(client.redactEvent).toHaveBeenCalledTimes(1);
+  // No response message sent
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  await adapter.stop();
+});
+
 // ── Operator command tests ────────────────────────────────────────────────────
 
 test("matrix adapter !cancel replies Cancelled. when run is active", async () => {
