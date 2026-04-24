@@ -5,8 +5,8 @@
  */
 
 import type { ReactionType, ReactionTypeEmoji } from "@grammyjs/types";
-import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
+import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
 import { getClient } from "../../agent/client";
 import { formatChannelControlRequestPrompt } from "../interactive";
 import {
@@ -357,8 +357,12 @@ export function createTelegramAdapter(
           id,
         );
       },
-      requestCancel: () =>
-        registry?.cancelActiveRun(route.agentId, route.conversationId) ?? false,
+      requestCancel: () => {
+        const liveConvId =
+          getChannelRegistry()?.getRoute("telegram", chatId, config.accountId)
+            ?.conversationId ?? "default";
+        return registry?.cancelActiveRun(route.agentId, liveConvId) ?? false;
+      },
       getConvListCache: () => convListCache.get(chatId) ?? null,
       setConvListCache: (list) => {
         if (list === null) {
@@ -816,6 +820,7 @@ export function createTelegramAdapter(
       typingIntervalByChatId.clear();
       toolBlockStateByChatId.clear();
       toolBlockOperationByChatId.clear();
+      convListCache.clear();
 
       for (const entry of bufferedMediaGroups.values()) {
         clearTimeout(entry.timer);
