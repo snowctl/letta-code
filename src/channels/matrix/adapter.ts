@@ -578,6 +578,9 @@ export function createMatrixAdapter(
       const pendingReasoningMsgId = reasoningMessageIdByChatId.get(msg.chatId);
       if (pendingReasoningMsgId) {
         stopReasoningFlush(msg.chatId);
+        // m.replace edits don't automatically clear the typing indicator on the
+        // Matrix server (unlike new messages), so we stop it explicitly here.
+        void stopTypingInterval(msg.chatId);
         const buffer = reasoningBufferByChatId.get(msg.chatId) ?? "";
         const answerHtml =
           msg.parseMode === "HTML"
