@@ -269,6 +269,29 @@ describe("handleOperatorCommand — cache invalidation", () => {
   });
 });
 
+describe("handleOperatorCommand — help", () => {
+  test("returns all command names with commandPrefix", async () => {
+    const ctx = makeCtx({ commandPrefix: "!" });
+    const result = await handleOperatorCommand("help", [], ctx);
+    expect(result).toContain("!cancel");
+    expect(result).toContain("!compact");
+    expect(result).toContain("!recompile");
+    expect(result).toContain("!conv list");
+    expect(result).toContain("!conv new");
+    expect(result).toContain("!conv fork");
+    expect(result).toContain("!conv switch <n>");
+    expect(result).toContain("!conv delete <n>");
+    expect(result).toContain("!help");
+  });
+
+  test("uses the platform commandPrefix", async () => {
+    const ctx = makeCtx({ commandPrefix: "/" });
+    const result = await handleOperatorCommand("help", [], ctx);
+    expect(result).toContain("/cancel");
+    expect(result).not.toContain("!cancel");
+  });
+});
+
 describe("handleOperatorCommand — error handling", () => {
   test("wraps errors with command prefix", async () => {
     const ctx = makeCtx({

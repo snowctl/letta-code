@@ -1879,3 +1879,26 @@ test("matrix adapter stop() clears convListCache", async () => {
   );
   expect(switchAfterStop).toBeDefined();
 });
+
+test("matrix adapter !help replies with all command names", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$help1",
+    content: { msgtype: "m.text", body: "!help" },
+  });
+
+  const helpCall = client.sendMessage.mock.calls.find(
+    (c) =>
+      ((c[1] as Record<string, unknown>).body as string)?.includes("!cancel"),
+  );
+  expect(helpCall).toBeDefined();
+  const body = (helpCall![1] as Record<string, unknown>).body as string;
+  expect(body).toContain("!compact");
+  expect(body).toContain("!conv list");
+  expect(body).toContain("!help");
+});

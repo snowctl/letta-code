@@ -34,12 +34,29 @@ export async function handleOperatorCommand(
         return await handleRecompile(ctx, deps);
       case "conv":
         return await handleConv(args, ctx);
+      case "help":
+        return handleHelp(ctx);
       default:
         return `Unknown command: ${command}`;
     }
   } catch (err) {
     return `${command} failed: ${err instanceof Error ? err.message : String(err)}`;
   }
+}
+
+function handleHelp(ctx: OperatorCommandContext): string {
+  const p = ctx.commandPrefix;
+  return [
+    `${p}cancel — cancel the active run`,
+    `${p}compact — force memory compaction`,
+    `${p}recompile — recompile system prompt`,
+    `${p}conv list — list conversations`,
+    `${p}conv new — start a new conversation`,
+    `${p}conv fork — fork the current conversation`,
+    `${p}conv switch <n> — switch to conversation <n>`,
+    `${p}conv delete <n> — delete conversation <n>`,
+    `${p}help — show this message`,
+  ].join("\n");
 }
 
 function handleCancel(ctx: OperatorCommandContext): string {

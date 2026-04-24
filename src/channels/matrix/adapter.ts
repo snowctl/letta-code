@@ -1,6 +1,7 @@
 // src/channels/matrix/adapter.ts
 import { join } from "node:path";
 import { marked } from "marked";
+import type { Letta } from "@letta-ai/letta-client";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import { getClient } from "../../agent/client";
 import { getChannelDir } from "../config";
@@ -804,6 +805,19 @@ export function createMatrixAdapter(
     args: string[],
     chatId: string,
   ): Promise<string> {
+    if (command === "help") {
+      return handleOperatorCommand("help", [], {
+        commandPrefix: "!",
+        agentId: "",
+        chatId,
+        client: {} as Letta,
+        getCurrentConvId: () => "default",
+        setCurrentConvId: async () => {},
+        requestCancel: () => false,
+        getConvListCache: () => null,
+        setConvListCache: () => {},
+      });
+    }
     const registry = getChannelRegistry();
     const route = registry?.getRoute("matrix", chatId, accountId);
     if (!route) return "This chat is not connected to an agent.";
@@ -890,6 +904,12 @@ export function createMatrixAdapter(
     if (command === "!conv") {
       const args = parts.slice(1).filter(Boolean);
       const reply = await dispatchOperatorCommand("conv", args, roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!help") {
+      const reply = await dispatchOperatorCommand("help", [], roomId);
       await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
       return;
     }

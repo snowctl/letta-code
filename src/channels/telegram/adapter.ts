@@ -5,6 +5,7 @@
  */
 
 import type { ReactionType, ReactionTypeEmoji } from "@grammyjs/types";
+import type { Letta } from "@letta-ai/letta-client";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
 import { getClient } from "../../agent/client";
@@ -337,6 +338,19 @@ export function createTelegramAdapter(
     args: string[],
     chatId: string,
   ): Promise<string> {
+    if (command === "help") {
+      return handleOperatorCommand("help", [], {
+        commandPrefix: "/",
+        agentId: "",
+        chatId,
+        client: {} as Letta,
+        getCurrentConvId: () => "default",
+        setCurrentConvId: async () => {},
+        requestCancel: () => false,
+        getConvListCache: () => null,
+        setConvListCache: () => {},
+      });
+    }
     const registry = getChannelRegistry();
     const route = registry?.getRoute("telegram", chatId, config.accountId);
     if (!route) return "This chat is not connected to an agent.";
@@ -763,6 +777,11 @@ export function createTelegramAdapter(
       const chatId = String(ctx.chat.id);
       const args = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
       await ctx.reply(await dispatchOperatorCommand("conv", args, chatId));
+    });
+
+    instance.command("help", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("help", [], chatId));
     });
 
     bot = instance;
