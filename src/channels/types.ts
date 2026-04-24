@@ -156,6 +156,18 @@ export interface ChannelAdapter {
   handleControlRequestEvent?(event: ChannelControlRequestEvent): Promise<void>;
 
   /**
+   * Optional hook for streaming text updates during a turn.
+   * Called with the full accumulated response text and the turn sources
+   * as each new text chunk arrives from the agent. The caller throttles
+   * dispatch; adapters should not assume a minimum interval between calls.
+   * Errors thrown here are caught and logged by the dispatcher.
+   */
+  handleStreamText?(
+    accumulatedText: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void>;
+
+  /**
    * Called by the registry when the adapter receives an inbound message.
    * Set by ChannelRegistry during initialization.
    */
