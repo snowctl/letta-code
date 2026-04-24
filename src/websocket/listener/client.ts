@@ -3292,6 +3292,20 @@ async function wireChannelIngress(
     }),
   );
 
+  registry.setCancelHandler((agentId: string, conversationId: string) => {
+    const runtimeKey = `${agentId}:${conversationId}`;
+    const scopedRuntime = listener.conversationRuntimes.get(runtimeKey);
+    if (!scopedRuntime?.isProcessing) return false;
+    scopedRuntime.cancelRequested = true;
+    if (
+      scopedRuntime.activeAbortController &&
+      !scopedRuntime.activeAbortController.signal.aborted
+    ) {
+      scopedRuntime.activeAbortController.abort();
+    }
+    return true;
+  });
+
   registry.setReady();
 }
 
