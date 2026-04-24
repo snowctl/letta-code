@@ -1237,10 +1237,13 @@ test("Matrix tool block: no thinking placeholder when showReasoning is false", a
 
 // ── Reasoning display tests ───────────────────────────────────────────────────
 
-test("matrix adapter sends reasoning drawer and combines with answer in single message", async () => {
+test("matrix adapter: reasoning + response redacts thinking and sends new message with drawer", async () => {
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$response-1");
 
   const source = {
     channel: "matrix" as const,
@@ -1250,19 +1253,14 @@ test("matrix adapter sends reasoning drawer and combines with answer in single m
     conversationId: "conv1",
   };
 
-  // First reasoning chunk — adapter sends initial "Thinking..." message
+  // First chunk — adapter sends initial thinking message
   await adapter.handleStreamReasoning!("I need to search for this.", [source]);
-
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const [, initialContent] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
-  const ic = initialContent as Record<string, unknown>;
-  expect(ic.formatted_body as string).toContain("<details><summary>Thinking...</summary>");
 
   // Second chunk (accumulates in buffer)
   await adapter.handleStreamReasoning!(" Found 3 results.", [source]);
 
-  // Answer arrives — should edit the reasoning message (m.replace), not send a new one
-  const callsBefore = client.sendMessage.mock.calls.length;
+  // Answer arrives — redact thinking, send new message with drawer on top
   const result = await adapter.sendMessage({
     channel: "matrix",
     accountId: "acc1",
@@ -1271,27 +1269,26 @@ test("matrix adapter sends reasoning drawer and combines with answer in single m
     parseMode: "HTML",
   });
 
-  // Exactly one new sendMessage call should have happened (the final m.replace edit)
-  expect(client.sendMessage.mock.calls.length).toBe(callsBefore + 1);
-  const [, finalContent] = client.sendMessage.mock.calls[callsBefore] as [string, Record<string, unknown>];
+  // Thinking message redacted
+  expect(client.redactEvent).toHaveBeenCalledWith("!room1:example.com", "$thinking-1");
+
+  // One new sendMessage call for the response
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  const [, finalContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
   const fc = finalContent as Record<string, unknown>;
 
-  // Must be an m.replace edit targeting the original message
-  expect(fc["m.relates_to"]).toMatchObject({
-    rel_type: "m.replace",
-    event_id: "$fake-event-id",
-  });
+  // Must NOT be an m.replace edit — it's a brand-new message
+  expect(fc["m.relates_to"]).toBeUndefined();
 
-  const newContent = fc["m.new_content"] as Record<string, unknown>;
-  const html = newContent.formatted_body as string;
+  const html = fc.formatted_body as string;
   expect(html).toContain("<details><summary>Thinking</summary>");
-  expect(html).not.toContain("Thinking...");
   expect(html).toContain("<hr>");
   expect(html).toContain("Here are the results.");
   expect(html).toContain("I need to search for this.");
+  expect(html).toContain("Found 3 results.");
 
-  // Return value should be the original reasoning message ID
-  expect(result.messageId).toBe("$fake-event-id");
+  // Return value is the new response message's ID
+  expect(result.messageId).toBe("$response-1");
 
   await adapter.stop();
 });
@@ -1310,8 +1307,8 @@ test("matrix adapter sends message normally when no reasoning was received", asy
 
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
   const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
-  // No m.relates_to means it's a normal new message, not an edit
   expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+  expect(client.redactEvent).not.toHaveBeenCalled();
 
   await adapter.stop();
 });
@@ -1335,7 +1332,6 @@ test("matrix adapter skips reasoning drawer when showReasoning is false", async 
   // No "Thinking..." message sent
   expect(client.sendMessage).not.toHaveBeenCalled();
 
-  // Answer arrives as a normal message (no m.replace)
   await adapter.sendMessage({
     channel: "matrix",
     accountId: "acc1",
@@ -1346,6 +1342,54 @@ test("matrix adapter skips reasoning drawer when showReasoning is false", async 
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
   const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
   expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+  expect(client.redactEvent).not.toHaveBeenCalled();
+
+  await adapter.stop();
+});
+
+test("matrix adapter: thinking placeholder deleted when response arrives with empty reasoning buffer", async () => {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  const adapter = createMatrixAdapter(TEST_ACCOUNT);
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-placeholder") // from tool call path
+    .mockResolvedValueOnce("$tool-block-1")
+    .mockResolvedValueOnce("$plain-response");       // plain response (no drawer)
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // Tool call arrives — sends thinking placeholder then tool block
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "b1",
+    toolName: "bash",
+    sources: [source],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Response arrives with no reasoning content
+  const result = await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Done.",
+  });
+
+  // Thinking placeholder must be redacted
+  expect(client.redactEvent).toHaveBeenCalledWith("!room1:example.com", "$thinking-placeholder");
+
+  // Response is plain (no thinking drawer)
+  const [, responseContent] = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
+  expect((responseContent as Record<string, unknown>).formatted_body).toBeUndefined();
+  expect((responseContent as Record<string, unknown>).body).toBe("Done.");
+  expect(result.messageId).toBe("$plain-response");
 
   await adapter.stop();
 });
