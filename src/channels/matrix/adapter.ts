@@ -163,11 +163,14 @@ export function createMatrixAdapter(
   function startReasoningFlush(chatId: string): void {
     if (reasoningFlushIntervalByChatId.has(chatId)) return;
     let lastFlushed = "";
+    let flushInProgress = false;
     const interval = setInterval(async () => {
+      if (flushInProgress) return;
       const messageId = reasoningMessageIdByChatId.get(chatId);
       const buffer = reasoningBufferByChatId.get(chatId) ?? "";
-      if (!messageId || buffer === lastFlushed || !matrixClient) return;
+      if (!messageId || messageId === "__pending__" || buffer === lastFlushed || !matrixClient) return;
       lastFlushed = buffer;
+      flushInProgress = true;
       const html = `<details><summary>Thinking...</summary>\n${escapeHtml(buffer)}</details>`;
       await matrixClient
         .sendMessage(chatId, {
@@ -187,6 +190,9 @@ export function createMatrixAdapter(
             "[Matrix] Failed to flush reasoning:",
             error instanceof Error ? error.message : error,
           );
+        })
+        .finally(() => {
+          flushInProgress = false;
         });
     }, 500);
     reasoningFlushIntervalByChatId.set(chatId, interval);
@@ -579,8 +585,8 @@ export function createMatrixAdapter(
             : escapeHtml(msg.text ?? "");
         const html = `<details><summary>Thinking</summary>\n${escapeHtml(buffer)}</details><hr>${answerHtml}`;
         const plainFallback = `Thinking\n---\n${msg.text ?? ""}`;
-        await client
-          .sendMessage(msg.chatId, {
+        try {
+          await client.sendMessage(msg.chatId, {
             msgtype: "m.text",
             body: plainFallback,
             format: "org.matrix.custom.html",
@@ -594,15 +600,17 @@ export function createMatrixAdapter(
               rel_type: "m.replace",
               event_id: pendingReasoningMsgId,
             },
-          })
-          .catch((error) => {
-            console.error(
-              "[Matrix] Failed to write final reasoning+answer message:",
-              error instanceof Error ? error.message : error,
-            );
           });
-        clearReasoningState(msg.chatId);
-        return { messageId: pendingReasoningMsgId };
+          clearReasoningState(msg.chatId);
+          return { messageId: pendingReasoningMsgId };
+        } catch (error) {
+          console.error(
+            "[Matrix] Failed to write final reasoning+answer message, falling back to plain send:",
+            error instanceof Error ? error.message : error,
+          );
+          clearReasoningState(msg.chatId);
+          // fall through to normal sendMessage below
+        }
       }
 
       // Plain text or HTML
@@ -751,6 +759,7 @@ export function createMatrixAdapter(
         );
 
         if (!reasoningMessageIdByChatId.has(chatId)) {
+          reasoningMessageIdByChatId.set(chatId, "__pending__"); // claim the slot immediately
           try {
             const eventId = await client.sendMessage(chatId, {
               msgtype: "m.text",
@@ -761,6 +770,7 @@ export function createMatrixAdapter(
             reasoningMessageIdByChatId.set(chatId, String(eventId));
             startReasoningFlush(chatId);
           } catch (error) {
+            reasoningMessageIdByChatId.delete(chatId); // allow retry on error
             console.warn(
               "[Matrix] Failed to send initial reasoning message:",
               error instanceof Error ? error.message : error,
