@@ -163,6 +163,15 @@ export interface ChannelAdapter {
   handleControlRequestEvent?(event: ChannelControlRequestEvent): Promise<void>;
 
   /**
+   * Optional hook for streaming text updates during a turn.
+   * Called with accumulated text so far and the turn sources.
+   */
+  onStreamText?(
+    accumulatedText: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void>;
+
+  /**
    * Called by the registry when the adapter receives an inbound message.
    * Set by ChannelRegistry during initialization.
    */
