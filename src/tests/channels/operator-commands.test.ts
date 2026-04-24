@@ -18,6 +18,7 @@ function makeCtx(
         messages: {
           compact: mock(async () => ({ status: "ok" })),
         },
+        recompile: mock(async () => "ok"),
       },
       conversations: {
         list: mock(async () => []),
@@ -76,7 +77,7 @@ describe("handleOperatorCommand — compact", () => {
 });
 
 describe("handleOperatorCommand — recompile", () => {
-  test("calls recompile and returns success message", async () => {
+  test("calls recompile dep for named conversation", async () => {
     const recompileMock = mock(async () => "ok");
     const ctx = makeCtx({ getCurrentConvId: () => "conv-abc" });
     const result = await handleOperatorCommand("recompile", [], ctx, {
@@ -84,6 +85,13 @@ describe("handleOperatorCommand — recompile", () => {
     });
     expect(result).toBe("System prompt recompiled.");
     expect(recompileMock).toHaveBeenCalledWith("conv-abc", "agent-1");
+  });
+
+  test("calls agents.recompile for default conversation", async () => {
+    const ctx = makeCtx({ getCurrentConvId: () => "default" });
+    const result = await handleOperatorCommand("recompile", [], ctx);
+    expect(result).toBe("System prompt recompiled.");
+    expect(ctx.client.agents.recompile).toHaveBeenCalledWith("agent-1");
   });
 });
 

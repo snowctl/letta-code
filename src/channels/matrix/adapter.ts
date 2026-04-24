@@ -403,7 +403,16 @@ export function createMatrixAdapter(
         if (msgtype === "m.text" || msgtype === "m.notice") {
           const body = (content.body as string | undefined)?.trim() ?? "";
           if (body.startsWith("!")) {
-            await handleBotCommand(roomIdStr, body, eventObj);
+            await handleBotCommand(roomIdStr, body, eventObj).catch(
+              async (err) => {
+                await client
+                  .sendMessage(roomIdStr, {
+                    msgtype: "m.text",
+                    body: `Command failed: ${err instanceof Error ? err.message : String(err)}`,
+                  })
+                  .catch(() => {});
+              },
+            );
             return;
           }
         }

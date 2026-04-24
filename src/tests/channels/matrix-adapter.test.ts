@@ -1483,7 +1483,10 @@ test("matrix adapter !recompile replies System prompt recompiled.", async () => 
   }));
   mock.module("../../agent/client", () => ({
     getClient: async () => ({
-      agents: { messages: { compact: async () => ({}) } },
+      agents: {
+        messages: { compact: async () => ({}) },
+        recompile: async () => "ok",
+      },
       conversations: {
         list: async () => [],
         create: async () => ({ id: "c1" }),

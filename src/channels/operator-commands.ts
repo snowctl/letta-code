@@ -79,8 +79,12 @@ async function handleRecompile(
   deps: RecompileDeps,
 ): Promise<string> {
   const convId = ctx.getCurrentConvId();
-  const recompile = deps.recompile ?? recompileAgentSystemPrompt;
-  await recompile(convId, ctx.agentId);
+  if (convId === "default" || !convId) {
+    await ctx.client.agents.recompile(ctx.agentId);
+  } else {
+    const recompile = deps.recompile ?? recompileAgentSystemPrompt;
+    await recompile(convId, ctx.agentId);
+  }
   return "System prompt recompiled.";
 }
 
