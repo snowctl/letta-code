@@ -25,7 +25,7 @@ import {
   kindToMatrixMsgtype,
   MATRIX_DEFAULT_MAX_DOWNLOAD_BYTES,
 } from "./media";
-import { loadMatrixBotSdkModule } from "./runtime";
+import { loadMatrixBotSdkModule, loadMatrixCryptoModule } from "./runtime";
 
 // ── Markdown helper ───────────────────────────────────────────────────────────
 
@@ -251,17 +251,24 @@ export function createMatrixAdapter(
     if (e2ee) {
       try {
         // matrix-bot-sdk@0.8.0's JS doesn't re-export RustSdkCryptoStoreType
-        // (only the .d.ts does), so it arrives as undefined. Fall back to
-        // whichever numeric store value is available: Sled (older API) or
-        // Sqlite (renamed in @matrix-org/matrix-sdk-crypto-nodejs ≥ 0.3).
-        const storeValue = RustSdkCryptoStoreType?.Sled ?? RustSdkCryptoStoreType?.Sqlite;
+        // even though the .d.ts claims it does. Load StoreType directly from
+        // @matrix-org/matrix-sdk-crypto-nodejs as the primary source, and fall
+        // back to whatever matrix-bot-sdk exports (in case a future version
+        // does re-export it). Sled was renamed to Sqlite in crypto-nodejs ≥ 0.3.
+        let storeValue: string | number | undefined =
+          RustSdkCryptoStoreType?.Sqlite ?? RustSdkCryptoStoreType?.Sled;
+
+        if (storeValue === undefined) {
+          const cryptoMod = await loadMatrixCryptoModule();
+          storeValue = cryptoMod.StoreType?.Sqlite ?? cryptoMod.StoreType?.Sled;
+        }
+
         if (storeValue === undefined) {
           throw new Error(
-            RustSdkCryptoStoreType
-              ? `No compatible store type in RustSdkCryptoStoreType (keys: ${Object.keys(RustSdkCryptoStoreType).join(", ")})`
-              : "RustSdkCryptoStoreType not exported by installed matrix-bot-sdk",
+            "StoreType not available from matrix-bot-sdk or @matrix-org/matrix-sdk-crypto-nodejs",
           );
         }
+
         cryptoProvider = new RustSdkCryptoStorageProvider(cryptoPath, storeValue);
       } catch (err) {
         console.warn(
