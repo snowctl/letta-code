@@ -6,11 +6,12 @@ export interface OperatorCommandContext {
   agentId: string;
   chatId: string;
   client: Letta;
+  commandPrefix: string;
   getCurrentConvId(): string;
   setCurrentConvId(id: string): Promise<void>;
   requestCancel(): boolean;
   getConvListCache(): Conversation[] | null;
-  setConvListCache(list: Conversation[]): void;
+  setConvListCache(list: Conversation[] | null): void;
 }
 
 type RecompileDeps = {
@@ -101,13 +102,14 @@ async function convList(ctx: OperatorCommandContext): Promise<string> {
 
   const lines = ordered.map((c, i) => {
     const label = c.id === "default" ? "default" : (c.summary ?? c.id);
-    const isCurrent =
-      c.id === currentId || (c.id === "default" && currentId === "default");
+    const isCurrent = c.id === currentId;
     return `${i + 1}. ${label}${isCurrent ? " (current)" : ""}`;
   });
 
   if (convs.length === 0) {
-    lines.push("No named conversations. Use !conv new to create one.");
+    lines.push(
+      `No named conversations yet. Use ${ctx.commandPrefix}conv new to create one.`,
+    );
   }
 
   return `Conversations:\n${lines.join("\n")}`;
@@ -116,6 +118,7 @@ async function convList(ctx: OperatorCommandContext): Promise<string> {
 async function convNew(ctx: OperatorCommandContext): Promise<string> {
   const conv = await ctx.client.conversations.create({ agent_id: ctx.agentId });
   await ctx.setCurrentConvId(conv.id);
+  ctx.setConvListCache(null);
   return `New conversation started (ID: ${conv.id}).`;
 }
 
@@ -126,6 +129,7 @@ async function convFork(ctx: OperatorCommandContext): Promise<string> {
   }
   const forked = await ctx.client.conversations.fork(convId);
   await ctx.setCurrentConvId(forked.id);
+  ctx.setConvListCache(null);
   return `Conversation forked (ID: ${forked.id}).`;
 }
 
@@ -173,6 +177,7 @@ async function convDelete(
   }
   const currentId = ctx.getCurrentConvId();
   await ctx.client.conversations.delete(target.id);
+  ctx.setConvListCache(null);
   if (currentId === target.id) {
     await ctx.setCurrentConvId("default");
     return "Deleted. Switched to default.";

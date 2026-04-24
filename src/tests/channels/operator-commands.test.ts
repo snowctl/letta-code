@@ -12,6 +12,7 @@ function makeCtx(
   return {
     agentId: "agent-1",
     chatId: "chat-1",
+    commandPrefix: "!",
     client: {
       agents: {
         messages: {
@@ -37,7 +38,7 @@ function makeCtx(
     setCurrentConvId: mock(async () => {}),
     requestCancel: mock(() => true),
     getConvListCache: () => null,
-    setConvListCache: mock(() => {}),
+    setConvListCache: mock((_list: Conversation[] | null) => {}),
     ...overrides,
   };
 }
@@ -130,7 +131,7 @@ describe("handleOperatorCommand — conv list", () => {
     });
     const result = await handleOperatorCommand("conv", ["list"], ctx);
     expect(result).toContain("1. default (current)");
-    expect(result).toContain("No named conversations");
+    expect(result).toContain("No named conversations yet.");
   });
 });
 
@@ -237,6 +238,33 @@ describe("handleOperatorCommand — conv delete", () => {
     const result = await handleOperatorCommand("conv", ["delete", "2"], ctx);
     expect(result).toBe("Deleted.");
     expect(ctx.setCurrentConvId).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleOperatorCommand — cache invalidation", () => {
+  test("conv new clears the list cache", async () => {
+    const ctx = makeCtx();
+    await handleOperatorCommand("conv", ["new"], ctx);
+    expect(ctx.setConvListCache).toHaveBeenLastCalledWith(null);
+  });
+
+  test("conv fork clears the list cache", async () => {
+    const ctx = makeCtx({ getCurrentConvId: () => "conv-current" });
+    await handleOperatorCommand("conv", ["fork"], ctx);
+    expect(ctx.setConvListCache).toHaveBeenLastCalledWith(null);
+  });
+
+  test("conv delete clears the list cache", async () => {
+    const cache = [
+      { id: "default", agent_id: "agent-1" } as Conversation,
+      { id: "conv-work", agent_id: "agent-1", summary: "Work" } as Conversation,
+    ];
+    const ctx = makeCtx({
+      getCurrentConvId: () => "default",
+      getConvListCache: () => cache,
+    });
+    await handleOperatorCommand("conv", ["delete", "2"], ctx);
+    expect(ctx.setConvListCache).toHaveBeenLastCalledWith(null);
   });
 });
 
