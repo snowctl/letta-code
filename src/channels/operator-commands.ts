@@ -125,7 +125,7 @@ async function convNew(ctx: OperatorCommandContext): Promise<string> {
 async function convFork(ctx: OperatorCommandContext): Promise<string> {
   const convId = ctx.getCurrentConvId();
   if (convId === "default" || !convId) {
-    return "Cannot fork the default conversation — use !conv new instead.";
+    return `Cannot fork the default conversation — use ${ctx.commandPrefix}conv new instead.`;
   }
   const forked = await ctx.client.conversations.fork(convId);
   await ctx.setCurrentConvId(forked.id);

@@ -158,6 +158,7 @@ describe("handleOperatorCommand — conv fork", () => {
     const ctx = makeCtx({ getCurrentConvId: () => "default" });
     const result = await handleOperatorCommand("conv", ["fork"], ctx);
     expect(result).toContain("Cannot fork the default");
+    expect(result).toContain("!conv new");
   });
 });
 
