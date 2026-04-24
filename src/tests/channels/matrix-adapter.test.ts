@@ -1196,9 +1196,8 @@ test("matrix adapter sends reasoning drawer and combines with answer in single m
   // Second chunk (accumulates in buffer)
   await adapter.handleStreamReasoning!(" Found 3 results.", [source]);
 
-  client.sendMessage.mockClear();
-
   // Answer arrives — should edit the reasoning message (m.replace), not send a new one
+  const callsBefore = client.sendMessage.mock.calls.length;
   const result = await adapter.sendMessage({
     channel: "matrix",
     accountId: "acc1",
@@ -1207,8 +1206,9 @@ test("matrix adapter sends reasoning drawer and combines with answer in single m
     parseMode: "HTML",
   });
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const [, finalContent] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  // Exactly one new sendMessage call should have happened (the final m.replace edit)
+  expect(client.sendMessage.mock.calls.length).toBe(callsBefore + 1);
+  const [, finalContent] = client.sendMessage.mock.calls[callsBefore] as [string, Record<string, unknown>];
   const fc = finalContent as Record<string, unknown>;
 
   // Must be an m.replace edit targeting the original message
