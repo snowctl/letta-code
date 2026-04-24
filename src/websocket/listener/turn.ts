@@ -643,10 +643,12 @@ export async function handleIncomingMessage(
     let runIdSent = false;
     let runId: string | undefined;
     const buffers = createBuffers(agentId);
+    const channelSources = runtime.activeChannelTurnSources;
     let accumulatedChannelText = "";
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      accumulatedChannelText = "";
       runIdSent = false;
       let latestErrorText: string | null = null;
       const result = await drainStreamWithResume(
@@ -708,12 +710,9 @@ export async function handleIncomingMessage(
                 },
               );
 
-              const textChunk = extractAssistantText(
-                normalizedChunk as unknown as Record<string, unknown>,
-              );
+              const textChunk = extractAssistantText(normalizedChunk);
               if (textChunk) {
                 accumulatedChannelText += textChunk;
-                const channelSources = runtime.activeChannelTurnSources;
                 if (channelSources && channelSources.length > 0) {
                   void getChannelRegistry()?.dispatchStreamText(
                     accumulatedChannelText,
