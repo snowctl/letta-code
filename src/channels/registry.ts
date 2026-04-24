@@ -35,7 +35,11 @@ import {
   removePendingControlRequest as removePersistedPendingControlRequest,
   upsertPendingControlRequest as upsertPersistedPendingControlRequest,
 } from "./pendingControlRequests";
-import { loadChannelPlugin } from "./pluginRegistry";
+import {
+  getChannelDisplayName,
+  isSupportedChannelId,
+  loadChannelPlugin,
+} from "./pluginRegistry";
 import {
   addRoute,
   getRoute as getRouteFromStore,
@@ -60,9 +64,9 @@ import type {
 import { formatChannelNotification } from "./xml";
 
 function channelDisplayName(channelId: string): string {
-  if (channelId === "slack") return "Slack";
-  if (channelId === "discord") return "Discord";
-  return "Telegram";
+  return isSupportedChannelId(channelId)
+    ? getChannelDisplayName(channelId)
+    : channelId;
 }
 
 function buildPairingInstructions(channelId: string, code: string): string {
