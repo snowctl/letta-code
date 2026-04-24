@@ -586,6 +586,7 @@ export function createTelegramAdapter(
       if (action === "show_reasoning") {
         const reasoning = reasoningByKey.get(k);
         if (!reasoning) return;
+        reasoningByKey.delete(k);
         const chatId = String(query.message?.chat.id ?? "");
         const messageId = query.message?.message_id;
         await instance.api
