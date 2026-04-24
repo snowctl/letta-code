@@ -126,6 +126,13 @@ export function extractAssistantText(chunk: Record<string, unknown>): string | n
   return text || null;
 }
 
+export function extractReasoningText(chunk: Record<string, unknown>): string | null {
+  if (chunk.message_type !== "reasoning_message") return null;
+  const reasoning = chunk.reasoning;
+  if (typeof reasoning === "string") return reasoning || null;
+  return null;
+}
+
 function trackListenerUserInput(
   messages: InboundMessagePayload[],
   modelId: string,
@@ -733,6 +740,14 @@ export async function handleIncomingMessage(
                     channelSources,
                   );
                 }
+              }
+
+              const reasoningChunk = extractReasoningText(normalizedChunk);
+              if (reasoningChunk && channelSources && channelSources.length > 0) {
+                void getChannelRegistry()?.dispatchStreamReasoning(
+                  reasoningChunk,
+                  channelSources,
+                );
               }
             }
           }
