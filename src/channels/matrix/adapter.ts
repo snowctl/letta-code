@@ -205,7 +205,7 @@ export function createMatrixAdapter(
         .finally(() => {
           flushInProgress = false;
         });
-    }, 500);
+    }, 150);
     reasoningFlushIntervalByChatId.set(chatId, interval);
   }
 
