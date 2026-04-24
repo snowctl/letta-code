@@ -1469,6 +1469,55 @@ class SettingsManager {
     this.unpinGlobal(agentId);
   }
 
+  /**
+   * Remove all traces of a deleted agent from settings: unpin it from both
+   * local and global lists, and clear the LRU session wherever it points to
+   * the deleted agent. Ensures the next startup shows the setup wizard rather
+   * than trying to resume a non-existent agent.
+   */
+  clearDeletedAgent(
+    agentId: string,
+    workingDirectory: string = process.cwd(),
+  ): void {
+    this.unpinBoth(agentId, workingDirectory);
+
+    // Clear global LRU if it points to the deleted agent
+    const settings = this.getSettings();
+    const serverKey = getCurrentServerKey(settings);
+    if (
+      settings.sessionsByServer?.[serverKey]?.agentId === agentId ||
+      settings.lastSession?.agentId === agentId ||
+      settings.lastAgent === agentId
+    ) {
+      const sessionsByServer = { ...settings.sessionsByServer };
+      delete sessionsByServer[serverKey];
+      this.updateSettings({
+        sessionsByServer,
+        lastSession: undefined,
+        lastAgent: null,
+      });
+    }
+
+    // Clear local LRU if it points to the deleted agent
+    const localSettings = this.getLocalProjectSettings(workingDirectory);
+    if (
+      localSettings.sessionsByServer?.[serverKey]?.agentId === agentId ||
+      localSettings.lastSession?.agentId === agentId ||
+      localSettings.lastAgent === agentId
+    ) {
+      const localSessionsByServer = { ...localSettings.sessionsByServer };
+      delete localSessionsByServer[serverKey];
+      this.updateLocalProjectSettings(
+        {
+          sessionsByServer: localSessionsByServer,
+          lastSession: undefined,
+          lastAgent: null,
+        },
+        workingDirectory,
+      );
+    }
+  }
+
   // DEPRECATED: Keep for backwards compatibility
   deleteProfile(
     _name: string,
