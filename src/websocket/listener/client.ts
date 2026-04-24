@@ -258,6 +258,7 @@ import {
   emitListenerStatus,
   evictConversationRuntimeIfIdle,
   getActiveRuntime,
+  getConversationRuntime,
   getListenerStatus,
   getOrCreateConversationRuntime,
   getPendingControlRequestCount,
@@ -3293,8 +3294,7 @@ async function wireChannelIngress(
   );
 
   registry.setCancelHandler((agentId: string, conversationId: string) => {
-    const runtimeKey = `${agentId}:${conversationId}`;
-    const scopedRuntime = listener.conversationRuntimes.get(runtimeKey);
+    const scopedRuntime = getConversationRuntime(listener, agentId, conversationId);
     if (!scopedRuntime?.isProcessing) return false;
     scopedRuntime.cancelRequested = true;
     if (
