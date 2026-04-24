@@ -437,6 +437,49 @@ export class ChannelRegistry {
     }
   }
 
+  async dispatchStreamReasoning(
+    chunk: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void> {
+    const groups = new Map<
+      string,
+      { adapter: ChannelAdapter; sources: ChannelTurnSource[] }
+    >();
+
+    for (const source of sources) {
+      const adapter = this.getAdapter(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      if (!adapter?.handleStreamReasoning) {
+        continue;
+      }
+      const groupKey = this.getAdapterKey(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      const existing = groups.get(groupKey);
+      if (existing) {
+        existing.sources.push(source);
+        continue;
+      }
+      groups.set(groupKey, { adapter, sources: [source] });
+    }
+
+    for (const { adapter, sources: groupedSources } of groups.values()) {
+      const { handleStreamReasoning } = adapter;
+      if (!handleStreamReasoning) continue;
+      try {
+        await handleStreamReasoning(chunk, groupedSources);
+      } catch (error) {
+        console.error(
+          `[Channels] Failed to dispatch reasoning for ${adapter.channelId ?? adapter.id}/${adapter.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
   // ── Readiness / ingress handler ───────────────────────────────
 
   /**
