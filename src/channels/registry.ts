@@ -199,7 +199,10 @@ export type ChannelApprovalResponseHandler = (params: {
   };
   response: ApprovalResponseBody;
 }) => Promise<boolean>;
-export type ChannelCancelHandler = (agentId: string, conversationId: string) => boolean;
+export type ChannelCancelHandler = (
+  agentId: string,
+  conversationId: string,
+) => boolean;
 
 type PendingChannelControlRequest = {
   event: ChannelControlRequestEvent;
@@ -1021,8 +1024,9 @@ export class ChannelRegistry {
     }
 
     // 3. Apply account-level default permission mode if configured.
-    const mode = (config as { defaultPermissionMode?: SlackDefaultPermissionMode })
-      .defaultPermissionMode;
+    const mode = (
+      config as { defaultPermissionMode?: SlackDefaultPermissionMode }
+    ).defaultPermissionMode;
     if (mode && mode !== "default") {
       this.eventHandler?.({
         type: "channel_permission_mode_set",

@@ -738,7 +738,12 @@ describe("ChannelRegistry.updateRouteConversation", () => {
       updatedAt: new Date().toISOString(),
     });
     const reg = new ChannelRegistry();
-    reg.updateRouteConversation("telegram", "chat-disabled", "acct-1", "conv-new");
+    reg.updateRouteConversation(
+      "telegram",
+      "chat-disabled",
+      "acct-1",
+      "conv-new",
+    );
     const raw = getRouteRaw("telegram", "chat-disabled", "acct-1");
     expect(raw?.conversationId).toBe("conv-new");
   });
