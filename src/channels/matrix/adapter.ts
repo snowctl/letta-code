@@ -223,6 +223,17 @@ export function createMatrixAdapter(
     reasoningBufferByChatId.delete(chatId);
   }
 
+  async function waitForPendingPlaceholder(chatId: string): Promise<void> {
+    if (reasoningMessageIdByChatId.get(chatId) !== "__pending__") return;
+    const deadline = Date.now() + 2000;
+    while (
+      reasoningMessageIdByChatId.get(chatId) === "__pending__" &&
+      Date.now() < deadline
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   // ── Tool block helper ─────────────────────────────────────────────
 
   function scheduleToolBlockUpdate(
@@ -621,15 +632,7 @@ export function createMatrixAdapter(
       const pendingReasoningMsgId = reasoningMessageIdByChatId.get(msg.chatId);
       if (pendingReasoningMsgId) {
         // If the placeholder send is still in-flight, wait for it to resolve (up to 2s)
-        if (pendingReasoningMsgId === "__pending__") {
-          const deadline = Date.now() + 2000;
-          while (
-            reasoningMessageIdByChatId.get(msg.chatId) === "__pending__" &&
-            Date.now() < deadline
-          ) {
-            await new Promise<void>((resolve) => setTimeout(resolve, 50));
-          }
-        }
+        await waitForPendingPlaceholder(msg.chatId);
 
         stopReasoningFlush(msg.chatId);
         void stopTypingInterval(msg.chatId);
@@ -803,17 +806,8 @@ export function createMatrixAdapter(
 
         // Redact thinking placeholder if turn ended without a response.
         // If the placeholder send is still in-flight, wait briefly for it to resolve.
+        await waitForPendingPlaceholder(source.chatId);
         let reasoningMsgId = reasoningMessageIdByChatId.get(source.chatId);
-        if (reasoningMsgId === "__pending__") {
-          const deadline = Date.now() + 2000;
-          while (
-            reasoningMessageIdByChatId.get(source.chatId) === "__pending__" &&
-            Date.now() < deadline
-          ) {
-            await new Promise<void>((r) => setTimeout(r, 50));
-          }
-          reasoningMsgId = reasoningMessageIdByChatId.get(source.chatId);
-        }
         if (reasoningMsgId && reasoningMsgId !== "__pending__" && matrixClient) {
           await matrixClient.redactEvent(source.chatId, reasoningMsgId).catch((error) => {
             console.warn(
