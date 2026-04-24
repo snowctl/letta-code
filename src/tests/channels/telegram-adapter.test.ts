@@ -1479,3 +1479,186 @@ test("tool block: cleared on finished (state does not persist across turns)", as
   expect(bot.api.editMessageText.mock.calls.length).toBe(0);
   await adapter.stop();
 });
+
+test("telegram adapter appends Show reasoning button when reasoning was received", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  const source = {
+    channel: "telegram" as const,
+    accountId: "telegram-test-account",
+    chatId: "42",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("I need to think.", [source]);
+  await adapter.handleStreamReasoning!(" Done.", [source]);
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "Here is the answer.",
+  });
+
+  expect(bot?.api.sendMessage).toHaveBeenCalledTimes(1);
+  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown>,
+  ];
+  const keyboard = opts.reply_markup as {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+  expect(keyboard.inline_keyboard[0]?.[0]?.text).toBe("🧠 Show reasoning");
+
+  const callbackData = JSON.parse(keyboard.inline_keyboard[0]![0]!.callback_data) as {
+    k: string;
+    a: string;
+  };
+  expect(callbackData.a).toBe("show_reasoning");
+
+  await adapter.stop();
+});
+
+test("telegram adapter sends reasoning as reply when Show reasoning button is tapped", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  const source = {
+    channel: "telegram" as const,
+    accountId: "telegram-test-account",
+    chatId: "42",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("My reasoning.", [source]);
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "Answer.",
+  });
+
+  // Capture callback_data from the sent message
+  const [, , sendOpts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown>,
+  ];
+  const keyboard = sendOpts.reply_markup as {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+  const callbackData = keyboard.inline_keyboard[0]![0]!.callback_data;
+
+  bot!.api.sendMessage.mockClear();
+
+  // Simulate user tapping the button
+  await bot!.emit("callback_query", {
+    callbackQuery: {
+      id: "cq1",
+      from: { id: 7, username: "user" },
+      data: callbackData,
+      message: { message_id: 999, chat: { id: 42 } },
+    },
+  });
+
+  expect(bot?.api.sendMessage).toHaveBeenCalledTimes(1);
+  const [chatId, text] = bot!.api.sendMessage.mock.calls[0] as unknown as [string, string];
+  expect(chatId).toBe("42");
+  expect(text).toBe("My reasoning.");
+
+  await adapter.stop();
+});
+
+test("telegram adapter sends message without button when no reasoning received", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "No reasoning here.",
+  });
+
+  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown> | undefined,
+  ];
+  expect((opts ?? {}).reply_markup).toBeUndefined();
+
+  await adapter.stop();
+});
+
+test("telegram adapter skips reasoning button when showReasoning is false", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+    showReasoning: false,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  const source = {
+    channel: "telegram" as const,
+    accountId: "telegram-test-account",
+    chatId: "42",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("thinking...", [source]);
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "Answer.",
+  });
+
+  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown> | undefined,
+  ];
+  expect((opts ?? {}).reply_markup).toBeUndefined();
+
+  await adapter.stop();
+});
