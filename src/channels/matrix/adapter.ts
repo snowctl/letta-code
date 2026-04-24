@@ -787,8 +787,19 @@ export function createMatrixAdapter(
         toolBlockStateByChatId.delete(source.chatId);
         toolBlockOperationByChatId.delete(source.chatId);
 
-        // Redact thinking placeholder if turn ended without a response
-        const reasoningMsgId = reasoningMessageIdByChatId.get(source.chatId);
+        // Redact thinking placeholder if turn ended without a response.
+        // If the placeholder send is still in-flight, wait briefly for it to resolve.
+        let reasoningMsgId = reasoningMessageIdByChatId.get(source.chatId);
+        if (reasoningMsgId === "__pending__") {
+          const deadline = Date.now() + 2000;
+          while (
+            reasoningMessageIdByChatId.get(source.chatId) === "__pending__" &&
+            Date.now() < deadline
+          ) {
+            await new Promise<void>((r) => setTimeout(r, 50));
+          }
+          reasoningMsgId = reasoningMessageIdByChatId.get(source.chatId);
+        }
         if (reasoningMsgId && reasoningMsgId !== "__pending__" && matrixClient) {
           await matrixClient.redactEvent(source.chatId, reasoningMsgId).catch((error) => {
             console.warn(

@@ -1187,6 +1187,7 @@ test("Matrix tool block: cleared on finished, thinking placeholder redacted", as
     MATRIX_LIFECYCLE_SOURCE.chatId,
     "$thinking-first",
   );
+  expect(client.redactEvent).toHaveBeenCalledTimes(1);
 
   // Second tool_call in a new turn
   await adapter.handleTurnLifecycleEvent!({
