@@ -199,6 +199,7 @@ export type ChannelApprovalResponseHandler = (params: {
   };
   response: ApprovalResponseBody;
 }) => Promise<boolean>;
+export type ChannelCancelHandler = (agentId: string, conversationId: string) => boolean;
 
 type PendingChannelControlRequest = {
   event: ChannelControlRequestEvent;
@@ -245,7 +246,7 @@ export class ChannelRegistry {
     PendingChannelControlRequest
   >();
   private readonly pendingControlRequestIdByScope = new Map<string, string>();
-  private cancelHandler: ((agentId: string, conversationId: string) => boolean) | null = null;
+  private cancelHandler: ChannelCancelHandler | null = null;
 
   constructor() {
     if (instance) {
@@ -498,7 +499,7 @@ export class ChannelRegistry {
     this.approvalResponseHandler = handler;
   }
 
-  setCancelHandler(fn: (agentId: string, conversationId: string) => boolean): void {
+  setCancelHandler(fn: ChannelCancelHandler | null): void {
     this.cancelHandler = fn;
   }
 
@@ -512,9 +513,13 @@ export class ChannelRegistry {
     accountId: string,
     conversationId: string,
   ): void {
-    const route = getRouteFromStore(channel, chatId, accountId);
+    const route = getRouteRaw(channel, chatId, accountId);
     if (!route) return;
-    setRouteInMemory(channel, { ...route, conversationId });
+    setRouteInMemory(channel, {
+      ...route,
+      conversationId,
+      updatedAt: new Date().toISOString(),
+    });
     saveRoutes(channel);
   }
 
@@ -803,6 +808,7 @@ export class ChannelRegistry {
     this.messageHandler = null;
     this.eventHandler = null;
     this.approvalResponseHandler = null;
+    this.cancelHandler = null;
   }
 
   /**
@@ -819,6 +825,7 @@ export class ChannelRegistry {
     this.messageHandler = null;
     this.eventHandler = null;
     this.approvalResponseHandler = null;
+    this.cancelHandler = null;
     this.pendingControlRequestsById.clear();
     this.pendingControlRequestIdByScope.clear();
     instance = null;
