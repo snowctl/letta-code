@@ -103,6 +103,7 @@ import {
   sendApprovalContinuationWithRetry,
   sendMessageStreamWithRetry,
 } from "./send";
+import { getChannelRegistry } from "../../channels/registry";
 import { injectQueuedSkillContent } from "./skill-injection";
 import { handleApprovalStop } from "./turn-approval";
 import type {
@@ -112,6 +113,18 @@ import type {
 } from "./types";
 
 const AUTO_REFLECTION_DESCRIPTION = "Reflect on recent conversations";
+
+export function extractAssistantText(chunk: Record<string, unknown>): string | null {
+  if (chunk.message_type !== "assistant_message") return null;
+  const content = chunk.content;
+  if (typeof content === "string") return content || null;
+  if (!Array.isArray(content)) return null;
+  const text = (content as Array<Record<string, unknown>>)
+    .filter((c) => c.type === "text" && typeof c.text === "string")
+    .map((c) => c.text as string)
+    .join("");
+  return text || null;
+}
 
 function trackListenerUserInput(
   messages: InboundMessagePayload[],
@@ -630,9 +643,18 @@ export async function handleIncomingMessage(
     let runIdSent = false;
     let runId: string | undefined;
     const buffers = createBuffers(agentId);
+    const channelSources = runtime.activeChannelTurnSources;
+    let accumulatedChannelText = "";
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      if (accumulatedChannelText !== "") {
+        // This is a retry — clear adapter stream states so the next segment posts fresh
+        if (channelSources && channelSources.length > 0) {
+          void getChannelRegistry()?.dispatchStreamReset(channelSources);
+        }
+      }
+      accumulatedChannelText = "";
       runIdSent = false;
       let latestErrorText: string | null = null;
       const result = await drainStreamWithResume(
@@ -693,6 +715,18 @@ export async function handleIncomingMessage(
                   conversation_id: conversationId,
                 },
               );
+
+              // normalizeToolReturnWireMessage is a pass-through for assistant_message chunks
+              const textChunk = extractAssistantText(normalizedChunk);
+              if (textChunk) {
+                accumulatedChannelText += textChunk;
+                if (channelSources && channelSources.length > 0) {
+                  void getChannelRegistry()?.dispatchStreamText(
+                    accumulatedChannelText,
+                    channelSources,
+                  );
+                }
+              }
             }
           }
 

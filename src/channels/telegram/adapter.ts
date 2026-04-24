@@ -16,6 +16,7 @@ import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
   ChannelTurnLifecycleEvent,
+  ChannelTurnSource,
   InboundChannelMessage,
   OutboundChannelMessage,
   TelegramChannelAccount,
@@ -221,6 +222,19 @@ export function createTelegramAdapter(
   let running = false;
   const typingIntervalByChatId = new Map<string, ReturnType<typeof setInterval>>();
 
+  const TELEGRAM_STREAM_INTERVAL_MS = 1000;
+  const TELEGRAM_STREAM_INTERVAL_MAX_MS = 8000;
+
+  interface TelegramStreamState {
+    messageId: string;
+    lastText: string;
+    lastEditAt: number;
+    pendingTimer: ReturnType<typeof setTimeout> | null;
+    currentInterval: number;
+    cleanupTimeout: ReturnType<typeof setTimeout> | null;
+  }
+  const streamStates = new Map<string, TelegramStreamState>();
+
   interface ToolBlockState {
     messageId: number;
     groups: ToolCallGroup[];
@@ -254,6 +268,35 @@ export function createTelegramAdapter(
     if (timer !== undefined) {
       clearInterval(timer);
       typingIntervalByChatId.delete(chatId);
+    }
+  }
+
+  async function editStreamMessage(chatId: string, text: string): Promise<void> {
+    const state = streamStates.get(chatId);
+    if (!state || !bot) return;
+    try {
+      await bot.api.editMessageText(chatId, Number(state.messageId), text);
+      state.lastEditAt = Date.now();
+      state.lastText = text;
+    } catch (error: unknown) {
+      const code = (error as { error_code?: number }).error_code;
+      if (code === 429) {
+        state.currentInterval = Math.min(
+          state.currentInterval * 2,
+          TELEGRAM_STREAM_INTERVAL_MAX_MS,
+        );
+        const delay = state.currentInterval;
+        if (state.pendingTimer) clearTimeout(state.pendingTimer);
+        state.pendingTimer = setTimeout(() => {
+          state.pendingTimer = null;
+          void editStreamMessage(chatId, state.lastText);
+        }, delay);
+      } else {
+        console.warn(
+          "[Telegram] Edit message failed (non-rate-limit):",
+          error instanceof Error ? error.message : error,
+        );
+      }
     }
   }
 
@@ -717,6 +760,11 @@ export function createTelegramAdapter(
         clearInterval(timer);
       }
       typingIntervalByChatId.clear();
+      for (const state of streamStates.values()) {
+        if (state.pendingTimer) clearTimeout(state.pendingTimer);
+        if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
+      }
+      streamStates.clear();
       toolBlockStateByChatId.clear();
       toolBlockOperationByChatId.clear();
 
@@ -735,6 +783,67 @@ export function createTelegramAdapter(
 
     isRunning(): boolean {
       return running;
+    },
+
+    async handleStreamText(
+      accumulatedText: string,
+      sources: ChannelTurnSource[],
+    ): Promise<void> {
+      if (!running || !bot) return;
+
+      for (const source of sources) {
+        const { chatId } = source;
+        const existing = streamStates.get(chatId);
+
+        if (!existing) {
+          stopTypingInterval(chatId);
+          try {
+            const result = await bot.api.sendMessage(chatId, accumulatedText);
+            streamStates.set(chatId, {
+              messageId: String(result.message_id),
+              lastText: accumulatedText,
+              lastEditAt: Date.now(),
+              pendingTimer: null,
+              currentInterval: TELEGRAM_STREAM_INTERVAL_MS,
+              cleanupTimeout: null,
+            });
+          } catch (error) {
+            console.error(
+              "[Telegram] Initial stream post failed:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+          continue;
+        }
+
+        existing.lastText = accumulatedText;
+        const elapsed = Date.now() - existing.lastEditAt;
+
+        if (elapsed >= existing.currentInterval) {
+          if (existing.pendingTimer) {
+            clearTimeout(existing.pendingTimer);
+            existing.pendingTimer = null;
+          }
+          void editStreamMessage(chatId, accumulatedText);
+        } else {
+          if (existing.pendingTimer) clearTimeout(existing.pendingTimer);
+          existing.pendingTimer = setTimeout(() => {
+            existing.pendingTimer = null;
+            void editStreamMessage(chatId, existing.lastText);
+          }, existing.currentInterval - elapsed);
+        }
+      }
+    },
+
+    async handleStreamReset(sources: ChannelTurnSource[]): Promise<void> {
+      for (const source of sources) {
+        const state = streamStates.get(source.chatId);
+        if (state) {
+          if (state.pendingTimer) clearTimeout(state.pendingTimer);
+          if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
+          streamStates.delete(source.chatId);
+        }
+      }
     },
 
     async handleTurnLifecycleEvent(
@@ -765,6 +874,20 @@ export function createTelegramAdapter(
       // "finished"
       for (const source of event.sources) {
         stopTypingInterval(source.chatId);
+
+        const streamState = streamStates.get(source.chatId);
+        if (streamState) {
+          if (streamState.pendingTimer) {
+            clearTimeout(streamState.pendingTimer);
+            streamState.pendingTimer = null;
+          }
+          void editStreamMessage(source.chatId, streamState.lastText);
+          streamState.cleanupTimeout = setTimeout(() => {
+            streamStates.delete(source.chatId);
+          }, 10_000);
+          streamState.currentInterval = TELEGRAM_STREAM_INTERVAL_MS;
+        }
+
         const pending = toolBlockOperationByChatId.get(source.chatId);
         if (pending) await pending.catch(() => {});
         toolBlockStateByChatId.delete(source.chatId);
@@ -868,6 +991,26 @@ export function createTelegramAdapter(
       }
       if (msg.parseMode) {
         opts.parse_mode = msg.parseMode;
+      }
+
+      const streamState = streamStates.get(msg.chatId);
+      if (streamState) {
+        if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
+        if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
+        streamStates.delete(msg.chatId);
+        const parseOpts = msg.parseMode
+          ? {
+              parse_mode: msg.parseMode as "HTML" | "Markdown" | "MarkdownV2",
+            }
+          : {};
+        // replyToMessageId cannot be applied to an edit; the initial stream post serves as the reply anchor
+        await telegramBot.api.editMessageText(
+          msg.chatId,
+          Number(streamState.messageId),
+          msg.text,
+          parseOpts,
+        );
+        return { messageId: streamState.messageId };
       }
 
       const result = await telegramBot.api.sendMessage(
