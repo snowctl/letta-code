@@ -285,16 +285,14 @@ export function createTelegramAdapter(
           state.currentInterval * 2,
           TELEGRAM_STREAM_INTERVAL_MAX_MS,
         );
+        const delay = state.currentInterval;
+        if (state.pendingTimer) clearTimeout(state.pendingTimer);
+        state.pendingTimer = setTimeout(() => {
+          state.pendingTimer = null;
+          void editStreamMessage(chatId, state.lastText);
+        }, delay);
       }
-      if (state.pendingTimer) clearTimeout(state.pendingTimer);
-      state.pendingTimer = setTimeout(() => {
-        state.pendingTimer = null;
-        void editStreamMessage(chatId, state.lastText);
-      }, state.currentInterval);
-      console.error(
-        "[Telegram] editMessageText failed:",
-        error instanceof Error ? error.message : error,
-      );
+      // other errors: silently drop (streaming edit failures are non-fatal)
     }
   }
 
@@ -989,9 +987,7 @@ export function createTelegramAdapter(
           msg.chatId,
           Number(streamState.messageId),
           msg.text,
-          msg.parseMode
-            ? { parse_mode: msg.parseMode as "HTML" | "Markdown" | "MarkdownV2" }
-            : {},
+          { parse_mode: "HTML" },
         );
         return { messageId: streamState.messageId };
       }
