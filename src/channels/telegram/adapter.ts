@@ -983,11 +983,17 @@ export function createTelegramAdapter(
         if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
         if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
         streamStates.delete(msg.chatId);
+        const parseOpts = msg.parseMode
+          ? {
+              parse_mode: msg.parseMode as "HTML" | "Markdown" | "MarkdownV2",
+            }
+          : {};
+        // replyToMessageId cannot be applied to an edit; the initial stream post serves as the reply anchor
         await telegramBot.api.editMessageText(
           msg.chatId,
           Number(streamState.messageId),
           msg.text,
-          { parse_mode: "HTML" },
+          parseOpts,
         );
         return { messageId: streamState.messageId };
       }
