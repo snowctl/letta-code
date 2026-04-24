@@ -223,6 +223,34 @@ export function createMatrixAdapter(
     reasoningBufferByChatId.delete(chatId);
   }
 
+  async function finalizeReasoningMessage(chatId: string): Promise<void> {
+    const messageId = reasoningMessageIdByChatId.get(chatId);
+    if (!messageId || messageId === "__pending__" || !matrixClient) return;
+    const buffer = reasoningBufferByChatId.get(chatId) ?? "";
+    if (!buffer) return;
+    const html = `<details><summary>Thinking</summary>\n${escapeHtml(buffer)}</details>`;
+    const plainText = `Thinking\n${buffer}`;
+    await matrixClient
+      .sendMessage(chatId, {
+        msgtype: "m.text",
+        body: `* ${plainText}`,
+        format: "org.matrix.custom.html",
+        "m.new_content": {
+          msgtype: "m.text",
+          body: plainText,
+          format: "org.matrix.custom.html",
+          formatted_body: html,
+        },
+        "m.relates_to": { rel_type: "m.replace", event_id: messageId },
+      })
+      .catch((error) => {
+        console.warn(
+          "[Matrix] Failed to finalize reasoning message:",
+          error instanceof Error ? error.message : error,
+        );
+      });
+  }
+
   async function waitForPendingPlaceholder(chatId: string): Promise<void> {
     if (reasoningMessageIdByChatId.get(chatId) !== "__pending__") return;
     const deadline = Date.now() + 2000;
@@ -628,52 +656,15 @@ export function createMatrixAdapter(
         return { messageId: String(eventId) };
       }
 
-      // Reasoning display — delete thinking placeholder, send response with drawer on top
+      // Reasoning display — finalize thinking message in place, send answer separately
       const pendingReasoningMsgId = reasoningMessageIdByChatId.get(msg.chatId);
       if (pendingReasoningMsgId) {
-        // If the placeholder send is still in-flight, wait for it to resolve (up to 2s)
         await waitForPendingPlaceholder(msg.chatId);
-
         stopReasoningFlush(msg.chatId);
         void stopTypingInterval(msg.chatId);
-
-        const buffer = reasoningBufferByChatId.get(msg.chatId) ?? "";
-        const resolvedMsgId = reasoningMessageIdByChatId.get(msg.chatId);
+        await finalizeReasoningMessage(msg.chatId);
         clearReasoningState(msg.chatId);
-
-        // Redact the thinking placeholder
-        if (resolvedMsgId && resolvedMsgId !== "__pending__") {
-          await client.redactEvent(msg.chatId, resolvedMsgId).catch((error) => {
-            console.warn(
-              "[Matrix] Failed to redact thinking placeholder:",
-              error instanceof Error ? error.message : error,
-            );
-          });
-        }
-
-        // Send response with thinking drawer on top if reasoning content exists
-        if (buffer) {
-          const answerHtml =
-            msg.parseMode === "HTML"
-              ? markdownToMatrixHtml(msg.text ?? "")
-              : escapeHtml(msg.text ?? "");
-          const html = `<details><summary>Thinking</summary>\n${escapeHtml(buffer)}</details><hr>${answerHtml}`;
-          const plainFallback = `Thinking\n---\n${msg.text ?? ""}`;
-          const responseContent: Record<string, unknown> = {
-            msgtype: "m.text",
-            body: plainFallback,
-            format: "org.matrix.custom.html",
-            formatted_body: html,
-          };
-          if (msg.replyToMessageId) {
-            responseContent["m.relates_to"] = {
-              "m.in_reply_to": { event_id: msg.replyToMessageId },
-            };
-          }
-          const eventId = await client.sendMessage(msg.chatId, responseContent);
-          return { messageId: String(eventId) };
-        }
-        // No reasoning content — fall through to plain send below
+        // Fall through to plain send below — answer goes as a separate new message
       }
 
       // Plain text or HTML
@@ -804,19 +795,9 @@ export function createMatrixAdapter(
         toolBlockStateByChatId.delete(source.chatId);
         toolBlockOperationByChatId.delete(source.chatId);
 
-        // Redact thinking placeholder if turn ended without a response.
-        // If the placeholder send is still in-flight, wait briefly for it to resolve.
         await waitForPendingPlaceholder(source.chatId);
-        let reasoningMsgId = reasoningMessageIdByChatId.get(source.chatId);
-        if (reasoningMsgId && reasoningMsgId !== "__pending__" && matrixClient) {
-          await matrixClient.redactEvent(source.chatId, reasoningMsgId).catch((error) => {
-            console.warn(
-              "[Matrix] Failed to redact thinking placeholder on turn end:",
-              error instanceof Error ? error.message : error,
-            );
-          });
-        }
-
+        stopReasoningFlush(source.chatId);
+        await finalizeReasoningMessage(source.chatId);
         clearReasoningState(source.chatId);
       }
     },
