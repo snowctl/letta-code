@@ -7,6 +7,8 @@ import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
   ChannelControlRequestKind,
+  ChannelTurnLifecycleEvent,
+  ChannelTurnSource,
   InboundChannelMessage,
   MatrixChannelAccount,
   OutboundChannelMessage,
@@ -93,6 +95,131 @@ export function createMatrixAdapter(
   const pendingReactionRequests = new Map<string, PendingReactionRequest>();
   // Map from `${chatId}:${senderId}` → requestId
   const awaitingFreeformByChat = new Map<string, string>();
+
+  // ── Typing indicator state ────────────────────────────────────────
+  const typingIntervalByChatId = new Map<string, ReturnType<typeof setInterval>>();
+
+  // ── Streaming state ──────────────────────────────────────────────
+  const MATRIX_STREAM_INTERVAL_MS = 500;
+  const MATRIX_STREAM_INTERVAL_MAX_MS = 8000;
+
+  interface MatrixStreamState {
+    messageId: string;
+    lastText: string;
+    lastEditAt: number;
+    pendingTimer: ReturnType<typeof setTimeout> | null;
+    currentInterval: number;
+    cleanupTimeout: ReturnType<typeof setTimeout> | null;
+  }
+  const streamStates = new Map<string, MatrixStreamState>();
+
+  // ── Tool block state ─────────────────────────────────────────────
+  interface MatrixToolBlockState {
+    messageId: string;
+    groups: ToolCallGroup[];
+  }
+  const toolBlockStateByChatId = new Map<string, MatrixToolBlockState>();
+  const toolBlockOperationByChatId = new Map<string, Promise<void>>();
+
+  // ── Typing interval helpers ───────────────────────────────────────
+
+  function startTypingInterval(chatId: string): void {
+    if (typingIntervalByChatId.has(chatId) || !matrixClient) return;
+    const fire = () => {
+      if (!matrixClient) return;
+      void matrixClient.sendTyping(chatId, true, 8000).catch(() => {});
+    };
+    fire();
+    typingIntervalByChatId.set(chatId, setInterval(fire, 4000));
+  }
+
+  async function stopTypingInterval(chatId: string): Promise<void> {
+    const timer = typingIntervalByChatId.get(chatId);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      typingIntervalByChatId.delete(chatId);
+      if (matrixClient) {
+        await matrixClient.sendTyping(chatId, false).catch(() => {});
+      }
+    }
+  }
+
+  // ── Stream edit helper ────────────────────────────────────────────
+
+  async function editStreamMessage(roomId: string, text: string): Promise<void> {
+    const state = streamStates.get(roomId);
+    if (!state || !matrixClient) return;
+    try {
+      await matrixClient.sendEvent(roomId, "m.room.message", {
+        "m.new_content": { msgtype: "m.text", body: text },
+        "m.relates_to": { rel_type: "m.replace", event_id: state.messageId },
+        body: "[editing…]",
+      });
+      state.lastEditAt = Date.now();
+      state.lastText = text;
+    } catch (error: unknown) {
+      const errCode = (error as { errcode?: string }).errcode;
+      if (errCode === "M_LIMIT_EXCEEDED") {
+        state.currentInterval = Math.min(
+          state.currentInterval * 2,
+          MATRIX_STREAM_INTERVAL_MAX_MS,
+        );
+        if (state.pendingTimer) clearTimeout(state.pendingTimer);
+        state.pendingTimer = setTimeout(() => {
+          state.pendingTimer = null;
+          void editStreamMessage(roomId, state.lastText);
+        }, state.currentInterval);
+      }
+      // other errors: silently drop (streaming edit failures are non-fatal)
+    }
+  }
+
+  // ── Tool block helper ─────────────────────────────────────────────
+
+  function scheduleToolBlockUpdate(chatId: string, toolName: string, description?: string): void {
+    const previous = toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
+    const operation = previous
+      .catch(() => {})
+      .then(async () => {
+        if (!matrixClient) return;
+        const state = toolBlockStateByChatId.get(chatId);
+        const newGroups = upsertToolCallGroup(state?.groups ?? [], toolName, description);
+        const text = renderToolBlock(newGroups);
+
+        if (!state) {
+          // Send new message
+          const eventId = await matrixClient.sendMessage(chatId, {
+            msgtype: "m.text",
+            body: text,
+          });
+          toolBlockStateByChatId.set(chatId, { messageId: String(eventId), groups: newGroups });
+        } else {
+          // Edit via m.relates_to / m.replace
+          await matrixClient.sendMessage(chatId, {
+            msgtype: "m.text",
+            body: `* ${text}`,
+            "m.new_content": { msgtype: "m.text", body: text },
+            "m.relates_to": {
+              rel_type: "m.replace",
+              event_id: state.messageId,
+            },
+          });
+          toolBlockStateByChatId.set(chatId, { messageId: state.messageId, groups: newGroups });
+        }
+      })
+      .catch((error) => {
+        console.warn(
+          `[Matrix] Failed to update tool block for ${chatId}:`,
+          error instanceof Error ? error.message : error,
+        );
+      })
+      .finally(() => {
+        if (toolBlockOperationByChatId.get(chatId) === operation) {
+          toolBlockOperationByChatId.delete(chatId);
+        }
+      });
+    toolBlockOperationByChatId.set(chatId, operation);
+  }
 
   async function createClient(): Promise<MatrixClientLike> {
     const {
@@ -279,6 +406,22 @@ export function createMatrixAdapter(
     },
 
     async stop(): Promise<void> {
+      // Clean up typing intervals
+      for (const [chatId, timer] of typingIntervalByChatId) {
+        clearInterval(timer);
+        if (matrixClient) {
+          await matrixClient.sendTyping(chatId, false).catch(() => {});
+        }
+      }
+      typingIntervalByChatId.clear();
+      for (const state of streamStates.values()) {
+        if (state.pendingTimer) clearTimeout(state.pendingTimer);
+        if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
+      }
+      streamStates.clear();
+      toolBlockStateByChatId.clear();
+      toolBlockOperationByChatId.clear();
+
       await matrixClient?.stop();
       running = false;
     },
@@ -345,6 +488,23 @@ export function createMatrixAdapter(
         content["m.relates_to"] = {
           "m.in_reply_to": { event_id: msg.replyToMessageId },
         };
+      }
+
+      const streamState = streamStates.get(msg.chatId);
+      if (streamState) {
+        if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
+        if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
+        streamStates.delete(msg.chatId);
+        // replyToMessageId cannot be applied to an edit; the initial stream post serves as the reply anchor
+        await client.sendEvent(msg.chatId, "m.room.message", {
+          "m.new_content": content,
+          "m.relates_to": {
+            rel_type: "m.replace",
+            event_id: streamState.messageId,
+          },
+          body: msg.text,
+        });
+        return { messageId: streamState.messageId };
       }
 
       const eventId = await client.sendMessage(msg.chatId, content);
@@ -418,6 +578,106 @@ export function createMatrixAdapter(
         sentReactionEventIds,
         awaitingFreeform: false,
       });
+    },
+
+    async handleStreamText(
+      accumulatedText: string,
+      sources: ChannelTurnSource[],
+    ): Promise<void> {
+      if (!running || !matrixClient) return;
+
+      for (const source of sources) {
+        const roomId = source.chatId;
+        const existing = streamStates.get(roomId);
+
+        if (!existing) {
+          await stopTypingInterval(roomId);
+          try {
+            const eventId = await matrixClient.sendMessage(roomId, {
+              msgtype: "m.text",
+              body: accumulatedText,
+            });
+            streamStates.set(roomId, {
+              messageId: String(eventId),
+              lastText: accumulatedText,
+              lastEditAt: Date.now(),
+              pendingTimer: null,
+              currentInterval: MATRIX_STREAM_INTERVAL_MS,
+              cleanupTimeout: null,
+            });
+          } catch (error) {
+            console.error(
+              "[Matrix] Initial stream post failed:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+          continue;
+        }
+
+        existing.lastText = accumulatedText;
+        const elapsed = Date.now() - existing.lastEditAt;
+
+        if (elapsed >= existing.currentInterval) {
+          if (existing.pendingTimer) {
+            clearTimeout(existing.pendingTimer);
+            existing.pendingTimer = null;
+          }
+          void editStreamMessage(roomId, accumulatedText);
+        } else {
+          if (existing.pendingTimer) clearTimeout(existing.pendingTimer);
+          existing.pendingTimer = setTimeout(() => {
+            existing.pendingTimer = null;
+            void editStreamMessage(roomId, existing.lastText);
+          }, existing.currentInterval - elapsed);
+        }
+      }
+    },
+
+    async handleTurnLifecycleEvent(event: ChannelTurnLifecycleEvent): Promise<void> {
+      if (!running) return;
+
+      if (event.type === "queued") {
+        startTypingInterval(event.source.chatId);
+        return;
+      }
+
+      if (event.type === "processing") {
+        for (const source of event.sources) {
+          startTypingInterval(source.chatId);
+        }
+        return;
+      }
+
+      if (event.type === "tool_call") {
+        if (event.toolName === "MessageChannel") return;
+        for (const source of event.sources) {
+          scheduleToolBlockUpdate(source.chatId, event.toolName, event.description);
+        }
+        return;
+      }
+
+      // "finished"
+      for (const source of event.sources) {
+        await stopTypingInterval(source.chatId);
+
+        const streamState = streamStates.get(source.chatId);
+        if (streamState) {
+          if (streamState.pendingTimer) {
+            clearTimeout(streamState.pendingTimer);
+            streamState.pendingTimer = null;
+          }
+          void editStreamMessage(source.chatId, streamState.lastText);
+          streamState.cleanupTimeout = setTimeout(() => {
+            streamStates.delete(source.chatId);
+          }, 10_000);
+          streamState.currentInterval = MATRIX_STREAM_INTERVAL_MS;
+        }
+
+        const pending = toolBlockOperationByChatId.get(source.chatId);
+        if (pending) await pending.catch(() => {});
+        toolBlockStateByChatId.delete(source.chatId);
+        toolBlockOperationByChatId.delete(source.chatId);
+      }
     },
 
     onMessage: undefined,
