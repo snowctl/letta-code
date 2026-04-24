@@ -1169,3 +1169,118 @@ test("Matrix tool block: cleared on finished", async () => {
   const secondCreate = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
   expect(secondCreate[1]["m.relates_to"]).toBeUndefined();
 });
+
+// ── Reasoning display tests ───────────────────────────────────────────────────
+
+test("matrix adapter sends reasoning drawer and combines with answer in single message", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // First reasoning chunk — adapter sends initial "Thinking..." message
+  await adapter.handleStreamReasoning!("I need to search for this.", [source]);
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, initialContent] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  const ic = initialContent as Record<string, unknown>;
+  expect(ic.formatted_body as string).toContain("<details><summary>Thinking...</summary>");
+
+  // Second chunk (accumulates in buffer)
+  await adapter.handleStreamReasoning!(" Found 3 results.", [source]);
+
+  client.sendMessage.mockClear();
+
+  // Answer arrives — should edit the reasoning message (m.replace), not send a new one
+  const result = await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Here are the results.",
+    parseMode: "HTML",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, finalContent] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  const fc = finalContent as Record<string, unknown>;
+
+  // Must be an m.replace edit targeting the original message
+  expect(fc["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$fake-event-id",
+  });
+
+  const newContent = fc["m.new_content"] as Record<string, unknown>;
+  const html = newContent.formatted_body as string;
+  expect(html).toContain("<details><summary>Thinking</summary>");
+  expect(html).not.toContain("Thinking...");
+  expect(html).toContain("<hr>");
+  expect(html).toContain("Here are the results.");
+  expect(html).toContain("I need to search for this.");
+
+  // Return value should be the original reasoning message ID
+  expect(result.messageId).toBe("$fake-event-id");
+
+  await adapter.stop();
+});
+
+test("matrix adapter sends message normally when no reasoning was received", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Hello.",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  // No m.relates_to means it's a normal new message, not an edit
+  expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+
+  await adapter.stop();
+});
+
+test("matrix adapter skips reasoning drawer when showReasoning is false", async () => {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  const adapter = createMatrixAdapter({ ...TEST_ACCOUNT, showReasoning: false });
+  await adapter.start();
+  const client = getFakeClient();
+
+  await adapter.handleStreamReasoning!("thinking...", [
+    {
+      channel: "matrix" as const,
+      accountId: "acc1",
+      chatId: "!room1:example.com",
+      agentId: "agent1",
+      conversationId: "conv1",
+    },
+  ]);
+
+  // No "Thinking..." message sent
+  expect(client.sendMessage).not.toHaveBeenCalled();
+
+  // Answer arrives as a normal message (no m.replace)
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Hello.",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+
+  await adapter.stop();
+});
