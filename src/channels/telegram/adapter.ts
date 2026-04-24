@@ -6,7 +6,14 @@
 
 import type { ReactionType, ReactionTypeEmoji } from "@grammyjs/types";
 import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
+import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
+import { getClient } from "../../agent/client";
 import { formatChannelControlRequestPrompt } from "../interactive";
+import {
+  handleOperatorCommand,
+  type OperatorCommandContext,
+} from "../operator-commands";
+import { getChannelRegistry } from "../registry";
 import {
   renderToolBlock,
   type ToolCallGroup,
@@ -224,6 +231,7 @@ export function createTelegramAdapter(
     string,
     ReturnType<typeof setInterval>
   >();
+  const convListCache = new Map<string, Conversation[]>();
 
   interface ToolBlockState {
     messageId: number;
@@ -322,6 +330,45 @@ export function createTelegramAdapter(
       botModule = await loadGrammyModule();
     }
     return botModule;
+  }
+
+  async function dispatchOperatorCommand(
+    command: string,
+    args: string[],
+    chatId: string,
+  ): Promise<string> {
+    const registry = getChannelRegistry();
+    const route = registry?.getRoute("telegram", chatId, config.accountId);
+    if (!route) return "This chat is not connected to an agent.";
+    const client = await getClient();
+    const opCtx: OperatorCommandContext = {
+      agentId: route.agentId,
+      chatId,
+      commandPrefix: "/",
+      client,
+      getCurrentConvId: () =>
+        getChannelRegistry()?.getRoute("telegram", chatId, config.accountId)
+          ?.conversationId ?? "default",
+      setCurrentConvId: async (id) => {
+        getChannelRegistry()?.updateRouteConversation(
+          "telegram",
+          chatId,
+          config.accountId,
+          id,
+        );
+      },
+      requestCancel: () =>
+        registry?.cancelActiveRun(route.agentId, route.conversationId) ?? false,
+      getConvListCache: () => convListCache.get(chatId) ?? null,
+      setConvListCache: (list) => {
+        if (list === null) {
+          convListCache.delete(chatId);
+        } else {
+          convListCache.set(chatId, list);
+        }
+      },
+    };
+    return handleOperatorCommand(command, args, opCtx);
   }
 
   async function emitInboundMessages(
@@ -591,7 +638,9 @@ export function createTelegramAdapter(
         const messageId = query.message?.message_id;
         await instance.api
           .sendMessage(chatId, reasoning, {
-            ...(messageId ? { reply_parameters: { message_id: messageId } } : {}),
+            ...(messageId
+              ? { reply_parameters: { message_id: messageId } }
+              : {}),
           })
           .catch((error) => {
             console.error(
@@ -689,6 +738,27 @@ export function createTelegramAdapter(
           "Status: Running\n" +
           `DM Policy: ${config.dmPolicy}`,
       );
+    });
+
+    instance.command("cancel", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("cancel", [], chatId));
+    });
+
+    instance.command("compact", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("compact", [], chatId));
+    });
+
+    instance.command("recompile", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("recompile", [], chatId));
+    });
+
+    instance.command("conv", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const args = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
+      await ctx.reply(await dispatchOperatorCommand("conv", args, chatId));
     });
 
     bot = instance;

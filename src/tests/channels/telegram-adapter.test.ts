@@ -81,8 +81,28 @@ class FakeBot {
     return this;
   }
 
-  command(_command: string, _handler: FakeHandler): this {
+  readonly commandHandlers = new Map<string, FakeHandler[]>();
+
+  command(commandName: string, handler: FakeHandler): this {
+    const existing = this.commandHandlers.get(commandName) ?? [];
+    existing.push(handler);
+    this.commandHandlers.set(commandName, existing);
     return this;
+  }
+
+  async fireCommand(
+    commandName: string,
+    chatId: string | number,
+    matchText = "",
+  ): Promise<void> {
+    const handlers = this.commandHandlers.get(commandName) ?? [];
+    for (const handler of handlers) {
+      await handler({
+        chat: { id: chatId },
+        match: matchText,
+        reply: mock(async (text: string) => ({ message_id: 999, text })),
+      });
+    }
   }
 
   async init(): Promise<void> {}
@@ -119,6 +139,21 @@ mock.module("../../channels/telegram/runtime", () => ({
     Bot: FakeBot,
     InputFile: FakeInputFile,
   }),
+}));
+
+// Default stub — operator command tests override this per-test via mock.module()
+mock.module("../../agent/client", () => ({
+  getClient: async () => ({}),
+}));
+
+// Default stub — operator command tests override this per-test via mock.module()
+mock.module("../../channels/registry", () => ({
+  getChannelRegistry: () => null,
+}));
+
+// Stub for operator-commands transitive dep
+mock.module("../../agent/modify", () => ({
+  recompileAgentSystemPrompt: async () => "ok",
 }));
 
 const { createTelegramAdapter } = await import(
@@ -1305,9 +1340,15 @@ test("typing indicator: idempotent — second queued for same chat does not doub
   await adapter.start();
   const bot = FakeBot.instances.at(-1)!;
 
-  await adapter.handleTurnLifecycleEvent!({ type: "queued", source: LIFECYCLE_SOURCE });
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: LIFECYCLE_SOURCE,
+  });
   const callsAfterFirst = bot.api.sendChatAction.mock.calls.length;
-  await adapter.handleTurnLifecycleEvent!({ type: "queued", source: LIFECYCLE_SOURCE });
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: LIFECYCLE_SOURCE,
+  });
 
   expect(bot.api.sendChatAction.mock.calls.length).toBe(callsAfterFirst);
   await adapter.stop();
@@ -1345,7 +1386,10 @@ test("tool block: first tool_call sends a new message", async () => {
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
-  const [chatId, text] = bot.api.sendMessage.mock.calls[0]! as unknown as [string, string];
+  const [chatId, text] = bot.api.sendMessage.mock.calls[0]! as unknown as [
+    string,
+    string,
+  ];
   expect(chatId).toBe("chat-42");
   expect(text).toBe("🔧 Tools used:\n• read_file");
   await adapter.stop();
@@ -1374,7 +1418,8 @@ test("tool block: second tool_call edits the existing message", async () => {
 
   expect(bot.api.sendMessage).toHaveBeenCalledTimes(1); // no second send
   expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
-  const [chatId, _msgId, text] = bot.api.editMessageText.mock.calls[0]! as unknown as [string, number, string];
+  const [chatId, _msgId, text] = bot.api.editMessageText.mock
+    .calls[0]! as unknown as [string, number, string];
   expect(chatId).toBe("chat-42");
   expect(text).toBe("🔧 Tools used:\n• read_file ×2");
   await adapter.stop();
@@ -1403,7 +1448,8 @@ test("tool block: tool with description grouped correctly", async () => {
   // Wait for async operations to complete
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  const [, _msgId, text] = bot.api.editMessageText.mock.calls[0]! as unknown as [string, number, string];
+  const [, _msgId, text] = bot.api.editMessageText.mock
+    .calls[0]! as unknown as [string, number, string];
   expect(text).toBe("🔧 Tools used:\n• bash — Run tests ×2");
   await adapter.stop();
 });
@@ -1522,7 +1568,9 @@ test("telegram adapter appends Show reasoning button when reasoning was received
   };
   expect(keyboard.inline_keyboard[0]?.[0]?.text).toBe("🧠 Show reasoning");
 
-  const callbackData = JSON.parse(keyboard.inline_keyboard[0]![0]!.callback_data) as {
+  const callbackData = JSON.parse(
+    keyboard.inline_keyboard[0]![0]!.callback_data,
+  ) as {
     k: string;
     a: string;
   };
@@ -1585,7 +1633,10 @@ test("telegram adapter sends reasoning as reply when Show reasoning button is ta
   });
 
   expect(bot?.api.sendMessage).toHaveBeenCalledTimes(1);
-  const [chatId, text] = bot!.api.sendMessage.mock.calls[0] as unknown as [string, string];
+  const [chatId, text] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+  ];
   expect(chatId).toBe("42");
   expect(text).toBe("My reasoning.");
   expect(bot?.api.answerCallbackQuery).toHaveBeenCalledWith("cq1");
@@ -1662,4 +1713,181 @@ test("telegram adapter skips reasoning button when showReasoning is false", asyn
   expect((opts ?? {}).reply_markup).toBeUndefined();
 
   await adapter.stop();
+});
+
+// ── Operator command tests ────────────────────────────────────────────────────
+
+test("telegram adapter /cancel replies Cancelled. when run is active", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({ agentId: "agent-1", conversationId: "conv-1" }),
+      cancelActiveRun: () => true,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1", agent_id: "agent-1" }),
+        fork: async () => ({ id: "cf", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-42" },
+    match: "",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("cancel") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toBe("Cancelled.");
+});
+
+test("telegram adapter /cancel replies No active run. when no run", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({ agentId: "agent-1", conversationId: "conv-1" }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-43" },
+    match: "",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("cancel") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toBe("No active run.");
+});
+
+test("telegram adapter /conv list replies with numbered list", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({ agentId: "agent-1", conversationId: "default" }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-44" },
+    match: "list",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("conv") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toContain("1. default (current)");
+});
+
+test("telegram adapter replies to unconnected chat with error message", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => null,
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({}),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-45" },
+    match: "",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("cancel") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toContain("not connected");
 });
