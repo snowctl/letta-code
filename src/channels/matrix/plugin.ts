@@ -10,6 +10,7 @@ export const matrixChannelPlugin: ChannelPlugin = {
     displayName: "Matrix",
     runtimePackages: ["matrix-bot-sdk@0.8.0"],
     runtimeModules: ["matrix-bot-sdk"],
+    runtimeTrustedDependencies: ["@matrix-org/matrix-sdk-crypto-nodejs"],
   },
   createAdapter(account: ChannelAccount) {
     return createMatrixAdapter(account as MatrixChannelAccount);

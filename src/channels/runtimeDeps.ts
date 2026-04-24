@@ -138,11 +138,18 @@ async function writeChannelRuntimeManifest(
   const runtimeDir = getChannelRuntimeDir(channelId);
   await mkdir(runtimeDir, { recursive: true });
 
-  const manifest = {
+  const spec = getChannelPluginMetadata(channelId);
+  const manifest: Record<string, unknown> = {
     name: `letta-channel-runtime-${channelId}`,
     private: true,
     description: `Runtime dependencies for Letta Code ${channelId} channel support`,
   };
+  if (
+    spec.runtimeTrustedDependencies &&
+    spec.runtimeTrustedDependencies.length > 0
+  ) {
+    manifest.trustedDependencies = [...spec.runtimeTrustedDependencies];
+  }
 
   await writeFile(
     getChannelRuntimePackagePath(channelId),

@@ -11,6 +11,14 @@ export interface ChannelPluginMetadata {
   displayName: string;
   runtimePackages: string[];
   runtimeModules: string[];
+  /**
+   * Packages (top-level or transitive) whose install scripts must run during
+   * channel runtime install. Written into the generated runtime manifest as
+   * `trustedDependencies` so bun will execute their postinstall hooks — needed
+   * for packages that download native binaries on install
+   * (e.g. `@matrix-org/matrix-sdk-crypto-nodejs`'s `download-lib.js`).
+   */
+  runtimeTrustedDependencies?: readonly string[];
 }
 
 export type ChannelMessageActionName = "send" | "react" | "upload-file";

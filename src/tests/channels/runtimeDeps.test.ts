@@ -140,6 +140,7 @@ test("installChannelRuntime writes a manifest and invokes npm in the runtime dir
   ) as {
     name: string;
     private: boolean;
+    trustedDependencies?: string[];
   };
 
   expect(manifest).toEqual(
@@ -148,12 +149,42 @@ test("installChannelRuntime writes a manifest and invokes npm in the runtime dir
       private: true,
     }),
   );
+  // Telegram has no native deps — trustedDependencies should be omitted.
+  expect(manifest.trustedDependencies).toBeUndefined();
   expect(spawnCalls).toEqual([
     {
       cmd: "npm",
       args: ["install", "--no-save", "grammy@1.42.0"],
       cwd: getChannelRuntimeDir("telegram"),
     },
+  ]);
+});
+
+test("installChannelRuntime writes trustedDependencies for channels with native runtime deps", async () => {
+  const spawnImpl = mock(() => {
+    const proc = new EventEmitter();
+    queueMicrotask(() => {
+      proc.emit("exit", 0);
+    });
+    return proc as unknown as ReturnType<typeof mock>;
+  });
+
+  __testOverrideChannelRuntimeDeps({
+    runtimeRoot,
+    spawnImpl: spawnImpl as never,
+    packageManager: "bun",
+  });
+
+  await installChannelRuntime("matrix");
+
+  const manifest = JSON.parse(
+    readFileSync(getChannelRuntimePackagePath("matrix"), "utf-8"),
+  ) as {
+    trustedDependencies?: string[];
+  };
+
+  expect(manifest.trustedDependencies).toEqual([
+    "@matrix-org/matrix-sdk-crypto-nodejs",
   ]);
 });
 

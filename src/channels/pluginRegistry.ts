@@ -53,6 +53,7 @@ const CHANNEL_PLUGIN_REGISTRATIONS: Record<
       displayName: "Matrix",
       runtimePackages: ["matrix-bot-sdk@0.8.0"],
       runtimeModules: ["matrix-bot-sdk"],
+      runtimeTrustedDependencies: ["@matrix-org/matrix-sdk-crypto-nodejs"],
     },
     load: async () => {
       const { matrixChannelPlugin } = await import("./matrix/plugin");
