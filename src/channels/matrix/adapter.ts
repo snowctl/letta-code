@@ -250,10 +250,19 @@ export function createMatrixAdapter(
     let cryptoProvider: unknown;
     if (e2ee) {
       try {
-        cryptoProvider = new RustSdkCryptoStorageProvider(
-          cryptoPath,
-          RustSdkCryptoStoreType.Sled,
-        );
+        // matrix-bot-sdk@0.8.0's JS doesn't re-export RustSdkCryptoStoreType
+        // (only the .d.ts does), so it arrives as undefined. Fall back to
+        // whichever numeric store value is available: Sled (older API) or
+        // Sqlite (renamed in @matrix-org/matrix-sdk-crypto-nodejs ≥ 0.3).
+        const storeValue = RustSdkCryptoStoreType?.Sled ?? RustSdkCryptoStoreType?.Sqlite;
+        if (storeValue === undefined) {
+          throw new Error(
+            RustSdkCryptoStoreType
+              ? `No compatible store type in RustSdkCryptoStoreType (keys: ${Object.keys(RustSdkCryptoStoreType).join(", ")})`
+              : "RustSdkCryptoStoreType not exported by installed matrix-bot-sdk",
+          );
+        }
+        cryptoProvider = new RustSdkCryptoStorageProvider(cryptoPath, storeValue);
       } catch (err) {
         console.warn(
           "[matrix] E2EE unavailable (Rust crypto addon failed to load); running unencrypted:",

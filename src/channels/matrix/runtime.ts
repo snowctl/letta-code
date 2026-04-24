@@ -14,7 +14,7 @@ export interface MatrixBotSdkLike {
     path: string,
     storeType: unknown,
   ) => unknown;
-  RustSdkCryptoStoreType: { Sled: string };
+  RustSdkCryptoStoreType: { Sled?: string | number; Sqlite?: number } | undefined;
 }
 
 export async function loadMatrixBotSdkModule(): Promise<MatrixBotSdkLike> {
