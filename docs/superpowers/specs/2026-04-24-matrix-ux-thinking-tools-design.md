@@ -37,7 +37,7 @@ As reasoning chunks arrive, the thinking message is updated in place via `m.repl
 Delete the thinking message silently. The tool block (if any) remains in the room.
 
 **State management:**  
-Reuses the existing `reasoningMessageIdByChatId` and `reasoningBufferByChatId` maps. Adds a flag or sentinel to distinguish "placeholder sent, no content yet" from "content has been accumulated" so the response handler knows whether to embed a thinking drawer.
+Reuses the existing `reasoningMessageIdByChatId` and `reasoningBufferByChatId` maps. Whether to embed a thinking drawer is determined by checking if `reasoningBufferByChatId` has non-empty content — no new flag needed. If the response arrives while the thinking message send is still in-flight (`messageId === "__pending__"`), the handler waits briefly (polls until resolved or times out at ~2s) before attempting deletion, then falls back to sending the response as plain text if deletion cannot be confirmed.
 
 ### 2. Tool Block Ordering Guarantee
 
