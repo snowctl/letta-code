@@ -921,7 +921,6 @@ export function createTelegramAdapter(
       if (pendingReasoning) {
         const key = (callbackKeyCounter++).toString(36);
         reasoningByKey.set(key, pendingReasoning);
-        pendingReasoningByChatId.delete(msg.chatId);
         opts.reply_markup = {
           inline_keyboard: [
             [
