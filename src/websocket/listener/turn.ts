@@ -648,6 +648,12 @@ export async function handleIncomingMessage(
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      if (accumulatedChannelText !== "") {
+        // This is a retry — clear adapter stream states so the next segment posts fresh
+        if (channelSources && channelSources.length > 0) {
+          void getChannelRegistry()?.dispatchStreamReset(channelSources);
+        }
+      }
       accumulatedChannelText = "";
       runIdSent = false;
       let latestErrorText: string | null = null;
@@ -710,6 +716,7 @@ export async function handleIncomingMessage(
                 },
               );
 
+              // normalizeToolReturnWireMessage is a pass-through for assistant_message chunks
               const textChunk = extractAssistantText(normalizedChunk);
               if (textChunk) {
                 accumulatedChannelText += textChunk;

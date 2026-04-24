@@ -291,8 +291,12 @@ export function createTelegramAdapter(
           state.pendingTimer = null;
           void editStreamMessage(chatId, state.lastText);
         }, delay);
+      } else {
+        console.warn(
+          "[Telegram] Edit message failed (non-rate-limit):",
+          error instanceof Error ? error.message : error,
+        );
       }
-      // other errors: silently drop (streaming edit failures are non-fatal)
     }
   }
 
@@ -827,6 +831,17 @@ export function createTelegramAdapter(
             existing.pendingTimer = null;
             void editStreamMessage(chatId, existing.lastText);
           }, existing.currentInterval - elapsed);
+        }
+      }
+    },
+
+    async handleStreamReset(sources: ChannelTurnSource[]): Promise<void> {
+      for (const source of sources) {
+        const state = streamStates.get(source.chatId);
+        if (state) {
+          if (state.pendingTimer) clearTimeout(state.pendingTimer);
+          if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
+          streamStates.delete(source.chatId);
         }
       }
     },

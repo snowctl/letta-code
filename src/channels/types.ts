@@ -175,6 +175,13 @@ export interface ChannelAdapter {
   ): Promise<void>;
 
   /**
+   * Optional hook called when the turn loop retries mid-turn (e.g. after a
+   * tool approval). Adapters should clear any in-progress stream state so
+   * the next segment posts a fresh message rather than editing the old one.
+   */
+  handleStreamReset?(sources: ChannelTurnSource[]): Promise<void>;
+
+  /**
    * Called by the registry when the adapter receives an inbound message.
    * Set by ChannelRegistry during initialization.
    */

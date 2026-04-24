@@ -644,6 +644,18 @@ export function createMatrixAdapter(
       }
     },
 
+    async handleStreamReset(sources: ChannelTurnSource[]): Promise<void> {
+      for (const source of sources) {
+        const roomId = source.chatId;
+        const state = streamStates.get(roomId);
+        if (state) {
+          if (state.pendingTimer) clearTimeout(state.pendingTimer);
+          if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
+          streamStates.delete(roomId);
+        }
+      }
+    },
+
     async handleTurnLifecycleEvent(event: ChannelTurnLifecycleEvent): Promise<void> {
       if (!running) return;
 

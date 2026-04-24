@@ -393,6 +393,46 @@ export class ChannelRegistry {
     }
   }
 
+  async dispatchStreamReset(sources: ChannelTurnSource[]): Promise<void> {
+    const groups = new Map<
+      string,
+      { adapter: ChannelAdapter; sources: ChannelTurnSource[] }
+    >();
+
+    for (const source of sources) {
+      const adapter = this.getAdapter(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      if (!adapter?.handleStreamReset) {
+        continue;
+      }
+      const groupKey = this.getAdapterKey(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      const existing = groups.get(groupKey);
+      if (existing) {
+        existing.sources.push(source);
+        continue;
+      }
+      groups.set(groupKey, { adapter, sources: [source] });
+    }
+
+    for (const { adapter, sources: groupedSources } of groups.values()) {
+      const { handleStreamReset } = adapter;
+      if (!handleStreamReset) continue;
+      try {
+        await handleStreamReset(groupedSources);
+      } catch (error) {
+        console.error(
+          `[Channels] Failed to dispatch stream reset for ${adapter.channelId ?? adapter.id}/${adapter.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
   // ── Readiness / ingress handler ───────────────────────────────
 
   /**
