@@ -1588,6 +1588,7 @@ test("telegram adapter sends reasoning as reply when Show reasoning button is ta
   const [chatId, text] = bot!.api.sendMessage.mock.calls[0] as unknown as [string, string];
   expect(chatId).toBe("42");
   expect(text).toBe("My reasoning.");
+  expect(bot?.api.answerCallbackQuery).toHaveBeenCalledWith("cq1");
 
   await adapter.stop();
 });
