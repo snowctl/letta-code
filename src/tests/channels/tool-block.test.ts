@@ -12,21 +12,19 @@ test("renderToolBlock: empty groups returns empty string", () => {
 
 test("renderToolBlock: single tool no description", () => {
   const groups: ToolCallGroup[] = [{ key: "bash", label: "bash", count: 1 }];
-  expect(renderToolBlock(groups)).toBe("🔧 Tools used:\n• bash");
+  expect(renderToolBlock(groups)).toBe("🔧 Tools used:\nbash");
 });
 
 test("renderToolBlock: single tool count > 1", () => {
-  const groups: ToolCallGroup[] = [
-    { key: "bash", label: "bash", count: 3 },
-  ];
-  expect(renderToolBlock(groups)).toBe("🔧 Tools used:\n• bash ×3");
+  const groups: ToolCallGroup[] = [{ key: "bash", label: "bash", count: 3 }];
+  expect(renderToolBlock(groups)).toBe("🔧 Tools used:\nbash (x3)");
 });
 
 test("renderToolBlock: tool with description", () => {
   const groups: ToolCallGroup[] = [
     { key: "bash\0Run tests", label: "bash — Run tests", count: 2 },
   ];
-  expect(renderToolBlock(groups)).toBe("🔧 Tools used:\n• bash — Run tests ×2");
+  expect(renderToolBlock(groups)).toBe("🔧 Tools used:\nbash — Run tests (x2)");
 });
 
 test("renderToolBlock: multiple tools preserves order", () => {
@@ -36,7 +34,7 @@ test("renderToolBlock: multiple tools preserves order", () => {
     { key: "glob", label: "glob", count: 2 },
   ];
   expect(renderToolBlock(groups)).toBe(
-    "🔧 Tools used:\n• read_file ×4\n• bash — Run tests\n• glob ×2",
+    "🔧 Tools used:\nread_file (x4)\nbash — Run tests\nglob (x2)",
   );
 });
 
