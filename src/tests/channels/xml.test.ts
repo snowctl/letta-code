@@ -2,79 +2,158 @@ import { describe, expect, test } from "bun:test";
 import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import type { InboundChannelMessage } from "../../channels/types";
 import {
-  buildChannelNotificationXml,
+  buildChannelMessageBody,
   buildChannelReminderText,
   formatChannelNotification,
 } from "../../channels/xml";
 
 function expectTextParts(
   content: MessageCreate["content"],
-): [{ type: "text"; text: string }, { type: "text"; text: string }] {
+  expectedCount: number,
+): Array<{ type: "text"; text: string }> {
   expect(Array.isArray(content)).toBe(true);
   const parts = content as Array<{ type: "text"; text: string }>;
-  expect(parts).toHaveLength(2);
-
-  const [reminderPart, notificationPart] = parts;
-  if (!reminderPart || !notificationPart) {
-    throw new Error("Expected reminder and notification text parts");
-  }
-
-  return [reminderPart, notificationPart];
+  expect(parts.length).toBe(expectedCount);
+  return parts;
 }
 
+const FIXED_TS = Date.parse("2026-04-25T12:27:01Z");
+
 describe("formatChannelNotification", () => {
-  test("formats structured content parts with reminder first and xml second", () => {
+  test("emits reminder + bare body, with the user's text outside any XML wrapper", () => {
     const msg: InboundChannelMessage = {
       channel: "telegram",
       chatId: "12345",
       senderId: "67890",
       senderName: "John",
       text: "Hello from Telegram!",
-      timestamp: Date.now(),
+      timestamp: FIXED_TS,
       messageId: "msg-42",
     };
 
     const content = formatChannelNotification(msg);
-    const [reminderPart, notificationPart] = expectTextParts(content);
+    const [reminderPart, bodyPart] = expectTextParts(content, 2);
 
-    expect(reminderPart.text).toContain("<system-reminder>");
-    expect(notificationPart.text).toContain("<channel-notification");
-    expect(notificationPart.text).toContain('source="telegram"');
-    expect(notificationPart.text).toContain('chat_id="12345"');
-    expect(notificationPart.text).toContain('sender_id="67890"');
-    expect(notificationPart.text).toContain('sender_name="John"');
-    expect(notificationPart.text).toContain('message_id="msg-42"');
-    expect(notificationPart.text).toContain("Hello from Telegram!");
-    expect(notificationPart.text).toContain("</channel-notification>");
+    expect(reminderPart!.text).toContain("<system-reminder>");
+    expect(reminderPart!.text).toContain("</system-reminder>");
+    expect(reminderPart!.text).toContain("## Message Metadata");
+    expect(reminderPart!.text).toContain("- **Channel**: telegram");
+    expect(reminderPart!.text).toContain("- **Chat ID**: 12345");
+    expect(reminderPart!.text).toContain("- **Sender**: John (67890)");
+    expect(reminderPart!.text).toContain("- **Message ID**: msg-42");
+
+    // The body part is the user's text *outside* any XML — no
+    // <channel-notification> wrapping, no nested envelope.
+    expect(bodyPart!.text).toBe("Hello from Telegram!");
+    expect(bodyPart!.text).not.toContain("<channel-notification");
   });
 
-  test("builds a reminder part describing reply semantics", () => {
+  test("renders sectioned markdown with metadata, chat context, and response directives", () => {
     const msg: InboundChannelMessage = {
-      channel: "telegram",
-      chatId: "12345",
-      senderId: "67890",
+      channel: "matrix",
+      chatId: "!room:server",
+      senderId: "@alice:server",
+      senderName: "Alice",
       text: "ping",
-      timestamp: Date.now(),
+      timestamp: FIXED_TS,
     };
-
     const reminder = buildChannelReminderText(msg);
 
-    expect(reminder).toContain("<system-reminder>");
-    expect(reminder).toContain("must call the MessageChannel tool");
-    expect(reminder).toContain(
-      'Use action="send", channel="telegram", and chat_id="12345"',
-    );
-    expect(reminder).toContain('action="react"');
-    expect(reminder).toContain("Current local time on this device:");
+    expect(reminder).toContain("## Message Metadata");
+    expect(reminder).toContain("## Chat Context");
+    expect(reminder).toContain("## Response Directives");
+    expect(reminder).toContain("- **Type**: Direct message");
   });
 
-  test("mentions toolset-dependent local file/image inspection for attachment paths", () => {
+  test("Received at field uses the message timestamp, not wall-clock — same input produces same envelope", () => {
+    const msg: InboundChannelMessage = {
+      channel: "matrix",
+      chatId: "!room:server",
+      senderId: "@alice:server",
+      text: "ping",
+      timestamp: FIXED_TS,
+    };
+    const a = buildChannelReminderText(msg);
+    // Sleep is unnecessary — we just rebuild from the same input. The point
+    // of the assertion: nothing in the reminder depends on Date.now().
+    const b = buildChannelReminderText(msg);
+    expect(a).toBe(b);
+    expect(a).toContain("2026-04-25T12:27:01.000Z");
+  });
+
+  test("response directives include text reply, react, remove-react, stay-silent, and replyTo", () => {
+    const msg: InboundChannelMessage = {
+      channel: "matrix",
+      chatId: "!room:server",
+      senderId: "@alice:server",
+      text: "ping",
+      timestamp: FIXED_TS,
+    };
+    const reminder = buildChannelReminderText(msg);
+
+    expect(reminder).toContain("**Reply with text**");
+    expect(reminder).toContain('action="send"');
+    expect(reminder).toContain("**React without text**");
+    expect(reminder).toContain('action="react"');
+    expect(reminder).toContain("**Remove a reaction**");
+    expect(reminder).toContain("**Stay silent**");
+    expect(reminder).toContain("silence is silence");
+    expect(reminder).toContain("`replyTo`");
+  });
+
+  test("react directive uses unicode-emoji hint by default, name-emoji hint for slack, and custom-emoji hint for discord", () => {
+    const matrix = buildChannelReminderText({
+      channel: "matrix",
+      chatId: "!room",
+      senderId: "@a",
+      text: "x",
+      timestamp: FIXED_TS,
+    });
+    expect(matrix).toContain("a unicode emoji");
+
+    const slack = buildChannelReminderText({
+      channel: "slack",
+      chatId: "C1",
+      senderId: "U1",
+      text: "x",
+      timestamp: FIXED_TS,
+    });
+    expect(slack).toContain("a reaction name like `thumbsup` or `eyes`");
+
+    const discord = buildChannelReminderText({
+      channel: "discord",
+      chatId: "1",
+      senderId: "u1",
+      text: "x",
+      timestamp: FIXED_TS,
+    });
+    expect(discord).toContain("custom emoji syntax like `<:name:id>`");
+  });
+
+  test("Slack threading hint is added in the chat-context section for threaded channel messages", () => {
+    const msg: InboundChannelMessage = {
+      channel: "slack",
+      chatId: "C123",
+      senderId: "U123",
+      text: "ping",
+      timestamp: FIXED_TS,
+      messageId: "1712800000.000100",
+      threadId: "1712790000.000050",
+      chatType: "channel",
+    };
+    const reminder = buildChannelReminderText(msg);
+
+    expect(reminder).toContain("**Slack threading**");
+    expect(reminder).toContain("stay in this thread automatically");
+  });
+
+  test("attachments appear in chat context with kind/local_path/mime metadata, and an inspect-attachments directive is emitted", () => {
     const msg: InboundChannelMessage = {
       channel: "slack",
       chatId: "C123",
       senderId: "U123",
       text: "see image",
-      timestamp: Date.now(),
+      timestamp: FIXED_TS,
       attachments: [
         {
           kind: "image",
@@ -84,129 +163,21 @@ describe("formatChannelNotification", () => {
         },
       ],
     };
-
     const reminder = buildChannelReminderText(msg);
 
-    expect(reminder).toContain("current toolset");
-    expect(reminder).toContain("Read");
-    expect(reminder).toContain("ViewImage");
-    expect(reminder).not.toContain("ReadFileGemini");
+    expect(reminder).toContain("- **Attachment**: kind=image");
+    expect(reminder).toContain("local_path=/tmp/photo.heic");
+    expect(reminder).toContain("mime_type=image/heic");
+    expect(reminder).toContain("**Inspect attachments**");
   });
 
-  test("adds Slack thread guidance for channel notifications", () => {
-    const msg: InboundChannelMessage = {
-      channel: "slack",
-      chatId: "C123",
-      senderId: "U123",
-      text: "ping",
-      timestamp: Date.now(),
-      messageId: "1712800000.000100",
-      threadId: "1712790000.000050",
-      chatType: "channel",
-    };
-
-    const reminder = buildChannelReminderText(msg);
-
-    expect(reminder).toContain("stay in the same Slack thread automatically");
-    expect(reminder).not.toContain("reply_to_message_id");
-  });
-
-  test("escapes XML special characters in notification text without over-escaping quotes", () => {
-    const msg: InboundChannelMessage = {
-      channel: "telegram",
-      chatId: "123",
-      senderId: "456",
-      text: "Hello <world> & \"friends\" 'here'",
-      timestamp: Date.now(),
-    };
-
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).toContain("&lt;world&gt;");
-    expect(xml).toContain("&amp;");
-    expect(xml).toContain('"friends"');
-    expect(xml).toContain("'here'");
-  });
-
-  test("escapes XML special characters in notification attributes", () => {
-    const msg: InboundChannelMessage = {
-      channel: "telegram",
-      chatId: "123",
-      senderId: "456",
-      senderName: 'John "The <Bot>"',
-      text: "test",
-      timestamp: Date.now(),
-    };
-
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).toContain("John &quot;The &lt;Bot&gt;&quot;");
-  });
-
-  test("omits optional notification attributes when not present", () => {
-    const msg: InboundChannelMessage = {
-      channel: "telegram",
-      chatId: "123",
-      senderId: "456",
-      text: "simple message",
-      timestamp: Date.now(),
-    };
-
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).not.toContain("sender_name=");
-    expect(xml).not.toContain("message_id=");
-  });
-
-  test("includes Slack thread metadata in the notification xml", () => {
-    const msg: InboundChannelMessage = {
-      channel: "slack",
-      chatId: "C123",
-      senderId: "U123",
-      text: "threaded hello",
-      timestamp: Date.now(),
-      messageId: "1712800000.000100",
-      threadId: "1712790000.000050",
-      chatType: "channel",
-    };
-
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).toContain('thread_id="1712790000.000050"');
-  });
-
-  test("includes reaction metadata in the notification xml", () => {
-    const msg: InboundChannelMessage = {
-      channel: "slack",
-      chatId: "C123",
-      senderId: "U123",
-      text: "Slack reaction added: :eyes:",
-      timestamp: Date.now(),
-      messageId: "1712800001.000200",
-      threadId: "1712790000.000050",
-      chatType: "channel",
-      reaction: {
-        action: "added",
-        emoji: "eyes",
-        targetMessageId: "1712800000.000100",
-        targetSenderId: "U999",
-      },
-    };
-
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).toContain(
-      '<reaction action="added" emoji="eyes" target_message_id="1712800000.000100" target_sender_id="U999" />',
-    );
-  });
-
-  test("renders attempted_transcription child node when transcription is present", () => {
+  test("voice memo transcription is shown as a sub-bullet under the attachment line", () => {
     const msg: InboundChannelMessage = {
       channel: "telegram",
       chatId: "123",
       senderId: "456",
       text: "",
-      timestamp: Date.now(),
+      timestamp: FIXED_TS,
       attachments: [
         {
           kind: "audio",
@@ -217,78 +188,55 @@ describe("formatChannelNotification", () => {
         },
       ],
     };
+    const reminder = buildChannelReminderText(msg);
 
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).toContain(
-      "<attempted_transcription>Hello, this is a voice memo test.</attempted_transcription>",
+    expect(reminder).toContain("- **Attachment**: kind=audio");
+    expect(reminder).toContain(
+      '  - Transcription: "Hello, this is a voice memo test."',
     );
-    expect(xml).toContain("</attachment>");
-    expect(xml).not.toMatch(/<attachment[^>]*\/>/);
-    expect(xml).toMatch(/<attachment[^>]*>\n/);
   });
 
-  test("renders self-closing attachment when transcription is absent", () => {
+  test("reaction events are reported in chat context, not as bare body text", () => {
     const msg: InboundChannelMessage = {
-      channel: "telegram",
-      chatId: "123",
-      senderId: "456",
+      channel: "slack",
+      chatId: "C123",
+      senderId: "U123",
+      senderName: "Charlie",
       text: "",
-      timestamp: Date.now(),
-      attachments: [
-        {
-          kind: "audio",
-          localPath: "/tmp/voice.ogg",
-          name: "voice.ogg",
-          mimeType: "audio/ogg",
-        },
-      ],
+      timestamp: FIXED_TS,
+      messageId: "1712800001.000200",
+      threadId: "1712790000.000050",
+      chatType: "channel",
+      reaction: {
+        action: "added",
+        emoji: "eyes",
+        targetMessageId: "1712800000.000100",
+        targetSenderId: "U999",
+      },
     };
+    const content = formatChannelNotification(msg);
+    // No body part — only reminder, since text is empty and no thread context.
+    const [reminderPart] = expectTextParts(content, 1);
 
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).toMatch(/<attachment[^>]*\/>/);
-    expect(xml).not.toContain("<attempted_transcription>");
-    expect(xml).not.toContain("</attachment>");
+    expect(reminderPart!.text).toContain("**Reaction event**");
+    expect(reminderPart!.text).toContain(
+      "Charlie added `eyes` on message `1712800000.000100`",
+    );
   });
 
-  test("escapes XML in transcription text", () => {
-    const msg: InboundChannelMessage = {
-      channel: "telegram",
-      chatId: "123",
-      senderId: "456",
-      text: "",
-      timestamp: Date.now(),
-      attachments: [
-        {
-          kind: "audio",
-          localPath: "/tmp/voice.ogg",
-          transcription: "He said <hello> & goodbye",
-        },
-      ],
-    };
-
-    const xml = buildChannelNotificationXml(msg);
-
-    expect(xml).toContain("&lt;hello&gt;");
-    expect(xml).toContain("&amp;");
-    expect(xml).not.toContain("<hello>");
-  });
-
-  test("includes Slack thread starter and history context in the notification xml", () => {
+  test("thread context is rendered as a structural <thread-context> XML block in the body part, before the user text", () => {
     const msg: InboundChannelMessage = {
       channel: "slack",
       chatId: "C123",
       senderId: "U123",
       senderName: "Charles",
       text: "please help",
-      timestamp: Date.now(),
+      timestamp: FIXED_TS,
       messageId: "1712800000.000100",
       threadId: "1712790000.000050",
       chatType: "channel",
       threadContext: {
-        label:
-          "Slack thread in #random: Original question from the thread root",
+        label: "Slack thread in #random",
         starter: {
           messageId: "1712790000.000050",
           senderId: "U111",
@@ -306,31 +254,52 @@ describe("formatChannelNotification", () => {
       },
     };
 
-    const xml = buildChannelNotificationXml(msg);
+    const body = buildChannelMessageBody(msg);
 
-    expect(xml).toContain("<thread-context");
-    expect(xml).toContain(
-      'label="Slack thread in #random: Original question from the thread root"',
-    );
-    expect(xml).toContain(
+    expect(body).toContain('<thread-context label="Slack thread in #random">');
+    expect(body).toContain(
       '<thread-starter sender_id="U111" sender_name="Alice" message_id="1712790000.000050">',
     );
-    expect(xml).toContain("Original question from the thread root");
-    expect(xml).toContain("<thread-history>");
-    expect(xml).toContain(
+    expect(body).toContain("Original question from the thread root");
+    expect(body).toContain("<thread-history>");
+    expect(body).toContain(
       '<thread-message sender_id="U222" sender_name="Bob" message_id="1712795000.000060">',
     );
-    expect(xml).toContain("Some follow-up before the bot was tagged");
-    expect(xml).toContain("please help");
+    expect(body).toContain("Some follow-up before the bot was tagged");
+    // User text is the last block in the body, separated from the XML by a
+    // blank line so the model parses it as plain content.
+    expect(body.endsWith("please help")).toBe(true);
+    expect(body).toContain("</thread-context>\n\nplease help");
   });
 
-  test("emits image content parts for inbound image attachments", () => {
+  test("thread-context XML escapes special characters in entry text", () => {
+    const msg: InboundChannelMessage = {
+      channel: "slack",
+      chatId: "C123",
+      senderId: "U123",
+      text: "hi",
+      timestamp: FIXED_TS,
+      threadContext: {
+        starter: {
+          senderId: "U111",
+          text: 'He said <hello> & "goodbye"',
+        },
+      },
+    };
+    const body = buildChannelMessageBody(msg);
+    expect(body).toContain("&lt;hello&gt;");
+    expect(body).toContain("&amp;");
+    // double-quotes in element text are not escaped (only attributes are)
+    expect(body).toContain('"goodbye"');
+  });
+
+  test("emits image content parts for inbound image attachments alongside the text parts", () => {
     const msg: InboundChannelMessage = {
       channel: "slack",
       chatId: "C123",
       senderId: "U123",
       text: "See screenshot",
-      timestamp: Date.now(),
+      timestamp: FIXED_TS,
       messageId: "1712800000.000100",
       chatType: "channel",
       attachments: [
@@ -344,11 +313,9 @@ describe("formatChannelNotification", () => {
         },
       ],
     };
-
     const content = formatChannelNotification(msg);
-
     expect(content).toHaveLength(3);
-    expect(content[2]).toEqual({
+    expect((content as unknown[])[2]).toEqual({
       type: "image",
       source: {
         type: "base64",
@@ -356,5 +323,41 @@ describe("formatChannelNotification", () => {
         data: "YWJj",
       },
     });
+  });
+
+  test("reaction-only event with no thread context produces a single reminder part (no body part)", () => {
+    const msg: InboundChannelMessage = {
+      channel: "matrix",
+      chatId: "!room:server",
+      senderId: "@alice:server",
+      text: "",
+      timestamp: FIXED_TS,
+      reaction: {
+        action: "added",
+        emoji: "👍",
+        targetMessageId: "$abc",
+      },
+    };
+    const content = formatChannelNotification(msg);
+    expectTextParts(content, 1);
+  });
+
+  test("group/channel messages show Type: Group/channel and Mentioned: yes when applicable", () => {
+    const msg: InboundChannelMessage = {
+      channel: "discord",
+      chatId: "1234567890",
+      senderId: "user-1",
+      senderName: "Alice",
+      text: "@bot help",
+      timestamp: FIXED_TS,
+      chatType: "channel",
+      chatLabel: "general",
+      isMention: true,
+    };
+    const reminder = buildChannelReminderText(msg);
+
+    expect(reminder).toContain("- **Type**: Group/channel");
+    expect(reminder).toContain("- **Label**: general");
+    expect(reminder).toContain("- **Mentioned**: yes");
   });
 });

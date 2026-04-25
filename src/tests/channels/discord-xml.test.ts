@@ -1,13 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { InboundChannelMessage } from "../../channels/types";
 import {
-  buildChannelNotificationXml,
+  buildChannelMessageBody,
   buildChannelReminderText,
-  formatChannelNotification,
 } from "../../channels/xml";
 
-describe("discord xml", () => {
-  test("notification XML has source=discord", () => {
+describe("discord envelope", () => {
+  test("reminder lists Channel: discord in metadata", () => {
     const message: InboundChannelMessage = {
       channel: "discord",
       chatId: "channel-123",
@@ -17,11 +16,13 @@ describe("discord xml", () => {
       text: "hello discord",
       timestamp: Date.now(),
     };
-    const xml = buildChannelNotificationXml(message);
-    expect(xml).toContain('source="discord"');
+    const reminder = buildChannelReminderText(message);
+    expect(reminder).toContain("- **Channel**: discord");
+    expect(reminder).toContain("- **Chat ID**: channel-123");
+    expect(reminder).toContain("- **Message ID**: msg-1");
   });
 
-  test("reminder text includes discord-specific capability hints", () => {
+  test("reminder includes a react directive with discord-specific custom-emoji syntax", () => {
     const message: InboundChannelMessage = {
       channel: "discord",
       chatId: "channel-123",
@@ -32,14 +33,12 @@ describe("discord xml", () => {
       timestamp: Date.now(),
     };
     const reminder = buildChannelReminderText(message);
-    expect(reminder).toContain("discord");
-    expect(reminder.toLowerCase()).toContain("react");
-    expect(reminder).toContain("upload-file");
-    expect(reminder).toContain("native Unicode emoji");
-    expect(reminder).toContain("<:name:id>");
+    expect(reminder).toContain("**React without text**");
+    expect(reminder).toContain('action="react"');
+    expect(reminder).toContain("custom emoji syntax like `<:name:id>`");
   });
 
-  test("thread metadata appears in XML as thread_id", () => {
+  test("threadId is recorded in chat metadata", () => {
     const message: InboundChannelMessage = {
       channel: "discord",
       chatId: "channel-123",
@@ -50,12 +49,11 @@ describe("discord xml", () => {
       threadId: "thread-999",
       timestamp: Date.now(),
     };
-    const xml = buildChannelNotificationXml(message);
-    expect(xml).toContain("thread-999");
-    expect(xml).toMatch(/thread_id\s*=\s*"thread-999"/);
+    const reminder = buildChannelReminderText(message);
+    expect(reminder).toContain("- **Thread ID**: thread-999");
   });
 
-  test("thread context renders thread-context, thread-starter, thread-history", () => {
+  test("thread context renders <thread-context>/<thread-starter>/<thread-history> in the body, before the user text", () => {
     const message: InboundChannelMessage = {
       channel: "discord",
       chatId: "channel-123",
@@ -83,13 +81,14 @@ describe("discord xml", () => {
         ],
       },
     };
-    const xml = buildChannelNotificationXml(message);
-    expect(xml).toContain("<thread-context");
-    expect(xml).toContain("<thread-starter");
-    expect(xml).toContain("<thread-history>");
+    const body = buildChannelMessageBody(message);
+    expect(body).toContain("<thread-context");
+    expect(body).toContain("<thread-starter");
+    expect(body).toContain("<thread-history>");
+    expect(body.endsWith("replying in thread")).toBe(true);
   });
 
-  test("reaction metadata appears in XML", () => {
+  test("reaction events surface in the chat-context section, not in the body", () => {
     const message: InboundChannelMessage = {
       channel: "discord",
       chatId: "channel-123",
@@ -104,10 +103,11 @@ describe("discord xml", () => {
         targetMessageId: "msg-1",
       },
     };
-    const xml = buildChannelNotificationXml(message);
-    expect(xml).toContain("reaction");
-    expect(xml).toContain("🔥");
-    expect(xml).toContain("msg-1");
-    expect(xml).toContain("added");
+    const reminder = buildChannelReminderText(message);
+    const body = buildChannelMessageBody(message);
+
+    expect(reminder).toContain("**Reaction event**");
+    expect(reminder).toContain("alice added `🔥` on message `msg-1`");
+    expect(body).toBe("");
   });
 });
