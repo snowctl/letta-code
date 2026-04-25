@@ -96,9 +96,18 @@ async function fetchBackedRequestFn(
   }
 
   try {
+    // `Connection: close` defeats Bun's HTTP keep-alive pool: it tells the
+    // homeserver to close the TCP socket after responding, so Bun cannot
+    // hand the connection out for reuse on the next request. The pool has
+    // been observed to retain sockets that the server (or an intermediate
+    // proxy) silently closed during an idle window, after which every
+    // pooled-reuse fetch hangs until our AbortSignal fires — wedging the
+    // matrix sync loop. Forcing a fresh TCP+TLS handshake per request costs
+    // ~50–200 ms but eliminates the dead-socket failure mode entirely.
+    // For one matrix bot at one /sync per ~30 s, that's free.
     const response = await fetch(buildLegacyRequestUrl(params), {
       method: params.method,
-      headers: params.headers,
+      headers: { ...params.headers, Connection: "close" },
       body: requestBody,
       signal: controller.signal,
     });
