@@ -182,7 +182,7 @@ export function createMatrixAdapter(
       if (!messageId || messageId === "__pending__" || buffer === lastFlushed || !matrixClient) return;
       lastFlushed = buffer;
       flushInProgress = true;
-      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer)}</blockquote>`;
+      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer).replace(/\n/g, "<br>")}</blockquote>`;
       await matrixClient
         .sendMessage(chatId, {
           msgtype: "m.text",
@@ -228,7 +228,7 @@ export function createMatrixAdapter(
     if (!messageId || messageId === "__pending__" || !matrixClient) return;
     const buffer = reasoningBufferByChatId.get(chatId) ?? "";
     if (!buffer) return;
-    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer)}</blockquote>`;
+    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer).replace(/\n/g, "<br>")}</blockquote>`;
     const plainText = `Thinking\n${buffer}`;
     await matrixClient
       .sendMessage(chatId, {
