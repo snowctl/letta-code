@@ -126,11 +126,24 @@ beforeEach(() => {
       SimpleFsStorageProvider: FakeSimpleFsStorageProvider,
       RustSdkCryptoStorageProvider: FakeRustSdkCryptoStorageProvider,
       RustSdkCryptoStoreType: { Sled: "sled" },
-      // setRequestFn: no-op in tests — production code installs a fetch-based
-      // implementation here, but FakeMatrixClient never makes real HTTP calls.
+      // setRequestFn: no-op in tests — production code installs an undici-
+      // backed fetch shim here, but FakeMatrixClient never makes real HTTP
+      // calls.
       setRequestFn: () => {},
     }),
     loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
+    // Stub the undici loader so adapter.ts's getUndiciDispatcher() resolves
+    // without touching the channel-runtime install.
+    loadUndiciModule: async () => ({
+      Agent: class {
+        async destroy() {}
+      },
+      fetch: async () => ({
+        status: 200,
+        headers: { forEach: () => {} },
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }),
+    }),
     ensureMatrixRuntimeInstalled: async () => true,
     ensureMatrixCryptoUpToDate: async () => false,
   }));
@@ -962,6 +975,16 @@ test("adapter starts without E2EE when crypto addon throws", async () => {
       setRequestFn: () => {},
     }),
     loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
+    loadUndiciModule: async () => ({
+      Agent: class {
+        async destroy() {}
+      },
+      fetch: async () => ({
+        status: 200,
+        headers: { forEach: () => {} },
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }),
+    }),
     ensureMatrixRuntimeInstalled: async () => true,
     ensureMatrixCryptoUpToDate: async () => false,
   }));

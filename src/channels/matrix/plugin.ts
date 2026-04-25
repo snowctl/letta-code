@@ -8,8 +8,8 @@ export const matrixChannelPlugin: ChannelPlugin = {
   metadata: {
     id: "matrix",
     displayName: "Matrix",
-    runtimePackages: ["matrix-bot-sdk@0.8.0"],
-    runtimeModules: ["matrix-bot-sdk"],
+    runtimePackages: ["matrix-bot-sdk@0.8.0", "undici@^7"],
+    runtimeModules: ["matrix-bot-sdk", "undici"],
     runtimeTrustedDependencies: ["@matrix-org/matrix-sdk-crypto-nodejs"],
   },
   createAdapter(account: ChannelAccount) {

@@ -71,6 +71,52 @@ export interface MatrixCryptoModuleLike {
   CrossSigningBootstrapRequests?: unknown;
 }
 
+/**
+ * Subset of `undici`'s public API used by the matrix HTTP transport.
+ *
+ * We replace Bun's built-in `fetch` with undici's so we can attach a custom
+ * `Agent` (dispatcher). Bun's pool has been observed to retain TCP sockets
+ * that the homeserver (or an intermediate proxy) silently closed during an
+ * idle window, after which every reuse hangs until our `AbortSignal` fires.
+ * undici's pool has explicit eviction knobs (`keepAliveTimeout`,
+ * `keepAliveMaxTimeout`) that let us close idle sockets *before* the server
+ * does, eliminating the dead-reuse failure mode without disabling pooling
+ * entirely.
+ */
+export interface UndiciDispatcher {
+  destroy(): Promise<void>;
+}
+
+export interface UndiciAgentOptions {
+  keepAliveTimeout?: number;
+  keepAliveMaxTimeout?: number;
+  bodyTimeout?: number;
+  headersTimeout?: number;
+  connect?: { timeout?: number };
+}
+
+export interface UndiciFetchOptions {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: BodyInit;
+  signal?: AbortSignal;
+  dispatcher?: UndiciDispatcher;
+}
+
+export interface UndiciResponseLike {
+  status: number;
+  headers: { forEach(cb: (value: string, key: string) => void): void };
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export interface UndiciLike {
+  Agent: new (opts?: UndiciAgentOptions) => UndiciDispatcher;
+  fetch: (
+    url: string,
+    init?: UndiciFetchOptions,
+  ) => Promise<UndiciResponseLike>;
+}
+
 export async function loadMatrixBotSdkModule(): Promise<MatrixBotSdkLike> {
   return loadChannelRuntimeModule<MatrixBotSdkLike>("matrix", "matrix-bot-sdk");
 }
@@ -80,6 +126,10 @@ export async function loadMatrixCryptoModule(): Promise<MatrixCryptoModuleLike> 
     "matrix",
     "@matrix-org/matrix-sdk-crypto-nodejs",
   );
+}
+
+export async function loadUndiciModule(): Promise<UndiciLike> {
+  return loadChannelRuntimeModule<UndiciLike>("matrix", "undici");
 }
 
 export function isMatrixRuntimeInstalled(): boolean {
