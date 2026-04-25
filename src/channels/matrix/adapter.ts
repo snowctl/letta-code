@@ -656,6 +656,12 @@ export function createMatrixAdapter(
         return { messageId: String(eventId) };
       }
 
+      // Wait for any in-flight tool block operation — it may also send the thinking placeholder.
+      // Without this, a fast response arrives before scheduleToolBlockUpdate runs, causing
+      // the thinking placeholder to appear below the response in the timeline.
+      const pendingToolBlockOp = toolBlockOperationByChatId.get(msg.chatId);
+      if (pendingToolBlockOp) await pendingToolBlockOp.catch(() => {});
+
       // Reasoning display — finalize thinking message in place, send answer separately
       const pendingReasoningMsgId = reasoningMessageIdByChatId.get(msg.chatId);
       if (pendingReasoningMsgId) {
