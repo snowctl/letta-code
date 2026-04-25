@@ -275,7 +275,20 @@ export async function loadChannelRuntimeModule<T>(
     throw buildMissingChannelRuntimeError(channelId);
   }
 
-  return (await import(pathToFileURL(resolvedPath).href)) as T;
+  // Bun treats some packages (e.g. `undici`) as built-in runtime modules and
+  // returns the bare specifier from `createRequire().resolve(...)` instead of
+  // a real file path. `pathToFileURL("undici")` would then resolve against
+  // the cwd and fail with "Cannot find module '<cwd>/undici'". Detect that
+  // case (no path separator, no scheme) and import the bare specifier
+  // directly — the module loader knows how to find built-ins.
+  const looksLikePath =
+    resolvedPath.includes("/") ||
+    resolvedPath.includes("\\") ||
+    resolvedPath.includes(":");
+  const importTarget = looksLikePath
+    ? pathToFileURL(resolvedPath).href
+    : resolvedPath;
+  return (await import(importTarget)) as T;
 }
 
 export function __testOverrideChannelRuntimeDeps(
