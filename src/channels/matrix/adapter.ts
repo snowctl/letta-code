@@ -1,8 +1,8 @@
 // src/channels/matrix/adapter.ts
 import { join } from "node:path";
-import { marked } from "marked";
 import type { Letta } from "@letta-ai/letta-client";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
+import { marked } from "marked";
 import { getClient } from "../../agent/client";
 import { getChannelDir } from "../config";
 import { formatChannelControlRequestPrompt } from "../interactive";
@@ -36,9 +36,91 @@ import {
 } from "./media";
 import {
   ensureMatrixCryptoUpToDate,
+  type LegacyRequestCallback,
+  type LegacyRequestParams,
+  type LegacyRequestResponse,
   loadMatrixBotSdkModule,
   loadMatrixCryptoModule,
 } from "./runtime";
+
+// ── HTTP transport ────────────────────────────────────────────────────────────
+// matrix-bot-sdk@0.8.0 ships with the deprecated `request` library. Its
+// `timeout` option is implemented via socket-level timer events on Node's `net`
+// module — which Bun polyfills imperfectly — so a stalled `/sync` long-poll
+// can hang past its 40 s timeout and never recover, wedging the entire sync
+// loop. The fetch-based implementation below uses AbortSignal.timeout(), which
+// is enforced at the JS event-loop level and works identically under Node and
+// Bun. Installed via `setRequestFn` in `createClient()`.
+
+function buildLegacyRequestUrl(params: LegacyRequestParams): string {
+  if (!params.qs) return params.uri;
+  const url = new URL(params.uri);
+  for (const [key, value] of Object.entries(params.qs)) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      // matrix-bot-sdk passes `useQuerystring: true, arrayFormat: "repeat"`,
+      // which means `?key=v1&key=v2`. URLSearchParams.append matches that.
+      for (const item of value) url.searchParams.append(key, String(item));
+    } else {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url.toString();
+}
+
+async function fetchBackedRequestFn(
+  params: LegacyRequestParams,
+  callback: LegacyRequestCallback,
+): Promise<void> {
+  const timeoutMs = params.timeout > 0 ? params.timeout : 60_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(
+      new Error(`matrix-bot-sdk request timed out after ${timeoutMs}ms`),
+    );
+  }, timeoutMs);
+
+  // Buffer is fetch-compatible at runtime (Node + Bun), but TS's BodyInit
+  // doesn't list it; copy out into a fresh ArrayBuffer so the type matches.
+  let requestBody: BodyInit | undefined;
+  if (params.body === undefined) {
+    requestBody = undefined;
+  } else if (typeof params.body === "string") {
+    requestBody = params.body;
+  } else {
+    const slice = params.body.buffer.slice(
+      params.body.byteOffset,
+      params.body.byteOffset + params.body.byteLength,
+    );
+    requestBody = slice as ArrayBuffer;
+  }
+
+  try {
+    const response = await fetch(buildLegacyRequestUrl(params), {
+      method: params.method,
+      headers: params.headers,
+      body: requestBody,
+      signal: controller.signal,
+    });
+    const buf = Buffer.from(await response.arrayBuffer());
+    const responseBody: string | Buffer =
+      params.encoding === null ? buf : buf.toString("utf-8");
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    const responseLike: LegacyRequestResponse = {
+      statusCode: response.status,
+      headers,
+      body: responseBody,
+    };
+    callback(null, responseLike, responseBody);
+  } catch (err) {
+    callback(err instanceof Error ? err : new Error(String(err)));
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ── Markdown helper ───────────────────────────────────────────────────────────
 
@@ -181,10 +263,18 @@ export function createMatrixAdapter(
       if (flushInProgress) return;
       const messageId = reasoningMessageIdByChatId.get(chatId);
       const buffer = reasoningBufferByChatId.get(chatId) ?? "";
-      if (!messageId || messageId === "__pending__" || buffer === lastFlushed || !matrixClient) return;
+      if (
+        !messageId ||
+        messageId === "__pending__" ||
+        buffer === lastFlushed ||
+        !matrixClient
+      )
+        return;
       lastFlushed = buffer;
       flushInProgress = true;
-      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer).replace(/\n--\n/g, "<hr>").replace(/\n/g, "<br>")}</blockquote>`;
+      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer)
+        .replace(/\n--\n/g, "<hr>")
+        .replace(/\n/g, "<br>")}</blockquote>`;
       await matrixClient
         .sendMessage(chatId, {
           msgtype: "m.text",
@@ -231,7 +321,9 @@ export function createMatrixAdapter(
     if (!messageId || messageId === "__pending__" || !matrixClient) return;
     const buffer = reasoningBufferByChatId.get(chatId) ?? "";
     if (!buffer) return;
-    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer).replace(/\n--\n/g, "<hr>").replace(/\n/g, "<br>")}</blockquote>`;
+    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer)
+      .replace(/\n--\n/g, "<hr>")
+      .replace(/\n/g, "<br>")}</blockquote>`;
     const plainText = `Thinking\n${buffer}`;
     await matrixClient
       .sendMessage(chatId, {
@@ -280,7 +372,10 @@ export function createMatrixAdapter(
         if (!matrixClient) return;
 
         // Send thinking placeholder before tool block to guarantee ordering
-        if (account.showReasoning !== false && !reasoningMessageIdByChatId.has(chatId)) {
+        if (
+          account.showReasoning !== false &&
+          !reasoningMessageIdByChatId.has(chatId)
+        ) {
           reasoningMessageIdByChatId.set(chatId, "__pending__");
           try {
             const eventId = await matrixClient.sendMessage(chatId, {
@@ -354,12 +449,22 @@ export function createMatrixAdapter(
     // cross-signing upload requests. Upgrade before loading the SDK.
     await ensureMatrixCryptoUpToDate();
 
+    const matrixBotSdk = await loadMatrixBotSdkModule();
+
+    // Replace matrix-bot-sdk's deprecated `request` library with a fetch-based
+    // implementation. The legacy lib's socket-level timeout never fires under
+    // Bun, so a stalled /sync long-poll wedges the entire sync loop forever.
+    // fetch + AbortSignal.timeout enforces the wall-clock timeout reliably and
+    // works the same under Node and Bun. Idempotent: setRequestFn overwrites
+    // a module-scoped variable, so calling it on every createClient is fine.
+    matrixBotSdk.setRequestFn(fetchBackedRequestFn);
+
     const {
       MatrixClient,
       SimpleFsStorageProvider,
       RustSdkCryptoStorageProvider,
       RustSdkCryptoStoreType,
-    } = await loadMatrixBotSdkModule();
+    } = matrixBotSdk;
 
     const channelDir = getChannelDir("matrix");
     const storageDir = join(channelDir, accountId);
@@ -662,7 +767,7 @@ export function createMatrixAdapter(
 
       // Drain all pending tool block operations to ensure tool block messages are above the response.
       while (toolBlockOperationByChatId.has(msg.chatId)) {
-        await (toolBlockOperationByChatId.get(msg.chatId)!).catch(() => {});
+        await toolBlockOperationByChatId.get(msg.chatId)!.catch(() => {});
       }
 
       // Reasoning state is intentionally NOT finalized here — thinking continues after tool calls
@@ -825,7 +930,8 @@ export function createMatrixAdapter(
         if (reasoningNeedsSeparatorByChatId.has(chatId)) {
           reasoningNeedsSeparatorByChatId.delete(chatId);
           const existing = reasoningBufferByChatId.get(chatId) ?? "";
-          if (existing) reasoningBufferByChatId.set(chatId, existing + "\n--\n");
+          if (existing)
+            reasoningBufferByChatId.set(chatId, existing + "\n--\n");
         }
 
         reasoningBufferByChatId.set(
@@ -888,8 +994,7 @@ export function createMatrixAdapter(
       commandPrefix: "!",
       client,
       getCurrentConvId: () =>
-        getChannelRegistry()
-          ?.getRoute("matrix", chatId, accountId)
+        getChannelRegistry()?.getRoute("matrix", chatId, accountId)
           ?.conversationId ?? "default",
       setCurrentConvId: async (id) => {
         getChannelRegistry()?.updateRouteConversation(
@@ -901,8 +1006,7 @@ export function createMatrixAdapter(
       },
       requestCancel: () => {
         const liveConvId =
-          getChannelRegistry()
-            ?.getRoute("matrix", chatId, accountId)
+          getChannelRegistry()?.getRoute("matrix", chatId, accountId)
             ?.conversationId ?? "default";
         return registry?.cancelActiveRun(route.agentId, liveConvId) ?? false;
       },

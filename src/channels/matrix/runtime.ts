@@ -18,8 +18,50 @@ export interface MatrixBotSdkLike {
     path: string,
     storeType: unknown,
   ) => unknown;
-  RustSdkCryptoStoreType: { Sled?: string | number; Sqlite?: number } | undefined;
+  RustSdkCryptoStoreType:
+    | { Sled?: string | number; Sqlite?: number }
+    | undefined;
+  // matrix-bot-sdk exposes setRequestFn to swap the underlying HTTP client.
+  // We use it to replace the deprecated `request` library (whose timeout
+  // implementation hangs forever under Bun on long-poll /sync) with a
+  // fetch-based wrapper that enforces timeouts via AbortSignal.
+  setRequestFn: (
+    fn: (
+      params: LegacyRequestParams,
+      callback: LegacyRequestCallback,
+    ) => unknown,
+  ) => void;
 }
+
+/**
+ * Subset of the legacy `request` library's options object that matrix-bot-sdk
+ * actually populates in `lib/http.js#doHttpRequest`. We model just these keys
+ * because the request fn is the boundary between matrix-bot-sdk and our
+ * fetch-based replacement — anything outside this list is ignored.
+ */
+export interface LegacyRequestParams {
+  uri: string;
+  method: string;
+  qs?: Record<string, unknown> | null;
+  body?: string | Buffer;
+  headers: Record<string, string>;
+  /** Wall-clock timeout in milliseconds. Enforced via AbortSignal.timeout. */
+  timeout: number;
+  /** When `null`, return body as Buffer. When `undefined`, return as string. */
+  encoding?: string | null;
+}
+
+export interface LegacyRequestResponse {
+  statusCode: number;
+  headers: Record<string, string>;
+  body: string | Buffer;
+}
+
+export type LegacyRequestCallback = (
+  err: Error | null,
+  response?: LegacyRequestResponse,
+  body?: string | Buffer,
+) => void;
 
 export interface MatrixCryptoModuleLike {
   StoreType: { Sled?: string | number; Sqlite?: number } | undefined;

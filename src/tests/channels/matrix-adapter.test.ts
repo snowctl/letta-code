@@ -126,6 +126,9 @@ beforeEach(() => {
       SimpleFsStorageProvider: FakeSimpleFsStorageProvider,
       RustSdkCryptoStorageProvider: FakeRustSdkCryptoStorageProvider,
       RustSdkCryptoStoreType: { Sled: "sled" },
+      // setRequestFn: no-op in tests — production code installs a fetch-based
+      // implementation here, but FakeMatrixClient never makes real HTTP calls.
+      setRequestFn: () => {},
     }),
     loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
     ensureMatrixRuntimeInstalled: async () => true,
@@ -956,6 +959,7 @@ test("adapter starts without E2EE when crypto addon throws", async () => {
         }
       },
       RustSdkCryptoStoreType: { Sled: "sled" },
+      setRequestFn: () => {},
     }),
     loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
     ensureMatrixRuntimeInstalled: async () => true,
