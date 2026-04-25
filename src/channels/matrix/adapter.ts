@@ -189,6 +189,18 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
+// ── Tool-progress UX threshold ────────────────────────────────────────────────
+// Tools that finish inside this window leave no trace in the chat — no running
+// block, no took-annotation. Anything longer renders the live progress UI and
+// the took-annotation when it ends. 1 s strikes a balance between hiding noise
+// from instant local ops (Read, Glob, etc.) and surfacing real waits.
+let toolProgressGraceMs = 1_000;
+
+/** Test-only override of the grace window. Production code must not call this. */
+export function __testSetToolProgressGraceMs(ms: number): void {
+  toolProgressGraceMs = ms;
+}
+
 // ── Control request state ─────────────────────────────────────────────────────
 
 const KEYCAP_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
@@ -290,6 +302,13 @@ export function createMatrixAdapter(
   // ended tool stays visible as a "Bash took 1:47" annotation until the
   // next tool starts or reasoning resumes — gives the user a record of how
   // long each step took.
+  //
+  // Tools that complete inside `toolProgressGraceMs` are *invisible*: the
+  // running block is never shown and no took-annotation is left behind.
+  // This keeps the room from flashing "Running `Read` · 0:00" for 200 ms
+  // every time the agent inspects a file. The grace also covers the
+  // took-annotation: if the running block never appeared, neither does
+  // the receipt.
   interface RunningToolState {
     toolCallId: string;
     toolName: string;
@@ -308,6 +327,12 @@ export function createMatrixAdapter(
   const toolProgressTickerByChatId = new Map<
     string,
     ReturnType<typeof setInterval>
+  >();
+  // Per-chat grace timer: pending until either the timer fires (running block
+  // becomes visible) or tool_ended arrives first (state cleared silently).
+  const toolProgressGraceTimerByChatId = new Map<
+    string,
+    ReturnType<typeof setTimeout>
   >();
 
   // ── Typing interval helpers ───────────────────────────────────────
@@ -545,6 +570,11 @@ export function createMatrixAdapter(
   function clearReasoningState(chatId: string): void {
     stopReasoningFlush(chatId);
     stopToolProgressTicker(chatId);
+    const graceTimer = toolProgressGraceTimerByChatId.get(chatId);
+    if (graceTimer !== undefined) {
+      clearTimeout(graceTimer);
+      toolProgressGraceTimerByChatId.delete(chatId);
+    }
     reasoningMessageIdByChatId.delete(chatId);
     reasoningBufferByChatId.delete(chatId);
     reasoningNeedsSeparatorByChatId.delete(chatId);
@@ -953,6 +983,10 @@ export function createMatrixAdapter(
         clearInterval(timer);
       }
       toolProgressTickerByChatId.clear();
+      for (const [, timer] of toolProgressGraceTimerByChatId) {
+        clearTimeout(timer);
+      }
+      toolProgressGraceTimerByChatId.clear();
       runningToolByChatId.clear();
       lastCompletedToolByChatId.clear();
       convListCache.clear();
@@ -1137,9 +1171,6 @@ export function createMatrixAdapter(
         const argsPreview = buildArgsPreview(event.toolName, event.args);
         for (const source of event.sources) {
           const { chatId } = source;
-          // A new tool starting clears the "took m:ss" annotation from the
-          // previous one — the user wants live status, not a stale receipt.
-          lastCompletedToolByChatId.delete(chatId);
           runningToolByChatId.set(chatId, {
             toolCallId: event.toolCallId,
             toolName: event.toolName,
@@ -1147,14 +1178,25 @@ export function createMatrixAdapter(
             timeoutMs: event.timeoutMs,
             startedAt: Date.now(),
           });
-          // Make sure there's a placeholder to edit, then push initial content
-          // immediately (don't wait for the 5 s tick).
-          void (async () => {
-            await ensureThinkingPlaceholder(chatId);
-            const html = buildPlaceholderHtml(chatId);
-            if (html !== null) await editPlaceholder(chatId, html);
-          })();
-          startToolProgressTicker(chatId);
+          // Defer rendering by toolProgressGraceMs. If tool_ended arrives
+          // first, the grace timer is cancelled and nothing is ever shown
+          // for this tool — fast tools (Read, Glob, etc.) stay invisible.
+          const graceTimer = setTimeout(() => {
+            toolProgressGraceTimerByChatId.delete(chatId);
+            // A new tool starting clears the "took m:ss" annotation from the
+            // previous one. We do this *here* (when we commit to showing
+            // the running block) rather than in tool_started, so a fast
+            // tool that gets suppressed doesn't disrupt a stale annotation
+            // that's still useful context.
+            lastCompletedToolByChatId.delete(chatId);
+            void (async () => {
+              await ensureThinkingPlaceholder(chatId);
+              const html = buildPlaceholderHtml(chatId);
+              if (html !== null) await editPlaceholder(chatId, html);
+            })();
+            startToolProgressTicker(chatId);
+          }, toolProgressGraceMs);
+          toolProgressGraceTimerByChatId.set(chatId, graceTimer);
         }
         return;
       }
@@ -1168,6 +1210,14 @@ export function createMatrixAdapter(
           // when a follow-up tool already replaced the running state.
           if (!running || running.toolCallId !== event.toolCallId) continue;
           runningToolByChatId.delete(chatId);
+          // If the grace timer is still pending, the running block was never
+          // rendered. Cancel it and exit silently — no annotation either.
+          const graceTimer = toolProgressGraceTimerByChatId.get(chatId);
+          if (graceTimer !== undefined) {
+            clearTimeout(graceTimer);
+            toolProgressGraceTimerByChatId.delete(chatId);
+            continue;
+          }
           stopToolProgressTicker(chatId);
           lastCompletedToolByChatId.set(chatId, {
             toolName: event.toolName,

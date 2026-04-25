@@ -2155,6 +2155,18 @@ test("matrix adapter !help replies with all command names", async () => {
 });
 
 // ── Live tool-progress UI ─────────────────────────────────────────────────────
+//
+// All these tests bypass the production grace window (1 s before the running
+// block becomes visible) by forcing it to 0 ms — see __testSetToolProgressGraceMs
+// usage below. The suppression behavior under non-zero grace gets its own test.
+
+async function setupToolProgressTestAdapter(graceMs = 0) {
+  const adapterMod = await import("../../channels/matrix/adapter");
+  adapterMod.__testSetToolProgressGraceMs(graceMs);
+  const adapter = adapterMod.createMatrixAdapter(MATRIX_LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  return adapter;
+}
 
 function getEditedFormattedBodies(client: FakeMatrixClient): string[] {
   const edits: string[] = [];
@@ -2178,8 +2190,7 @@ function getEditedFormattedBodies(client: FakeMatrixClient): string[] {
 }
 
 test("Matrix tool progress: tool_started edits placeholder with running tool block", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2207,8 +2218,7 @@ test("Matrix tool progress: tool_started edits placeholder with running tool blo
 });
 
 test("Matrix tool progress: timeoutMs shown in m:ss when agent set custom timeout", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2229,8 +2239,7 @@ test("Matrix tool progress: timeoutMs shown in m:ss when agent set custom timeou
 });
 
 test("Matrix tool progress: no `/ max` shown when tool has no timeout", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2255,8 +2264,7 @@ test("Matrix tool progress: no `/ max` shown when tool has no timeout", async ()
 });
 
 test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotation", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2290,8 +2298,7 @@ test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotat
 });
 
 test("Matrix tool progress: error outcome shows `errored after m:ss`", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2324,8 +2331,7 @@ test("Matrix tool progress: error outcome shows `errored after m:ss`", async () 
 });
 
 test("Matrix tool progress: a new tool_started clears the previous `took` annotation", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2371,8 +2377,7 @@ test("Matrix tool progress: a new tool_started clears the previous `took` annota
 });
 
 test("Matrix tool progress: secret-shaped substrings in args are redacted in the preview", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2398,8 +2403,7 @@ test("Matrix tool progress: secret-shaped substrings in args are redacted in the
 });
 
 test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2423,8 +2427,7 @@ test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis",
 });
 
 test("Matrix tool progress: MessageChannel does not trigger tool-progress UI", async () => {
-  const adapter = await makeLifecycleAdapter();
-  await adapter.start();
+  const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
@@ -2442,4 +2445,78 @@ test("Matrix tool progress: MessageChannel does not trigger tool-progress UI", a
   // No placeholder edits — MessageChannel is the bot's outbound path, not work
   // we're surfacing as "running".
   expect(edits.length).toBe(0);
+});
+
+test("Matrix tool progress: tool that completes inside grace window is invisible (no running, no annotation)", async () => {
+  const adapter = await setupToolProgressTestAdapter(120); // 120 ms grace
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-fast",
+    toolCallId: "call-instant",
+    toolName: "Read",
+    args: { file_path: "/tmp/instant" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  // Tool ends well inside the 120 ms grace window.
+  await new Promise((r) => setTimeout(r, 30));
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-fast",
+    toolCallId: "call-instant",
+    toolName: "Read",
+    durationMs: 50,
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  // Wait past the grace window to confirm nothing fires after the fact.
+  await new Promise((r) => setTimeout(r, 200));
+
+  const edits = getEditedFormattedBodies(client);
+  // No placeholder edits at all — neither running block nor took-annotation.
+  expect(edits.length).toBe(0);
+  // And no thinking placeholder was created either (since tool was suppressed
+  // and there was no reasoning content).
+  const placeholderCreates = (client.sendMessage.mock.calls as Array<
+    [string, Record<string, unknown>]
+  >).filter(
+    (c) => c[1]["m.relates_to"] === undefined,
+  );
+  expect(placeholderCreates.length).toBe(0);
+});
+
+test("Matrix tool progress: tool that survives the grace window renders normally and leaves a took-annotation", async () => {
+  const adapter = await setupToolProgressTestAdapter(50); // 50 ms grace
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-slow",
+    toolCallId: "call-slow",
+    toolName: "Bash",
+    args: { command: "long-running-script" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  // Wait past the grace window — the running block should now be visible.
+  await new Promise((r) => setTimeout(r, 100));
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-slow",
+    toolCallId: "call-slow",
+    toolName: "Bash",
+    durationMs: 3_000,
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  expect(edits.length).toBeGreaterThanOrEqual(2);
+  // The first edit should be the running block, the last the took-annotation.
+  expect(edits[0]!).toContain("Running");
+  expect(edits[edits.length - 1]!).toMatch(/took\s*0:03/);
 });
