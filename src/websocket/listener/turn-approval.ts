@@ -512,6 +512,50 @@ export async function handleApprovalStop(params: {
           });
         }
       : undefined;
+  const onToolStarted =
+    channelSources.length > 0
+      ? (event: {
+          toolName: string;
+          toolCallId: string;
+          args: Record<string, unknown>;
+          timeoutMs?: number;
+        }) => {
+          const registry = getChannelRegistry();
+          if (!registry) return;
+          void registry.dispatchTurnLifecycleEvent({
+            type: "tool_started",
+            batchId: dequeuedBatchId,
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            args: event.args,
+            timeoutMs: event.timeoutMs,
+            sources: channelSources,
+          });
+        }
+      : undefined;
+  const onToolEnded =
+    channelSources.length > 0
+      ? (event: {
+          toolName: string;
+          toolCallId: string;
+          durationMs: number;
+          outcome: "success" | "error";
+          error?: string;
+        }) => {
+          const registry = getChannelRegistry();
+          if (!registry) return;
+          void registry.dispatchTurnLifecycleEvent({
+            type: "tool_ended",
+            batchId: dequeuedBatchId,
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            durationMs: event.durationMs,
+            outcome: event.outcome,
+            error: event.error,
+            sources: channelSources,
+          });
+        }
+      : undefined;
 
   const executionResults = await executeApprovalBatch(decisions, undefined, {
     toolContextId: turnToolContextId ?? undefined,
@@ -522,6 +566,8 @@ export async function handleApprovalStop(params: {
       agentId && conversationId ? { agentId, conversationId } : undefined,
     onFileWrite,
     onToolCall,
+    onToolStarted,
+    onToolEnded,
   });
   const persistedExecutionResults = normalizeExecutionResultsForInterruptParity(
     runtime,

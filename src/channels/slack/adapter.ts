@@ -1267,6 +1267,10 @@ export function createSlackAdapter(
         return;
       }
 
+      if (event.type === "tool_started" || event.type === "tool_ended") {
+        return;
+      }
+
       const nextState: SlackLifecycleState =
         event.outcome === "completed"
           ? "completed"

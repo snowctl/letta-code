@@ -99,6 +99,32 @@ export type ChannelTurnLifecycleEvent =
       sources: ChannelTurnSource[];
     }
   | {
+      /** Fires immediately before a tool's `executeTool` call, after approval.
+       *  Carries the resolved args (caller-set or defaulted) so adapters can
+       *  render live progress (running tool name, args preview, deadline). */
+      type: "tool_started";
+      batchId: string;
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+      /** Resolved tool deadline in ms — agent-set or known default.
+       *  `undefined` for tools with no time limit (e.g. local file ops). */
+      timeoutMs?: number;
+      sources: ChannelTurnSource[];
+    }
+  | {
+      /** Fires immediately after a tool's `executeTool` returns or throws.
+       *  Pairs with a previous `tool_started` by `toolCallId`. */
+      type: "tool_ended";
+      batchId: string;
+      toolCallId: string;
+      toolName: string;
+      durationMs: number;
+      outcome: "success" | "error";
+      error?: string;
+      sources: ChannelTurnSource[];
+    }
+  | {
       type: "finished";
       batchId: string;
       sources: ChannelTurnSource[];

@@ -902,6 +902,8 @@ export function createTelegramAdapter(
         return;
       }
 
+      if (event.type === "tool_started" || event.type === "tool_ended") return;
+
       // "finished"
       for (const source of event.sources) {
         stopTypingInterval(source.chatId);

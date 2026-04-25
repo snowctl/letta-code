@@ -18,6 +18,59 @@ import {
 } from "../tools/manager";
 
 /**
+ * Tool start/end lifecycle callbacks.
+ *
+ * `onToolStarted` fires immediately before `executeTool`; `onToolEnded` fires
+ * after it resolves or throws. Both are optional. Channel adapters use these
+ * to render live tool-progress UI (running tool name, elapsed time, deadline).
+ *
+ * `args` carries the resolved tool arguments so adapters can show a preview.
+ * `timeoutMs` is the resolved deadline (caller-set or known default) — see
+ * `resolveToolTimeoutMs` below — or `undefined` when the tool has no
+ * meaningful time limit.
+ */
+export interface ToolStartedEvent {
+  toolName: string;
+  toolCallId: string;
+  args: Record<string, unknown>;
+  timeoutMs?: number;
+}
+
+export interface ToolEndedEvent {
+  toolName: string;
+  toolCallId: string;
+  durationMs: number;
+  outcome: "success" | "error";
+  error?: string;
+}
+
+/**
+ * Resolve the effective deadline (in ms) for a tool invocation. Returns
+ * `undefined` for tools without a timeout concept — local file ops, memory
+ * tools, etc. — so adapters can decide whether to show "elapsed / max" or
+ * just "elapsed".
+ *
+ * Centralized here (rather than duplicated in adapters) because the defaults
+ * live in the tool implementations and only this module sees the resolved
+ * args at call time.
+ */
+export function resolveToolTimeoutMs(
+  toolName: string,
+  args: Record<string, unknown>,
+): number | undefined {
+  // Bash: see src/tools/impl/Bash.ts — caller may pass `timeout`,
+  // default 120000 ms, clamped at 600000 ms by the runner itself.
+  if (toolName === "Bash") {
+    const explicit = typeof args.timeout === "number" ? args.timeout : null;
+    const resolved = explicit ?? 120_000;
+    return Math.min(Math.max(resolved, 1), 600_000);
+  }
+  // BashOutput / KillBash: short polls, no useful "deadline" to surface.
+  // Tools without a time concept return undefined.
+  return undefined;
+}
+
+/**
  * Extract displayable text from tool return content (for UI display).
  * Multimodal content returns the text parts concatenated.
  */
@@ -202,6 +255,8 @@ async function executeSingleDecision(
     parentScope?: { agentId: string; conversationId: string };
     onFileWrite?: (filePath: string, content: string) => void;
     onToolCall?: (toolName: string, description?: string) => void;
+    onToolStarted?: (event: ToolStartedEvent) => void;
+    onToolEnded?: (event: ToolEndedEvent) => void;
   },
 ): Promise<ApprovalResult> {
   // If aborted, record an interrupted result
@@ -254,26 +309,77 @@ async function executeSingleDecision(
         parsedArgs = decision.approval.toolArgs || {};
       }
 
-      const toolResult = await executeTool(
-        decision.approval.toolName,
-        parsedArgs,
-        {
-          signal: options?.abortSignal,
+      // Fire tool_started before execution so live-progress UIs (matrix
+      // adapter etc.) can render immediately. Wrapped so a callback throw
+      // never aborts the actual tool call.
+      const toolStartTime = Date.now();
+      try {
+        options?.onToolStarted?.({
+          toolName: decision.approval.toolName,
           toolCallId: decision.approval.toolCallId,
-          toolContextId: options?.toolContextId,
-          parentScope: options?.parentScope,
-          onOutput: options?.onStreamingOutput
-            ? (chunk, stream) =>
-                options.onStreamingOutput?.(
-                  decision.approval.toolCallId,
-                  chunk,
-                  stream === "stderr",
-                )
-            : undefined,
-          onFileWrite: options?.onFileWrite,
-          onToolCall: options?.onToolCall,
-        },
-      );
+          args: parsedArgs,
+          timeoutMs: resolveToolTimeoutMs(
+            decision.approval.toolName,
+            parsedArgs,
+          ),
+        });
+      } catch {
+        // ignore — lifecycle callbacks must not affect tool execution
+      }
+
+      let toolResult: ToolExecutionResult;
+      try {
+        toolResult = await executeTool(
+          decision.approval.toolName,
+          parsedArgs,
+          {
+            signal: options?.abortSignal,
+            toolCallId: decision.approval.toolCallId,
+            toolContextId: options?.toolContextId,
+            parentScope: options?.parentScope,
+            onOutput: options?.onStreamingOutput
+              ? (chunk, stream) =>
+                  options.onStreamingOutput?.(
+                    decision.approval.toolCallId,
+                    chunk,
+                    stream === "stderr",
+                  )
+              : undefined,
+            onFileWrite: options?.onFileWrite,
+            onToolCall: options?.onToolCall,
+          },
+        );
+      } catch (executeErr) {
+        // Fire tool_ended on the throw path before re-throwing so the outer
+        // catch's existing error-result logic remains the single source of
+        // truth for the result shape.
+        try {
+          options?.onToolEnded?.({
+            toolName: decision.approval.toolName,
+            toolCallId: decision.approval.toolCallId,
+            durationMs: Date.now() - toolStartTime,
+            outcome: "error",
+            error:
+              executeErr instanceof Error
+                ? executeErr.message
+                : String(executeErr),
+          });
+        } catch {
+          // ignore
+        }
+        throw executeErr;
+      }
+
+      try {
+        options?.onToolEnded?.({
+          toolName: decision.approval.toolName,
+          toolCallId: decision.approval.toolCallId,
+          durationMs: Date.now() - toolStartTime,
+          outcome: toolResult.status === "error" ? "error" : "success",
+        });
+      } catch {
+        // ignore
+      }
 
       // Update UI if callback provided (interactive mode)
       // Note: UI display uses text-only version, backend gets full multimodal content
@@ -383,6 +489,8 @@ export async function executeApprovalBatch(
     parentScope?: { agentId: string; conversationId: string };
     onFileWrite?: (filePath: string, content: string) => void;
     onToolCall?: (toolName: string, description?: string) => void;
+    onToolStarted?: (event: ToolStartedEvent) => void;
+    onToolEnded?: (event: ToolEndedEvent) => void;
   },
 ): Promise<ApprovalResult[]> {
   const toolContextId =

@@ -938,6 +938,12 @@ export function createMatrixAdapter(
         return;
       }
 
+      if (event.type === "tool_started" || event.type === "tool_ended") {
+        // Reserved for follow-up commit (live tool-progress UI). No-op here so
+        // commit 1's lifecycle plumbing lands without changing matrix behavior.
+        return;
+      }
+
       if (event.type === "tool_call") {
         // Any tool call (including MessageChannel) interrupts the reasoning stream.
         // Mark that the next reasoning chunk should prepend a separator.
