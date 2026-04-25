@@ -779,6 +779,11 @@ export function createMatrixAdapter(
         await toolBlockOperationByChatId.get(msg.chatId)!.catch(() => {});
       }
 
+      // If handleStreamReasoning is currently sending the thinking placeholder (__pending__),
+      // wait for it to land before sending the response — otherwise the response arrives first
+      // and the thinking block ends up below it in the Matrix timeline.
+      await waitForPendingPlaceholder(msg.chatId);
+
       // Reasoning state is intentionally NOT finalized here — thinking continues after tool calls
       // (including MessageChannel). Finalization happens only at the "finished" lifecycle event.
       void stopTypingInterval(msg.chatId);
