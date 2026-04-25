@@ -2153,3 +2153,293 @@ test("matrix adapter !help replies with all command names", async () => {
   expect(body).toContain("!conv list");
   expect(body).toContain("!help");
 });
+
+// ── Live tool-progress UI ─────────────────────────────────────────────────────
+
+function getEditedFormattedBodies(client: FakeMatrixClient): string[] {
+  const edits: string[] = [];
+  for (const call of client.sendMessage.mock.calls as Array<
+    [string, Record<string, unknown>]
+  >) {
+    const relatesTo = call[1]["m.relates_to"] as
+      | Record<string, unknown>
+      | undefined;
+    if (relatesTo?.rel_type !== "m.replace") continue;
+    const newContent = call[1]["m.new_content"] as
+      | Record<string, unknown>
+      | undefined;
+    const html =
+      (newContent?.formatted_body as string | undefined) ??
+      (call[1].formatted_body as string | undefined) ??
+      "";
+    edits.push(html);
+  }
+  return edits;
+}
+
+test("Matrix tool progress: tool_started edits placeholder with running tool block", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-1",
+    toolName: "Bash",
+    args: { command: "start-camofox.sh --headless" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  // Allow the placeholder-create + initial edit to settle.
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  expect(edits.length).toBeGreaterThanOrEqual(1);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Running");
+  expect(lastEdit).toContain("Bash");
+  expect(lastEdit).toContain("start-camofox.sh --headless");
+  // Default Bash timeout (120s) renders as 2:00 in the m:ss format.
+  expect(lastEdit).toMatch(/0:00\s*\/\s*2:00/);
+});
+
+test("Matrix tool progress: timeoutMs shown in m:ss when agent set custom timeout", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-2",
+    toolName: "Bash",
+    args: { command: "npm install", timeout: 600_000 },
+    timeoutMs: 600_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toMatch(/0:00\s*\/\s*10:00/);
+});
+
+test("Matrix tool progress: no `/ max` shown when tool has no timeout", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-read-1",
+    toolName: "Read",
+    args: { file_path: "/etc/passwd" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    // no timeoutMs
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Running");
+  expect(lastEdit).toContain("Read");
+  expect(lastEdit).toContain("/etc/passwd");
+  // No "X / Y" deadline format; just elapsed.
+  expect(lastEdit).not.toMatch(/\d:\d{2}\s*\/\s*\d:\d{2}/);
+});
+
+test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotation", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-3",
+    toolName: "Bash",
+    args: { command: "git status" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-1",
+    toolCallId: "call-bash-3",
+    toolName: "Bash",
+    durationMs: 107_000, // 1:47
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Bash");
+  expect(lastEdit).toMatch(/took\s*1:47/);
+  expect(lastEdit).not.toContain("Running");
+});
+
+test("Matrix tool progress: error outcome shows `errored after m:ss`", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-err",
+    toolName: "Bash",
+    args: { command: "false" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-1",
+    toolCallId: "call-bash-err",
+    toolName: "Bash",
+    durationMs: 4_500,
+    outcome: "error",
+    error: "exit 1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toMatch(/errored after\s*0:04/);
+});
+
+test("Matrix tool progress: a new tool_started clears the previous `took` annotation", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  // First tool runs and ends.
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-1",
+    toolName: "Bash",
+    args: { command: "echo first" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-1",
+    toolCallId: "call-1",
+    toolName: "Bash",
+    durationMs: 1_000,
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  // Second tool starts. The "took" annotation should be replaced with a fresh
+  // running block — not stacked alongside it.
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-2",
+    toolName: "Read",
+    args: { file_path: "/tmp/x" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Running");
+  expect(lastEdit).toContain("Read");
+  expect(lastEdit).not.toContain("took");
+});
+
+test("Matrix tool progress: secret-shaped substrings in args are redacted in the preview", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-curl",
+    toolName: "Bash",
+    args: {
+      command:
+        "curl -H 'Authorization: Bearer sk-supersecret' --api-key=abcdef https://api.example.com",
+    },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).not.toContain("sk-supersecret");
+  expect(lastEdit).not.toContain("abcdef");
+  expect(lastEdit).toContain("&lt;redacted&gt;");
+});
+
+test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  const longCommand =
+    "echo this is a very long command that should definitely exceed the eighty character preview limit imposed by buildArgsPreview";
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-long",
+    toolName: "Bash",
+    args: { command: longCommand },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("…");
+  expect(lastEdit).not.toContain("buildArgsPreview");
+});
+
+test("Matrix tool progress: MessageChannel does not trigger tool-progress UI", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-mc",
+    toolName: "MessageChannel",
+    args: { channel: "matrix", action: "send", message: "hi" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  // No placeholder edits — MessageChannel is the bot's outbound path, not work
+  // we're surfacing as "running".
+  expect(edits.length).toBe(0);
+});

@@ -283,6 +283,33 @@ export function createMatrixAdapter(
     ReturnType<typeof setInterval>
   >();
 
+  // ── Live tool-progress state ──────────────────────────────────────────────
+  // Tracks the currently-executing tool per chat so the thinking placeholder
+  // shows "Running `Bash` · 0:32 / 2:00" with a ticking elapsed counter
+  // instead of looking frozen during long tool runs. The most recently
+  // ended tool stays visible as a "Bash took 1:47" annotation until the
+  // next tool starts or reasoning resumes — gives the user a record of how
+  // long each step took.
+  interface RunningToolState {
+    toolCallId: string;
+    toolName: string;
+    argsPreview: string;
+    timeoutMs?: number;
+    startedAt: number;
+  }
+  interface CompletedToolState {
+    toolName: string;
+    argsPreview: string;
+    durationMs: number;
+    outcome: "success" | "error";
+  }
+  const runningToolByChatId = new Map<string, RunningToolState>();
+  const lastCompletedToolByChatId = new Map<string, CompletedToolState>();
+  const toolProgressTickerByChatId = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >();
+
   // ── Typing interval helpers ───────────────────────────────────────
 
   function startTypingInterval(chatId: string): void {
@@ -306,50 +333,205 @@ export function createMatrixAdapter(
     }
   }
 
+  /**
+   * Format ms as `m:ss` (e.g. `0:32`, `2:14`). Always two-digit seconds; the
+   * minute count grows as needed without padding so the field doesn't shift
+   * width across the 1-min boundary on phones that render edits in place.
+   */
+  function formatElapsed(ms: number): string {
+    const totalSec = Math.max(0, Math.floor(ms / 1000));
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  }
+
+  /**
+   * Redact common secret-like substrings before showing tool args back to
+   * the user. Matches `--api-key=…`, `Authorization: Bearer …`,
+   * `password=…`, `token=…`, `--header "x-api-key: …"`, etc. The single-bot
+   * Argos use case has self-talk privacy, but a careful default prevents
+   * accidental disclosure when tool output gets quoted into other rooms.
+   */
+  function redactSecrets(text: string): string {
+    return text
+      // Authorization: Bearer xxxxx (HTTP header, with or without leading dashes)
+      .replace(
+        /(authorization\s*[:=]\s*(?:bearer|basic)\s+)\S+/gi,
+        "$1<redacted>",
+      )
+      // --foo-key=value, --foo_token=value, password=value, etc.
+      .replace(
+        /((?:^|[\s"'-])(?:[\w-]*?(?:api[_-]?key|secret|token|password|bearer|auth))[=:\s]\s*)\S+/gi,
+        "$1<redacted>",
+      );
+  }
+
+  /**
+   * Build the args preview shown inside the running-tool block. Limits to
+   * 80 chars, redacts secret-shaped substrings, and falls back gracefully
+   * when args don't have a "natural" string representation per tool.
+   */
+  function buildArgsPreview(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): string {
+    let raw: string;
+    if (toolName === "Bash" && typeof args.command === "string") {
+      raw = args.command;
+    } else if (
+      (toolName === "Read" || toolName === "Write" || toolName === "Edit") &&
+      typeof args.file_path === "string"
+    ) {
+      raw = args.file_path;
+    } else if (toolName === "Glob" && typeof args.pattern === "string") {
+      raw = args.pattern;
+    } else if (toolName === "Grep" && typeof args.pattern === "string") {
+      raw = args.pattern;
+    } else {
+      // Fallback: stringify whatever's there, single-line.
+      raw = JSON.stringify(args).replace(/\s+/g, " ");
+    }
+    const oneLine = raw.replace(/\s+/g, " ").trim();
+    const redacted = redactSecrets(oneLine);
+    return redacted.length > 80 ? `${redacted.slice(0, 79)}…` : redacted;
+  }
+
+  /** Build the running-tool block HTML (or null if nothing to render). */
+  function buildToolStatusHtml(chatId: string): string | null {
+    const running = runningToolByChatId.get(chatId);
+    if (running) {
+      const elapsed = formatElapsed(Date.now() - running.startedAt);
+      const deadline = running.timeoutMs
+        ? ` / ${formatElapsed(running.timeoutMs)}`
+        : "";
+      const args = escapeHtml(running.argsPreview);
+      return `<b>Running <code>${escapeHtml(running.toolName)}</code> · ${elapsed}${deadline}</b><br><blockquote><code>${args}</code></blockquote>`;
+    }
+    const completed = lastCompletedToolByChatId.get(chatId);
+    if (completed) {
+      const took = formatElapsed(completed.durationMs);
+      const verb = completed.outcome === "error" ? "errored after" : "took";
+      const args = escapeHtml(completed.argsPreview);
+      return `<i><code>${escapeHtml(completed.toolName)}</code> ${verb} ${took}</i><br><blockquote><code>${args}</code></blockquote>`;
+    }
+    return null;
+  }
+
+  /** Build the full thinking-placeholder HTML: reasoning buffer plus the
+   *  current tool-status block (running or just-completed) when present.
+   *  Returns `null` when there's nothing meaningful to flush — the
+   *  placeholder was already created with the bare "Thinking..." HTML, so
+   *  emitting that again would be a wasted edit. */
+  function buildPlaceholderHtml(chatId: string): string | null {
+    const buffer = reasoningBufferByChatId.get(chatId) ?? "";
+    const reasoningHtml = buffer
+      ? `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer)
+          .replace(/\n--\n/g, "<hr>")
+          .replace(/\n/g, "<br>")}</blockquote>`
+      : "";
+    const toolHtml = buildToolStatusHtml(chatId);
+    if (reasoningHtml && toolHtml) return `${reasoningHtml}${toolHtml}`;
+    if (toolHtml) return toolHtml;
+    if (reasoningHtml) return reasoningHtml;
+    return null;
+  }
+
+  /** Edit the existing thinking-placeholder message with fresh HTML.
+   *  No-op when there's no active placeholder or matrix client. */
+  async function editPlaceholder(chatId: string, html: string): Promise<void> {
+    if (!matrixClient) return;
+    const messageId = reasoningMessageIdByChatId.get(chatId);
+    if (!messageId || messageId === "__pending__") return;
+    await matrixClient
+      .sendMessage(chatId, {
+        msgtype: "m.text",
+        body: "* Thinking...",
+        format: "org.matrix.custom.html",
+        "m.new_content": {
+          msgtype: "m.text",
+          body: "* Thinking...",
+          format: "org.matrix.custom.html",
+          formatted_body: html,
+        },
+        "m.relates_to": { rel_type: "m.replace", event_id: messageId },
+      })
+      .catch((error) => {
+        console.warn(
+          "[Matrix] Failed to edit placeholder:",
+          error instanceof Error ? error.message : error,
+        );
+      });
+  }
+
   function startReasoningFlush(chatId: string): void {
     if (reasoningFlushIntervalByChatId.has(chatId)) return;
-    let lastFlushed = "";
+    let lastFlushed: string | null = null;
     let flushInProgress = false;
     const interval = setInterval(async () => {
       if (flushInProgress) return;
       const messageId = reasoningMessageIdByChatId.get(chatId);
-      const buffer = reasoningBufferByChatId.get(chatId) ?? "";
-      if (
-        !messageId ||
-        messageId === "__pending__" ||
-        buffer === lastFlushed ||
-        !matrixClient
-      )
-        return;
-      lastFlushed = buffer;
+      if (!messageId || messageId === "__pending__" || !matrixClient) return;
+      const html = buildPlaceholderHtml(chatId);
+      if (html === null) return; // nothing meaningful yet — leave bare "Thinking..."
+      // Dedupe identical edits — avoids a tight stream of no-op `m.replace`
+      // events when neither reasoning nor tool state has changed.
+      if (html === lastFlushed) return;
+      lastFlushed = html;
       flushInProgress = true;
-      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer)
-        .replace(/\n--\n/g, "<hr>")
-        .replace(/\n/g, "<br>")}</blockquote>`;
-      await matrixClient
-        .sendMessage(chatId, {
-          msgtype: "m.text",
-          body: "* Thinking...",
-          format: "org.matrix.custom.html",
-          "m.new_content": {
-            msgtype: "m.text",
-            body: "* Thinking...",
-            format: "org.matrix.custom.html",
-            formatted_body: html,
-          },
-          "m.relates_to": { rel_type: "m.replace", event_id: messageId },
-        })
-        .catch((error) => {
-          console.warn(
-            "[Matrix] Failed to flush reasoning:",
-            error instanceof Error ? error.message : error,
-          );
-        })
-        .finally(() => {
-          flushInProgress = false;
-        });
+      await editPlaceholder(chatId, html).finally(() => {
+        flushInProgress = false;
+      });
     }, 150);
     reasoningFlushIntervalByChatId.set(chatId, interval);
+  }
+
+  /** Ensure a thinking-placeholder message exists for this chat, creating one
+   *  if it doesn't. Used at tool_started for tools that fire before any
+   *  reasoning content has arrived (e.g. immediate tool calls). */
+  async function ensureThinkingPlaceholder(chatId: string): Promise<void> {
+    if (!matrixClient) return;
+    if (reasoningMessageIdByChatId.has(chatId)) return; // already exists or pending
+    reasoningMessageIdByChatId.set(chatId, "__pending__");
+    try {
+      const eventId = await matrixClient.sendMessage(chatId, {
+        msgtype: "m.text",
+        body: "Thinking...",
+        format: "org.matrix.custom.html",
+        formatted_body: "<b>Thinking...</b>",
+      });
+      reasoningMessageIdByChatId.set(chatId, String(eventId));
+      startReasoningFlush(chatId);
+    } catch (error) {
+      reasoningMessageIdByChatId.delete(chatId);
+      console.warn(
+        "[Matrix] Failed to create placeholder for tool progress:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  /** Start the per-chat ticker that bumps the running-tool elapsed timer
+   *  every 5 s. Idempotent. */
+  function startToolProgressTicker(chatId: string): void {
+    if (toolProgressTickerByChatId.has(chatId)) return;
+    const ticker = setInterval(async () => {
+      if (!runningToolByChatId.has(chatId)) {
+        stopToolProgressTicker(chatId);
+        return;
+      }
+      const html = buildPlaceholderHtml(chatId);
+      if (html === null) return;
+      await editPlaceholder(chatId, html);
+    }, 5_000);
+    toolProgressTickerByChatId.set(chatId, ticker);
+  }
+
+  function stopToolProgressTicker(chatId: string): void {
+    const ticker = toolProgressTickerByChatId.get(chatId);
+    if (ticker !== undefined) {
+      clearInterval(ticker);
+      toolProgressTickerByChatId.delete(chatId);
+    }
   }
 
   function stopReasoningFlush(chatId: string): void {
@@ -362,9 +544,12 @@ export function createMatrixAdapter(
 
   function clearReasoningState(chatId: string): void {
     stopReasoningFlush(chatId);
+    stopToolProgressTicker(chatId);
     reasoningMessageIdByChatId.delete(chatId);
     reasoningBufferByChatId.delete(chatId);
     reasoningNeedsSeparatorByChatId.delete(chatId);
+    runningToolByChatId.delete(chatId);
+    lastCompletedToolByChatId.delete(chatId);
   }
 
   async function finalizeReasoningMessage(chatId: string): Promise<void> {
@@ -764,6 +949,12 @@ export function createMatrixAdapter(
       reasoningMessageIdByChatId.clear();
       reasoningBufferByChatId.clear();
       reasoningNeedsSeparatorByChatId.clear();
+      for (const [, timer] of toolProgressTickerByChatId) {
+        clearInterval(timer);
+      }
+      toolProgressTickerByChatId.clear();
+      runningToolByChatId.clear();
+      lastCompletedToolByChatId.clear();
       convListCache.clear();
 
       await matrixClient?.stop();
@@ -938,9 +1129,58 @@ export function createMatrixAdapter(
         return;
       }
 
-      if (event.type === "tool_started" || event.type === "tool_ended") {
-        // Reserved for follow-up commit (live tool-progress UI). No-op here so
-        // commit 1's lifecycle plumbing lands without changing matrix behavior.
+      if (event.type === "tool_started") {
+        // MessageChannel is the bot's *outbound* channel, not user-visible
+        // work. Skip live progress for it (same exclusion the existing
+        // tool_call handler applies to the tool block).
+        if (event.toolName === "MessageChannel") return;
+        const argsPreview = buildArgsPreview(event.toolName, event.args);
+        for (const source of event.sources) {
+          const { chatId } = source;
+          // A new tool starting clears the "took m:ss" annotation from the
+          // previous one — the user wants live status, not a stale receipt.
+          lastCompletedToolByChatId.delete(chatId);
+          runningToolByChatId.set(chatId, {
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            argsPreview,
+            timeoutMs: event.timeoutMs,
+            startedAt: Date.now(),
+          });
+          // Make sure there's a placeholder to edit, then push initial content
+          // immediately (don't wait for the 5 s tick).
+          void (async () => {
+            await ensureThinkingPlaceholder(chatId);
+            const html = buildPlaceholderHtml(chatId);
+            if (html !== null) await editPlaceholder(chatId, html);
+          })();
+          startToolProgressTicker(chatId);
+        }
+        return;
+      }
+
+      if (event.type === "tool_ended") {
+        if (event.toolName === "MessageChannel") return;
+        for (const source of event.sources) {
+          const { chatId } = source;
+          const running = runningToolByChatId.get(chatId);
+          // Only act on the matching tool call — guards against late arrivals
+          // when a follow-up tool already replaced the running state.
+          if (!running || running.toolCallId !== event.toolCallId) continue;
+          runningToolByChatId.delete(chatId);
+          stopToolProgressTicker(chatId);
+          lastCompletedToolByChatId.set(chatId, {
+            toolName: event.toolName,
+            argsPreview: running.argsPreview,
+            durationMs: event.durationMs,
+            outcome: event.outcome,
+          });
+          // Push the "took m:ss" annotation immediately. Subsequent reasoning
+          // flushes (if the agent keeps thinking) keep the annotation visible
+          // until the next tool_started clears it.
+          const html = buildPlaceholderHtml(chatId);
+          if (html !== null) void editPlaceholder(chatId, html);
+        }
         return;
       }
 
