@@ -143,6 +143,8 @@ export function createMatrixAdapter(
   // ── Reasoning display state ───────────────────────────────────────────────
   const reasoningMessageIdByChatId = new Map<string, string>();
   const reasoningBufferByChatId = new Map<string, string>();
+  // Set when a tool call interrupts reasoning; causes next chunk to prepend \n--\n separator
+  const reasoningNeedsSeparatorByChatId = new Set<string>();
   const reasoningFlushIntervalByChatId = new Map<
     string,
     ReturnType<typeof setInterval>
@@ -182,7 +184,7 @@ export function createMatrixAdapter(
       if (!messageId || messageId === "__pending__" || buffer === lastFlushed || !matrixClient) return;
       lastFlushed = buffer;
       flushInProgress = true;
-      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer).replace(/\n/g, "<br>")}</blockquote>`;
+      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer).replace(/\n--\n/g, "<hr>").replace(/\n/g, "<br>")}</blockquote>`;
       await matrixClient
         .sendMessage(chatId, {
           msgtype: "m.text",
@@ -221,6 +223,7 @@ export function createMatrixAdapter(
     stopReasoningFlush(chatId);
     reasoningMessageIdByChatId.delete(chatId);
     reasoningBufferByChatId.delete(chatId);
+    reasoningNeedsSeparatorByChatId.delete(chatId);
   }
 
   async function finalizeReasoningMessage(chatId: string): Promise<void> {
@@ -228,7 +231,7 @@ export function createMatrixAdapter(
     if (!messageId || messageId === "__pending__" || !matrixClient) return;
     const buffer = reasoningBufferByChatId.get(chatId) ?? "";
     if (!buffer) return;
-    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer).replace(/\n/g, "<br>")}</blockquote>`;
+    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer).replace(/\n--\n/g, "<hr>").replace(/\n/g, "<br>")}</blockquote>`;
     const plainText = `Thinking\n${buffer}`;
     await matrixClient
       .sendMessage(chatId, {
@@ -603,6 +606,7 @@ export function createMatrixAdapter(
       reasoningFlushIntervalByChatId.clear();
       reasoningMessageIdByChatId.clear();
       reasoningBufferByChatId.clear();
+      reasoningNeedsSeparatorByChatId.clear();
       convListCache.clear();
 
       await matrixClient?.stop();
@@ -656,24 +660,14 @@ export function createMatrixAdapter(
         return { messageId: String(eventId) };
       }
 
-      // Drain all pending tool block operations before touching reasoning state.
-      // New ops can be chained onto the queue while we await; loop until the queue is empty.
-      // Without this, Op2 (chained after Op1) starts after sendMessage clears reasoning state
-      // and re-sends the thinking placeholder below the response.
+      // Drain all pending tool block operations to ensure tool block messages are above the response.
       while (toolBlockOperationByChatId.has(msg.chatId)) {
         await (toolBlockOperationByChatId.get(msg.chatId)!).catch(() => {});
       }
 
-      // Reasoning display — finalize thinking message in place, send answer separately
-      const pendingReasoningMsgId = reasoningMessageIdByChatId.get(msg.chatId);
-      if (pendingReasoningMsgId) {
-        await waitForPendingPlaceholder(msg.chatId);
-        stopReasoningFlush(msg.chatId);
-        void stopTypingInterval(msg.chatId); // fire-and-forget: don't block the answer send on typing clearance
-        await finalizeReasoningMessage(msg.chatId);
-        clearReasoningState(msg.chatId);
-        // Fall through to plain send below — answer goes as a separate new message
-      }
+      // Reasoning state is intentionally NOT finalized here — thinking continues after tool calls
+      // (including MessageChannel). Finalization happens only at the "finished" lifecycle event.
+      void stopTypingInterval(msg.chatId);
 
       // Plain text or HTML
       const content: Record<string, unknown> = {
@@ -783,6 +777,13 @@ export function createMatrixAdapter(
       }
 
       if (event.type === "tool_call") {
+        // Any tool call (including MessageChannel) interrupts the reasoning stream.
+        // Mark that the next reasoning chunk should prepend a separator.
+        for (const source of event.sources) {
+          if (reasoningMessageIdByChatId.has(source.chatId)) {
+            reasoningNeedsSeparatorByChatId.add(source.chatId);
+          }
+        }
         if (event.toolName === "MessageChannel") return;
         for (const source of event.sources) {
           scheduleToolBlockUpdate(
@@ -819,6 +820,14 @@ export function createMatrixAdapter(
 
       for (const source of sources) {
         const { chatId } = source;
+
+        // A tool call interrupted reasoning since last chunk — prepend separator
+        if (reasoningNeedsSeparatorByChatId.has(chatId)) {
+          reasoningNeedsSeparatorByChatId.delete(chatId);
+          const existing = reasoningBufferByChatId.get(chatId) ?? "";
+          if (existing) reasoningBufferByChatId.set(chatId, existing + "\n--\n");
+        }
+
         reasoningBufferByChatId.set(
           chatId,
           (reasoningBufferByChatId.get(chatId) ?? "") + chunk,

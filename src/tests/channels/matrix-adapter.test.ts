@@ -1233,14 +1233,14 @@ test("Matrix tool block: no thinking placeholder when showReasoning is false", a
 
 // ── Reasoning display tests ───────────────────────────────────────────────────
 
-test("matrix adapter: reasoning + response finalizes thinking in place and sends plain answer", async () => {
+test("matrix adapter: reasoning + response finalizes thinking at finished (not at sendMessage)", async () => {
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
   client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")   // initial thinking message
-    .mockResolvedValueOnce("$thinking-final") // final edit (finalizeReasoningMessage)
-    .mockResolvedValueOnce("$answer-1");    // plain answer
+    .mockResolvedValueOnce("$thinking-1")    // initial thinking message
+    .mockResolvedValueOnce("$answer-1")      // plain answer (sendMessage)
+    .mockResolvedValueOnce("$thinking-final"); // final edit at "finished"
 
   const source = {
     channel: "matrix" as const,
@@ -1263,14 +1263,27 @@ test("matrix adapter: reasoning + response finalizes thinking in place and sends
     parseMode: "HTML",
   });
 
-  // Must NOT redact — thinking stays in the room
+  // sendMessage only sends the answer — thinking NOT finalized yet
   expect(client.redactEvent).not.toHaveBeenCalled();
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  expect(result.messageId).toBe("$answer-1");
 
-  // 3 sendMessage calls: initial thinking + final edit + plain answer
+  // Second call: plain answer (no m.relates_to)
+  const [, answerContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  expect((answerContent as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+
+  // Thinking is finalized only when the turn ends
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
   expect(client.sendMessage).toHaveBeenCalledTimes(3);
 
-  // Second call: final edit of thinking message (m.replace, summary changes to "Thinking")
-  const [, editContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  // Third call: final edit of thinking message
+  const [, editContent] = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
   const ec = editContent as Record<string, unknown>;
   expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
   const newContent = ec["m.new_content"] as Record<string, unknown>;
@@ -1280,15 +1293,6 @@ test("matrix adapter: reasoning + response finalizes thinking in place and sends
   expect(editHtml).not.toContain("Thinking...");
   expect(editHtml).toContain("I need to search for this.");
   expect(editHtml).toContain("Found 3 results.");
-
-  // Third call: plain answer (no m.relates_to, no blockquote drawer)
-  const [, answerContent] = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
-  const ac = answerContent as Record<string, unknown>;
-  expect(ac["m.relates_to"]).toBeUndefined();
-  expect(ac.formatted_body as string).not.toContain("<blockquote>");
-
-  // Return value is the answer's message ID
-  expect(result.messageId).toBe("$answer-1");
 
   await adapter.stop();
 });
@@ -1436,6 +1440,81 @@ test("matrix adapter: thinking finalized when turn ends without response", async
   expect((newContent.formatted_body as string)).toContain("<b>Thinking</b>");
   expect((newContent.formatted_body as string)).toContain("<blockquote>");
   expect((newContent.formatted_body as string)).not.toContain("Thinking...");
+
+  await adapter.stop();
+});
+
+test("matrix adapter: multi-run thinking within one turn is appended with separator", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")    // initial thinking message
+    .mockResolvedValueOnce("$tool-block-1")  // tool block
+    .mockResolvedValueOnce("$answer-1")      // response
+    .mockResolvedValueOnce("$thinking-final"); // final edit at "finished"
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // First reasoning segment
+  await adapter.handleStreamReasoning!("First thought.", [source]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  // Tool call interrupts — marks separator needed
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "b1",
+    toolName: "bash",
+    sources: [source],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Second reasoning segment (after tool)
+  await adapter.handleStreamReasoning!("Second thought.", [source]);
+
+  // MessageChannel tool call (response send)
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "b1",
+    toolName: "MessageChannel",
+    sources: [source],
+  });
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Here is the answer.",
+  });
+
+  // Only one thinking message — NOT a second placeholder
+  expect(client.sendMessage).toHaveBeenCalledTimes(3); // thinking + tool block + answer
+
+  // Finalize at "finished"
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "b1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(4);
+
+  // Final edit contains both segments with separator
+  const [, editContent] = client.sendMessage.mock.calls[3] as [string, Record<string, unknown>];
+  const ec = editContent as Record<string, unknown>;
+  expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
+  const newContent = ec["m.new_content"] as Record<string, unknown>;
+  const editHtml = newContent.formatted_body as string;
+  expect(editHtml).toContain("First thought.");
+  expect(editHtml).toContain("Second thought.");
+  expect(editHtml).toContain("<hr>"); // separator between segments
 
   await adapter.stop();
 });
