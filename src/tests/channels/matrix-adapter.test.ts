@@ -1074,7 +1074,7 @@ test("Matrix tool block: first tool_call sends thinking placeholder then tool bl
   const [room0, content0] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
   expect(room0).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
   expect((content0 as Record<string, unknown>).formatted_body as string).toContain(
-    "<details><summary>Thinking...</summary>",
+    "<b>Thinking...</b>",
   );
   expect((content0 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
 
@@ -1275,16 +1275,17 @@ test("matrix adapter: reasoning + response finalizes thinking in place and sends
   expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
   const newContent = ec["m.new_content"] as Record<string, unknown>;
   const editHtml = newContent.formatted_body as string;
-  expect(editHtml).toContain("<details><summary>Thinking</summary>");
+  expect(editHtml).toContain("<b>Thinking</b>");
+  expect(editHtml).toContain("<blockquote>");
   expect(editHtml).not.toContain("Thinking...");
   expect(editHtml).toContain("I need to search for this.");
   expect(editHtml).toContain("Found 3 results.");
 
-  // Third call: plain answer (no m.relates_to, no formatted_body drawer)
+  // Third call: plain answer (no m.relates_to, no blockquote drawer)
   const [, answerContent] = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
   const ac = answerContent as Record<string, unknown>;
   expect(ac["m.relates_to"]).toBeUndefined();
-  expect(ac.formatted_body as string).not.toContain("<details>");
+  expect(ac.formatted_body as string).not.toContain("<blockquote>");
 
   // Return value is the answer's message ID
   expect(result.messageId).toBe("$answer-1");
@@ -1432,7 +1433,8 @@ test("matrix adapter: thinking finalized when turn ends without response", async
   const ec = editContent as Record<string, unknown>;
   expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
   const newContent = ec["m.new_content"] as Record<string, unknown>;
-  expect((newContent.formatted_body as string)).toContain("<details><summary>Thinking</summary>");
+  expect((newContent.formatted_body as string)).toContain("<b>Thinking</b>");
+  expect((newContent.formatted_body as string)).toContain("<blockquote>");
   expect((newContent.formatted_body as string)).not.toContain("Thinking...");
 
   await adapter.stop();

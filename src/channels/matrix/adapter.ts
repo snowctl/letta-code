@@ -182,7 +182,7 @@ export function createMatrixAdapter(
       if (!messageId || messageId === "__pending__" || buffer === lastFlushed || !matrixClient) return;
       lastFlushed = buffer;
       flushInProgress = true;
-      const html = `<details><summary>Thinking...</summary>\n${escapeHtml(buffer)}</details>`;
+      const html = `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer)}</blockquote>`;
       await matrixClient
         .sendMessage(chatId, {
           msgtype: "m.text",
@@ -228,7 +228,7 @@ export function createMatrixAdapter(
     if (!messageId || messageId === "__pending__" || !matrixClient) return;
     const buffer = reasoningBufferByChatId.get(chatId) ?? "";
     if (!buffer) return;
-    const html = `<details><summary>Thinking</summary>\n${escapeHtml(buffer)}</details>`;
+    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer)}</blockquote>`;
     const plainText = `Thinking\n${buffer}`;
     await matrixClient
       .sendMessage(chatId, {
@@ -284,7 +284,7 @@ export function createMatrixAdapter(
               msgtype: "m.text",
               body: "Thinking...",
               format: "org.matrix.custom.html",
-              formatted_body: "<details><summary>Thinking...</summary></details>",
+              formatted_body: "<b>Thinking...</b>",
             });
             reasoningMessageIdByChatId.set(chatId, String(eventId));
             startReasoningFlush(chatId);
@@ -656,11 +656,13 @@ export function createMatrixAdapter(
         return { messageId: String(eventId) };
       }
 
-      // Wait for any in-flight tool block operation — it may also send the thinking placeholder.
-      // Without this, a fast response arrives before scheduleToolBlockUpdate runs, causing
-      // the thinking placeholder to appear below the response in the timeline.
-      const pendingToolBlockOp = toolBlockOperationByChatId.get(msg.chatId);
-      if (pendingToolBlockOp) await pendingToolBlockOp.catch(() => {});
+      // Drain all pending tool block operations before touching reasoning state.
+      // New ops can be chained onto the queue while we await; loop until the queue is empty.
+      // Without this, Op2 (chained after Op1) starts after sendMessage clears reasoning state
+      // and re-sends the thinking placeholder below the response.
+      while (toolBlockOperationByChatId.has(msg.chatId)) {
+        await (toolBlockOperationByChatId.get(msg.chatId)!).catch(() => {});
+      }
 
       // Reasoning display — finalize thinking message in place, send answer separately
       const pendingReasoningMsgId = reasoningMessageIdByChatId.get(msg.chatId);
@@ -829,7 +831,7 @@ export function createMatrixAdapter(
               msgtype: "m.text",
               body: "Thinking...",
               format: "org.matrix.custom.html",
-              formatted_body: "<details><summary>Thinking...</summary></details>",
+              formatted_body: "<b>Thinking...</b>",
             });
             reasoningMessageIdByChatId.set(chatId, String(eventId));
             startReasoningFlush(chatId);
