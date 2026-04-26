@@ -596,15 +596,23 @@ export function createMatrixAdapter(
     turnStartedAtByChatId.delete(chatId);
   }
 
-  async function finalizeReasoningMessage(chatId: string): Promise<void> {
+  async function finalizeReasoningMessage(
+    chatId: string,
+    footer?: { html: string; text: string },
+  ): Promise<void> {
     const messageId = reasoningMessageIdByChatId.get(chatId);
     if (!messageId || messageId === "__pending__" || !matrixClient) return;
     const buffer = reasoningBufferByChatId.get(chatId) ?? "";
-    if (!buffer) return;
-    const html = `<b>Thinking</b><br><blockquote>${escapeHtml(buffer)
-      .replace(/\n--\n/g, "<hr>")
-      .replace(/\n/g, "<br>")}</blockquote>`;
-    const plainText = `Thinking\n${buffer}`;
+    // Skip if nothing to show and no footer to append.
+    if (!buffer && !footer) return;
+    const innerHtml =
+      (buffer
+        ? escapeHtml(buffer)
+            .replace(/\n--\n/g, "<hr>")
+            .replace(/\n/g, "<br>")
+        : "") + (footer ? `<hr>${footer.html}` : "");
+    const html = `<b>Thinking</b><br><blockquote>${innerHtml}</blockquote>`;
+    const plainText = `Thinking\n${buffer}${footer ? `\n${footer.text}` : ""}`;
     await matrixClient
       .sendMessage(chatId, {
         msgtype: "m.text",
@@ -618,7 +626,7 @@ export function createMatrixAdapter(
         },
         "m.relates_to": { rel_type: "m.replace", event_id: messageId },
       })
-      .catch((error) => {
+      .catch((error: unknown) => {
         console.warn(
           "[Matrix] Failed to finalize reasoning message:",
           error instanceof Error ? error.message : error,
@@ -1326,7 +1334,6 @@ export function createMatrixAdapter(
         const durationStr = formatElapsed(durationMs);
         const lastResponse = lastResponseByChatId.get(chatId);
         const reasoningMsgId = reasoningMessageIdByChatId.get(chatId);
-        // biome-ignore lint/correctness/noUnusedVariables: used in Tasks 2 and 3
         const hasThinkingBlock =
           !!reasoningMsgId && reasoningMsgId !== "__pending__";
 
@@ -1363,8 +1370,33 @@ export function createMatrixAdapter(
                 );
               });
           }
+        } else if (event.outcome === "error") {
+          const footerHtml =
+            `<span data-mx-color="#f85149">⚠ Turn failed</span> ` +
+            `<span data-mx-color="#8b949e">· tool error</span>`;
+          const footerText = "⚠ Turn failed · tool error";
+
+          if (hasThinkingBlock) {
+            await finalizeReasoningMessage(chatId, {
+              html: footerHtml,
+              text: footerText,
+            });
+            clearReasoningState(chatId);
+          } else {
+            clearReasoningState(chatId);
+            await matrixClient
+              ?.sendMessage(chatId, {
+                msgtype: "m.text",
+                body: "⚠ Turn failed — the turn didn't complete.",
+                format: "org.matrix.custom.html",
+                formatted_body:
+                  `<span data-mx-color="#f85149">⚠ Turn failed</span> ` +
+                  `<span data-mx-color="#8b949e">— the turn didn't complete.</span>`,
+              })
+              .catch(() => {});
+          }
         } else {
-          // error / cancelled — handled in later tasks
+          // "cancelled" — handled in Task 3
           await finalizeReasoningMessage(chatId);
           clearReasoningState(chatId);
         }

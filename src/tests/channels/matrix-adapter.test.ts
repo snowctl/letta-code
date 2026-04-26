@@ -2687,3 +2687,64 @@ test("Matrix tool progress: tool that survives the grace window renders normally
   expect(edits[0]!).toContain("Running");
   expect(edits[edits.length - 1]!).toMatch(/took\s*0:03/);
 });
+
+test("Matrix turn state: finished(error) with thinking block appends error footer in blockquote", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")   // initial thinking placeholder
+    .mockResolvedValueOnce("$finalize-1");  // final edit at finished
+
+  await adapter.handleStreamReasoning!("Checking email…", [MATRIX_LIFECYCLE_SOURCE]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "error",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  const [, editContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  expect(editContent["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
+
+  const newContent = editContent["m.new_content"] as Record<string, unknown>;
+  const html = newContent.formatted_body as string;
+  expect(html).toContain("Checking email");
+  expect(html).toContain("data-mx-color=\"#f85149\"");
+  expect(html).toContain("⚠ Turn failed");
+  expect(html).not.toContain("✓");
+});
+
+test("Matrix turn state: finished(error) with no thinking block sends fallback error message", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  client.sendMessage.mockResolvedValueOnce("$fallback-error-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "error",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  const [room, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  expect(room).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+  expect(content["m.relates_to"]).toBeUndefined();
+
+  const html = content.formatted_body as string;
+  expect(html).toContain("data-mx-color=\"#f85149\"");
+  expect(html).toContain("⚠ Turn failed");
+  expect(html).toContain("didn't complete");
+});
