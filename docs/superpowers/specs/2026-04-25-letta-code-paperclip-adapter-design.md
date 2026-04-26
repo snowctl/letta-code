@@ -7,21 +7,18 @@
 
 A standalone npm package (`@letta-ai/letta-code-paperclip-adapter`) that integrates Letta Code with Paperclip's agent orchestration platform. Paperclip spawns the `letta` CLI in headless mode to execute tasks, persisting conversation threads across wakeups so agents retain full context. The adapter lives in a separate repo (`../letta-code-paperclip-adapter`) and is loaded by Paperclip's external adapter plugin system.
 
-Argos (the manager agent) creates tasks in Paperclip via its REST API directly — no adapter is needed on the Argos side. Paperclip then assigns those tasks to Letta Code agents via this adapter.
+Paperclip assigns tasks to Letta Code agents via this adapter.
 
 ## Architecture
 
 ```
-Argos (manager)
-  └── POST /api/companies/{id}/issues → Paperclip REST API
-                                            │
-                               Paperclip orchestrator
-                                            │
-                               letta-code adapter (this package)
-                                            │
-                               letta CLI (--headless --output-format stream-json)
-                                            │
-                               Letta server (external, e.g. Argos Docker container)
+Paperclip orchestrator
+        │
+letta-code adapter (this package)
+        │
+letta CLI (--headless --output-format stream-json)
+        │
+Letta server (external — user-managed)
 ```
 
 The adapter is loaded at Paperclip server startup via the external adapter plugin system. It exports `createServerAdapter()` from its root entry point and a UI parser from `./ui-parser`.
@@ -195,26 +192,6 @@ A Letta Code skill that teaches agents how to create tasks in Paperclip:
 - Content: `POST /api/companies/{PAPERCLIP_COMPANY_ID}/issues` with title, description, status, assigneeAgentId
 - Auth: `Authorization: Bearer $PAPERCLIP_API_KEY` (injected by the adapter via env)
 - Key env vars: `PAPERCLIP_API_URL`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_KEY`, `PAPERCLIP_TASK_ID` (parent issue ID)
-
-## Argos Integration
-
-No adapter is required. Argos creates Paperclip tasks by calling:
-
-```
-POST {PAPERCLIP_API_URL}/api/companies/{companyId}/issues
-Authorization: Bearer <agent-api-key>
-Content-Type: application/json
-
-{
-  "title": "...",
-  "description": "...",
-  "status": "todo",
-  "priority": "medium",
-  "assigneeAgentId": "<letta-code-agent-id>"
-}
-```
-
-The agent API key is a long-lived credential configured in Argos's environment. The `assigneeAgentId` is the Paperclip agent ID for the target Letta Code worker (not the Letta agent ID).
 
 ## Error Handling
 
