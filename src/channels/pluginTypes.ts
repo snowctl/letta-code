@@ -42,7 +42,7 @@ export interface ChannelMessageToolSchemaContribution {
 }
 
 /**
- * Plugin-owned discovery for the shared MessageChannel tool.
+ * Plugin-owned discovery for the channel action tools.
  * Channel plugins advertise their supported actions and any extra schema
  * fragments here so the public tool surface stays singular while the
  * capabilities remain channel-specific.
@@ -87,9 +87,9 @@ export interface ChannelMessageActionContext {
 }
 
 /**
- * Channel-owned action surface for the shared MessageChannel tool.
- * This mirrors the OpenClaw pattern: one top-level tool, with each channel
- * plugin owning action discovery and execution underneath it.
+ * Channel-owned action surface for ChannelAction/NotifyUser tools.
+ * One top-level tool, with each channel plugin owning action discovery
+ * and execution underneath it.
  */
 export interface ChannelMessageActionAdapter {
   describeMessageTool(params: {

@@ -175,7 +175,7 @@ function makeFetchBackedRequestFn(
 
 // ── Markdown helper ───────────────────────────────────────────────────────────
 
-// Inlined here rather than imported from MessageChannel.ts to avoid the transitive import
+// Inlined here rather than imported from channels/format.ts to avoid the transitive import
 // chain (registry → accounts → config) that conflicts with mock.module() in tests.
 function markdownToMatrixHtml(text: string): string {
   return (marked.parse(text) as string).trimEnd();
@@ -1113,7 +1113,7 @@ export function createMatrixAdapter(
       await waitForPendingPlaceholder(msg.chatId);
 
       // Reasoning state is intentionally NOT finalized here — thinking continues after tool calls
-      // (including MessageChannel). Finalization happens only at the "finished" lifecycle event.
+      // (including ChannelAction). Finalization happens only at the "finished" lifecycle event.
       void stopTypingInterval(msg.chatId);
 
       // Plain text or HTML
@@ -1437,7 +1437,7 @@ export function createMatrixAdapter(
                 });
             }
           } else if (lastResponse && matrixClient) {
-            // Fallback: no pending text from auto-forward (legacy path or MessageChannel was used)
+            // Fallback: no pending text from auto-forward (e.g. silent turn)
             const footerHtml =
               `<hr><span data-mx-color="#3fb950">✓</span> ` +
               `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;

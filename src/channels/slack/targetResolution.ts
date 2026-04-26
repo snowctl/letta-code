@@ -70,7 +70,7 @@ function normalizeSlackTarget(
 ): NormalizedSlackTarget | string {
   const trimmed = rawTarget.trim();
   if (!trimmed) {
-    return "Error: MessageChannel target cannot be empty.";
+    return "Error: channel target cannot be empty.";
   }
 
   const prefixed = trimmed.match(/^([a-z_-]+):(.*)$/i);
@@ -78,7 +78,7 @@ function normalizeSlackTarget(
     const prefix = prefixed[1]?.toLowerCase();
     const value = prefixed[2]?.trim() ?? "";
     if (!value) {
-      return "Error: MessageChannel target cannot be empty.";
+      return "Error: channel target cannot be empty.";
     }
     if (prefix === "channel") {
       return normalizeSlackTarget(value);
@@ -86,7 +86,7 @@ function normalizeSlackTarget(
     if (prefix === "user") {
       return 'Error: Slack proactive MessageChannel currently supports channel targets only. Use a channel target like "#general" or "channel:C123".';
     }
-    return `Error: Unsupported Slack MessageChannel target prefix "${prefix}".`;
+    return `Error: Unsupported Slack channel target prefix "${prefix}".`;
   }
 
   if (SLACK_CHANNEL_ID_PATTERN.test(trimmed)) {
@@ -99,7 +99,7 @@ function normalizeSlackTarget(
 
   const normalizedName = normalizeSlackChannelName(trimmed);
   if (!normalizedName) {
-    return "Error: MessageChannel target cannot be empty.";
+    return "Error: channel target cannot be empty.";
   }
 
   return {
@@ -128,7 +128,7 @@ function findCachedSlackTarget(params: {
   });
 
   if (matches.length > 1) {
-    return `Error: Slack MessageChannel target "${params.normalizedTarget.raw}" is ambiguous for account "${params.accountId}".`;
+    return `Error: Slack channel target "${params.normalizedTarget.raw}" is ambiguous for account "${params.accountId}".`;
   }
 
   const match = matches[0];
@@ -206,7 +206,7 @@ function findSlackChannelByTarget(params: {
       normalizeSlackChannelName(channel.name ?? "") === normalizedTarget.name,
   );
   if (matches.length > 1) {
-    return `Error: Slack MessageChannel target "${normalizedTarget.raw}" matched multiple channels.`;
+    return `Error: Slack channel target "${normalizedTarget.raw}" matched multiple channels.`;
   }
   return matches[0] ?? null;
 }
@@ -272,7 +272,7 @@ export async function resolveSlackMessageTarget(params: {
   }
   if (!matchedChannel) {
     throw new Error(
-      `Unknown Slack MessageChannel target "${normalizedTarget.raw}" for account "${params.account.accountId}".`,
+      `Unknown Slack channel target "${normalizedTarget.raw}" for account "${params.account.accountId}".`,
     );
   }
 

@@ -1,7 +1,7 @@
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
 import { getClient } from "../agent/client";
 import { resolveModel } from "../agent/model";
-import type { MessageChannelToolDiscoveryScope } from "../channels/messageTool";
+import type { ChannelToolScope } from "../channels/messageTool";
 import { getChannelRegistry } from "../channels/registry";
 import { getRoutesForChannel, loadRoutes } from "../channels/routing";
 import {
@@ -97,7 +97,7 @@ function getPreferredAgentModelHandle(
 
 function getToolNamesForToolset(
   toolsetName: ToolsetName,
-  channelToolScope?: MessageChannelToolDiscoveryScope | null,
+  channelToolScope?: ChannelToolScope | null,
 ): ToolName[] {
   let tools: ToolName[];
   switch (toolsetName) {
@@ -140,7 +140,7 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
   exclude?: ToolName[];
   workingDirectory?: string;
   permissionModeState?: PermissionModeState;
-  channelToolScope?: MessageChannelToolDiscoveryScope | null;
+  channelToolScope?: ChannelToolScope | null;
   runtimeContext?: Partial<RuntimeContextSnapshot>;
 }): Promise<PreparedScopeToolContext> {
   const {
@@ -202,7 +202,7 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
 export function resolveConversationChannelToolScope(
   agentId: string,
   conversationId: string,
-): MessageChannelToolDiscoveryScope {
+): ChannelToolScope {
   const registry = getChannelRegistry();
   if (!registry) {
     return { channels: [] };

@@ -9,7 +9,7 @@ import {
 } from "../agent/context";
 import { getModelInfo } from "../agent/model";
 import { getAllSubagentConfigs } from "../agent/subagents";
-import type { MessageChannelToolDiscoveryScope } from "../channels/messageTool";
+import type { ChannelToolScope } from "../channels/messageTool";
 import { getActiveChannelIds } from "../channels/registry";
 import { refreshFileIndex } from "../cli/helpers/fileIndex";
 import { INTERRUPTED_BY_USER } from "../constants";
@@ -45,7 +45,7 @@ export const TOOL_NAMES = Object.keys(TOOL_DEFINITIONS) as ToolName[];
  */
 function maybeAppendChannelTools(
   toolNames: ToolName[],
-  channelToolScope?: MessageChannelToolDiscoveryScope | null,
+  channelToolScope?: ChannelToolScope | null,
 ): ToolName[] {
   const hasActiveChannelTools =
     channelToolScope !== undefined
@@ -836,7 +836,7 @@ export async function prepareToolExecutionContextForSpecificTools(
   options?: {
     workingDirectory?: string;
     permissionModeState?: PermissionModeState;
-    channelToolScope?: MessageChannelToolDiscoveryScope | null;
+    channelToolScope?: ChannelToolScope | null;
     runtimeContext?: Partial<RuntimeContextSnapshot>;
   },
 ): Promise<PreparedToolExecutionContext> {
@@ -857,7 +857,7 @@ export async function prepareToolExecutionContextForModel(
     exclude?: ToolName[];
     workingDirectory?: string;
     permissionModeState?: PermissionModeState;
-    channelToolScope?: MessageChannelToolDiscoveryScope | null;
+    channelToolScope?: ChannelToolScope | null;
     runtimeContext?: Partial<RuntimeContextSnapshot>;
   },
 ): Promise<PreparedToolExecutionContext> {
@@ -1055,7 +1055,7 @@ async function resolveBaseToolNamesForModel(
   modelIdentifier?: string,
   options?: {
     exclude?: ToolName[];
-    channelToolScope?: MessageChannelToolDiscoveryScope | null;
+    channelToolScope?: ChannelToolScope | null;
   },
 ): Promise<ToolName[]> {
   const { toolFilter } = await import("./filter");
@@ -1092,7 +1092,7 @@ async function buildRegistryForModel(
   modelIdentifier?: string,
   options?: {
     exclude?: ToolName[];
-    channelToolScope?: MessageChannelToolDiscoveryScope | null;
+    channelToolScope?: ChannelToolScope | null;
   },
 ): Promise<ToolRegistry> {
   const { toolFilter } = await import("./filter");
