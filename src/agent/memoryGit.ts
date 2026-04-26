@@ -243,7 +243,19 @@ async function getAuthToken(): Promise<string> {
   const client = await getClient();
   // The client constructor resolves the token; extract it
   // biome-ignore lint/suspicious/noExplicitAny: accessing internal client options
-  return (client as any)._options?.apiKey ?? "";
+  const apiKey = (client as any)._options?.apiKey as string | undefined;
+  // Memfs git ops always require auth — letta-server's /v1/git/* enforces
+  // bearer auth, and falling back to "" silently produces broken credential
+  // helpers (see configureLocalCredentialHelper). Fail loudly here so the
+  // misconfig surfaces at the call site rather than as a cryptic
+  // "could not read Username" git error several layers down.
+  if (!apiKey) {
+    throw new Error(
+      "getAuthToken: memfs git operations require LETTA_API_KEY. " +
+        "Set the env var or run 'letta' to authenticate.",
+    );
+  }
+  return apiKey;
 }
 
 /**
@@ -376,6 +388,20 @@ async function configureLocalCredentialHelper(
   dir: string,
   token: string,
 ): Promise<void> {
+  // An empty token here means we'd write `password=` into the credential
+  // helper, which silently breaks every subsequent `git push`/`git pull`
+  // against the memfs endpoint. Git can't prompt for credentials in a
+  // headless agent runtime, so the next op fatals with `could not read
+  // Username for '<url>': No such device or address`. Refuse to write the
+  // helper at all — the caller (cloneMemoryRepo / pullMemory) should fail
+  // loudly so the misconfig surfaces before bad state is committed to disk.
+  if (!token) {
+    throw new Error(
+      "configureLocalCredentialHelper: empty token. " +
+        "Memfs git operations require a valid LETTA_API_KEY. " +
+        "Set the env var or run 'letta' to authenticate before configuring memfs.",
+    );
+  }
   const rawBaseUrl = getMemfsServerUrl();
   const normalizedBaseUrl = normalizeCredentialBaseUrl(rawBaseUrl);
 
@@ -707,6 +733,29 @@ async function fetchAgentDisplayName(agentId: string): Promise<string | null> {
 }
 
 /**
+ * If the local repo's default branch is `master` (Letta server default), rename
+ * it to `main` so post-commit pushes land on `main` at the memory-repository
+ * remote. The tracking ref (`branch.main.merge`) is left pointing to
+ * `refs/heads/master` so `git pull` continues to work against the server.
+ */
+async function maybeRenameMasterToMain(dir: string): Promise<void> {
+  if (!existsSync(join(dir, ".git"))) return;
+  try {
+    const { stdout } = await runGit(dir, [
+      "symbolic-ref",
+      "--quiet",
+      "--short",
+      "HEAD",
+    ]);
+    if (stdout.trim() !== "master") return;
+    await runGit(dir, ["branch", "-m", "master", "main"]);
+    debugLog("memfs-git", "Renamed local branch master → main");
+  } catch {
+    // Non-fatal — if it fails the push will still work, just on master.
+  }
+}
+
+/**
  * Ensure the memfs repo has canonical local git config:
  *   - `letta.agentId` reconciled to the current agent id (always)
  *   - `user.email` = `<agentId>@letta.com` (only if unset — user overrides preserved)
@@ -724,6 +773,9 @@ export async function ensureLocalMemfsGitConfig(
   if (!existsSync(join(dir, ".git"))) {
     return;
   }
+
+  // Self-healing rename for repos cloned before this fix.
+  await maybeRenameMasterToMain(dir);
 
   try {
     // Always reconcile — cheap and idempotent.
@@ -1258,6 +1310,9 @@ export async function cloneMemoryRepo(agentId: string): Promise<void> {
       }
     }
   }
+
+  // Rename master → main if the remote defaulted to master
+  await maybeRenameMasterToMain(dir);
 
   // Configure local credential helper so the agent can do plain
   // `git push` / `git pull` without auth prefixes.
