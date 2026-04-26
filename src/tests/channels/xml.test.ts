@@ -81,7 +81,7 @@ describe("formatChannelNotification", () => {
     expect(a).toContain("2026-04-25T12:27:01.000Z");
   });
 
-  test("response directives include text reply, react, remove-react, stay-silent, and replyTo", () => {
+  test("response directives explain auto-forward model: text delivered automatically, ChannelAction for side-effects", () => {
     const msg: InboundChannelMessage = {
       channel: "matrix",
       chatId: "!room:server",
@@ -91,19 +91,16 @@ describe("formatChannelNotification", () => {
     };
     const reminder = buildChannelReminderText(msg);
 
-    expect(reminder).toContain("**Reply with text**");
-    expect(reminder).toContain('action="send"');
-    expect(reminder).toContain("**React without text**");
+    expect(reminder).toContain("delivered automatically");
+    expect(reminder).toContain("ChannelAction");
     expect(reminder).toContain('action="react"');
-    expect(reminder).toContain("**Remove a reaction**");
-    expect(reminder).toContain("**Stay silent (rare)**");
-    expect(reminder).toContain("silence is the exception");
-    expect(reminder).toContain("`replyTo`");
+    expect(reminder).toContain('action="edit"');
+    expect(reminder).toContain('action="thread-reply"');
+    expect(reminder).not.toContain("MessageChannel");
+    expect(reminder).not.toContain("You MUST respond via");
   });
 
-  test("response directives lead with strong MUST-use-MessageChannel imperative", () => {
-    // Plain assistant text is dropped on every channel. The reminder must
-    // be unambiguous that MessageChannel is the only delivery path.
+  test("response directives explain silence: produce no response text", () => {
     const msg: InboundChannelMessage = {
       channel: "matrix",
       chatId: "!room:server",
@@ -112,9 +109,7 @@ describe("formatChannelNotification", () => {
       timestamp: FIXED_TS,
     };
     const reminder = buildChannelReminderText(msg);
-    expect(reminder).toContain("**You MUST respond via the `MessageChannel` tool.**");
-    expect(reminder).toContain("Plain assistant text is not delivered");
-    expect(reminder).toContain("only `MessageChannel` calls reach the chat platform");
+    expect(reminder).toContain("produce no response text");
   });
 
   test("react directive uses unicode-emoji hint by default, name-emoji hint for slack, and custom-emoji hint for discord", () => {
@@ -184,7 +179,7 @@ describe("formatChannelNotification", () => {
     expect(reminder).toContain("- **Attachment**: kind=image");
     expect(reminder).toContain("local_path=/tmp/photo.heic");
     expect(reminder).toContain("mime_type=image/heic");
-    expect(reminder).toContain("**Inspect attachments**");
+    expect(reminder).toContain("local file/image tools");
   });
 
   test("voice memo transcription is shown as a sub-bullet under the attachment line", () => {
