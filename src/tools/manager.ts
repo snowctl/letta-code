@@ -282,6 +282,8 @@ const TOOL_PERMISSIONS: Record<ToolName, { requiresApproval: boolean }> = {
   memory: { requiresApproval: false },
   memory_apply_patch: { requiresApproval: false },
   MessageChannel: { requiresApproval: false },
+  ChannelAction: { requiresApproval: false },
+  NotifyUser: { requiresApproval: false },
   MultiEdit: { requiresApproval: true },
   Read: { requiresApproval: false },
   view_image: { requiresApproval: false },
@@ -1657,6 +1659,12 @@ export async function executeTool(
 
       // Inject parent scope for MessageChannel tool (per-execution, not global singleton)
       if (internalName === "MessageChannel" && options?.parentScope) {
+        enhancedArgs = { ...enhancedArgs, parentScope: options.parentScope };
+      }
+      if (internalName === "ChannelAction" && options?.parentScope) {
+        enhancedArgs = { ...enhancedArgs, parentScope: options.parentScope };
+      }
+      if (internalName === "NotifyUser" && options?.parentScope) {
         enhancedArgs = { ...enhancedArgs, parentScope: options.parentScope };
       }
 

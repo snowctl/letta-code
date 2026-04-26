@@ -129,6 +129,10 @@ function getToolNamesForToolset(
   if (hasScopedChannelTool && !tools.includes("MessageChannel" as ToolName)) {
     tools.push("MessageChannel" as ToolName);
   }
+  if (hasScopedChannelTool && !tools.includes("ChannelAction" as ToolName)) {
+    tools.push("ChannelAction" as ToolName);
+    tools.push("NotifyUser" as ToolName);
+  }
 
   return tools;
 }

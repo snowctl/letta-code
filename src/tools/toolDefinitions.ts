@@ -42,6 +42,11 @@ import { apply_patch } from "./impl/ApplyPatch";
 import { ask_user_question } from "./impl/AskUserQuestion";
 import { bash } from "./impl/Bash";
 import { bash_output } from "./impl/BashOutput";
+import {
+  ChannelActionDescription,
+  ChannelActionSchema,
+  channel_action,
+} from "./impl/ChannelAction";
 import { edit } from "./impl/Edit";
 import { enter_plan_mode } from "./impl/EnterPlanMode";
 import { exit_plan_mode } from "./impl/ExitPlanMode";
@@ -58,6 +63,11 @@ import { memory } from "./impl/Memory";
 import { memory_apply_patch } from "./impl/MemoryApplyPatch";
 import { message_channel } from "./impl/MessageChannel";
 import { multi_edit } from "./impl/MultiEdit";
+import {
+  NotifyUserDescription,
+  NotifyUserSchema,
+  notify_user,
+} from "./impl/NotifyUser";
 import { read } from "./impl/Read";
 import { read_file } from "./impl/ReadFileCodex";
 import { read_file_gemini } from "./impl/ReadFileGemini";
@@ -143,6 +153,11 @@ const toolDefinitions = {
     description: BashOutputDescription.trim(),
     impl: bash_output as unknown as ToolImplementation,
   },
+  ChannelAction: {
+    schema: ChannelActionSchema,
+    description: ChannelActionDescription,
+    impl: channel_action as unknown as ToolImplementation,
+  },
   Edit: {
     schema: EditSchema,
     description: EditDescription.trim(),
@@ -207,6 +222,11 @@ const toolDefinitions = {
     schema: MultiEditSchema,
     description: MultiEditDescription.trim(),
     impl: multi_edit as unknown as ToolImplementation,
+  },
+  NotifyUser: {
+    schema: NotifyUserSchema,
+    description: NotifyUserDescription,
+    impl: notify_user as unknown as ToolImplementation,
   },
   Read: {
     schema: ReadSchema,
