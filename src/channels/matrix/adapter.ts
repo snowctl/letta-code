@@ -1085,6 +1085,8 @@ export function createMatrixAdapter(
       const content: Record<string, unknown> = {
         msgtype: "m.text",
         body: text,
+        format: "org.matrix.custom.html",
+        formatted_body: markdownToMatrixHtml(text),
       };
       if (options?.replyToMessageId) {
         content["m.relates_to"] = {
