@@ -1,10 +1,10 @@
+import { formatOutboundChannelMessage } from "../../channels/format";
 import {
   isSupportedChannelId,
   loadChannelPlugin,
 } from "../../channels/pluginRegistry";
 import type { ChannelRegistry } from "../../channels/registry";
 import { getChannelRegistry } from "../../channels/registry";
-import { formatOutboundChannelMessage } from "./MessageChannel";
 
 export type NotifyUserArgs = {
   channel: string;

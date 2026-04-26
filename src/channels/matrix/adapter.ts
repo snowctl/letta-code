@@ -1250,10 +1250,13 @@ export function createMatrixAdapter(
       }
 
       if (event.type === "tool_started") {
-        // MessageChannel is the bot's *outbound* channel, not user-visible
-        // work. Skip live progress for it (same exclusion the existing
-        // tool_call handler applies to the tool block).
-        if (event.toolName === "MessageChannel") return;
+        // ChannelAction and NotifyUser are outbound channel tools, not user-visible
+        // work. Skip live progress for them.
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
         const argsPreview = buildArgsPreview(event.toolName, event.args);
         for (const source of event.sources) {
           const { chatId } = source;
@@ -1288,7 +1291,11 @@ export function createMatrixAdapter(
       }
 
       if (event.type === "tool_ended") {
-        if (event.toolName === "MessageChannel") return;
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
         for (const source of event.sources) {
           const { chatId } = source;
           const running = runningToolByChatId.get(chatId);
@@ -1321,14 +1328,18 @@ export function createMatrixAdapter(
       }
 
       if (event.type === "tool_call") {
-        // Any tool call (including MessageChannel) interrupts the reasoning stream.
+        // Any tool call interrupts the reasoning stream.
         // Mark that the next reasoning chunk should prepend a separator.
         for (const source of event.sources) {
           if (reasoningMessageIdByChatId.has(source.chatId)) {
             reasoningNeedsSeparatorByChatId.add(source.chatId);
           }
         }
-        if (event.toolName === "MessageChannel") return;
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
         for (const source of event.sources) {
           scheduleToolBlockUpdate(
             source.chatId,

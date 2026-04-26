@@ -1130,7 +1130,8 @@ async function makeLifecycleAdapter() {
 
 function getLifecycleFakeClient(): FakeMatrixClient {
   // The lifecycle adapter is created after other adapters in setup; get the last instance
-  const client = FakeMatrixClient.instances[FakeMatrixClient.instances.length - 1];
+  const client =
+    FakeMatrixClient.instances[FakeMatrixClient.instances.length - 1];
   if (!client) throw new Error("No FakeMatrixClient created");
   return client;
 }
@@ -1181,8 +1182,7 @@ test("Matrix turn state: finished(completed) edits last response with completion
   const client = getLifecycleFakeClient();
 
   // processing stamps turn start; sendMessage captures last response event ID
-  client.sendMessage
-    .mockResolvedValueOnce("$response-1"); // plain text response
+  client.sendMessage.mockResolvedValueOnce("$response-1"); // plain text response
 
   await adapter.handleTurnLifecycleEvent!({
     type: "processing",
@@ -1209,7 +1209,10 @@ test("Matrix turn state: finished(completed) edits last response with completion
   // Two sendMessage calls: response + footer edit
   expect(client.sendMessage).toHaveBeenCalledTimes(2);
 
-  const [footerRoom, footerContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  const [footerRoom, footerContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(footerRoom).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
 
   // Must be an m.replace edit on the response event ID
@@ -1221,7 +1224,7 @@ test("Matrix turn state: finished(completed) edits last response with completion
   // formatted_body must contain the green check and "completed in"
   const newContent = footerContent["m.new_content"] as Record<string, unknown>;
   const html = newContent.formatted_body as string;
-  expect(html).toContain("data-mx-color=\"#3fb950\"");
+  expect(html).toContain('data-mx-color="#3fb950"');
   expect(html).toContain("✓");
   expect(html).toContain("completed in");
 
@@ -1251,15 +1254,21 @@ test("Matrix tool block: first tool_call sends thinking placeholder then tool bl
   expect(client.sendMessage).toHaveBeenCalledTimes(2);
 
   // First call: thinking placeholder (no m.relates_to = new message)
-  const [room0, content0] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  const [room0, content0] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(room0).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
-  expect((content0 as Record<string, unknown>).formatted_body as string).toContain(
-    "<b>Thinking...</b>",
-  );
+  expect(
+    (content0 as Record<string, unknown>).formatted_body as string,
+  ).toContain("<b>Thinking...</b>");
   expect((content0 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
 
   // Second call: tool block (no m.relates_to = new message)
-  const [room1, content1] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  const [room1, content1] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(room1).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
   expect((content1 as Record<string, unknown>).body).toContain("bash");
   expect((content1 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
@@ -1293,13 +1302,20 @@ test("Matrix tool block: second tool_call edits tool block via m.replace", async
   // 3 calls: thinking placeholder + tool block create + tool block edit
   expect(client.sendMessage).toHaveBeenCalledTimes(3);
 
-  const thirdCall = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
+  const thirdCall = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
   const thirdContent = thirdCall[1];
-  const relatesTo = thirdContent["m.relates_to"] as Record<string, unknown> | undefined;
+  const relatesTo = thirdContent["m.relates_to"] as
+    | Record<string, unknown>
+    | undefined;
   expect(relatesTo?.rel_type).toBe("m.replace");
   expect(relatesTo?.event_id).toBe("$tool-block-1");
 
-  const newContent = thirdContent["m.new_content"] as Record<string, unknown> | undefined;
+  const newContent = thirdContent["m.new_content"] as
+    | Record<string, unknown>
+    | undefined;
   expect(newContent?.body).toContain("bash");
   expect(newContent?.body).toContain("read_file");
 });
@@ -1322,15 +1338,21 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
 
   await new Promise((r) => setTimeout(r, 200));
 
-  const calls = client.sendMessage.mock.calls as Array<[string, Record<string, unknown>]>;
+  const calls = client.sendMessage.mock.calls as Array<
+    [string, Record<string, unknown>]
+  >;
   // calls[0]: thinking placeholder (no m.relates_to)
   expect(calls[0]![1]["m.relates_to"]).toBeUndefined();
-  expect((calls[0]![1] as Record<string, unknown>).formatted_body as string).toContain("Thinking...");
+  expect(
+    (calls[0]![1] as Record<string, unknown>).formatted_body as string,
+  ).toContain("Thinking...");
   // calls[1]: tool block create (no m.relates_to)
   expect(calls[1]![1]["m.relates_to"]).toBeUndefined();
   // calls[2..150]: tool block edits
   for (let i = 2; i < calls.length; i++) {
-    const relatesTo = calls[i]![1]["m.relates_to"] as Record<string, unknown> | undefined;
+    const relatesTo = calls[i]![1]["m.relates_to"] as
+      | Record<string, unknown>
+      | undefined;
     expect(relatesTo?.rel_type).toBe("m.replace");
   }
   // 1 thinking placeholder + 1 tool block create + 149 edits = 151
@@ -1376,10 +1398,18 @@ test("Matrix tool block: cleared on finished, no redaction (thinking stays)", as
   await new Promise((r) => setTimeout(r, 10));
 
   // Second turn's thinking placeholder is a new message (no m.relates_to)
-  const secondThinking = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
+  const secondThinking = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(secondThinking[1]["m.relates_to"]).toBeUndefined();
-  expect((secondThinking[1] as Record<string, unknown>).formatted_body as string).toContain("Thinking...");
-  const secondTool = client.sendMessage.mock.calls[3] as [string, Record<string, unknown>];
+  expect(
+    (secondThinking[1] as Record<string, unknown>).formatted_body as string,
+  ).toContain("Thinking...");
+  const secondTool = client.sendMessage.mock.calls[3] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(secondTool[1]["m.relates_to"]).toBeUndefined();
 });
 
@@ -1404,7 +1434,10 @@ test("Matrix tool block: no thinking placeholder when showReasoning is false", a
 
   // Only 1 message (tool block only, no thinking placeholder)
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect((content as Record<string, unknown>).body).toContain("bash");
   expect((content as Record<string, unknown>).formatted_body).toBeUndefined();
 
@@ -1418,8 +1451,8 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   await adapter.start();
   const client = getFakeClient();
   client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")    // initial thinking message
-    .mockResolvedValueOnce("$answer-1")      // plain answer (sendMessage)
+    .mockResolvedValueOnce("$thinking-1") // initial thinking message
+    .mockResolvedValueOnce("$answer-1") // plain answer (sendMessage)
     .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
     .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
 
@@ -1450,8 +1483,13 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   expect(result.messageId).toBe("$answer-1");
 
   // Second call: plain answer (no m.relates_to)
-  const [, answerContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
-  expect((answerContent as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+  const [, answerContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(
+    (answerContent as Record<string, unknown>)["m.relates_to"],
+  ).toBeUndefined();
 
   // Thinking is finalized only when the turn ends
   await adapter.handleTurnLifecycleEvent!({
@@ -1465,9 +1503,15 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   expect(client.sendMessage).toHaveBeenCalledTimes(4);
 
   // Third call: final edit of thinking message
-  const [, editContent] = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
+  const [, editContent] = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
   const ec = editContent as Record<string, unknown>;
-  expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
+  expect(ec["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
   const newContent = ec["m.new_content"] as Record<string, unknown>;
   const editHtml = newContent.formatted_body as string;
   expect(editHtml).toContain("<b>Thinking</b>");
@@ -1477,9 +1521,15 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   expect(editHtml).toContain("Found 3 results.");
 
   // Fourth call: completion footer edit on the answer message
-  const [, footerEditContent] = client.sendMessage.mock.calls[3] as [string, Record<string, unknown>];
+  const [, footerEditContent] = client.sendMessage.mock.calls[3] as [
+    string,
+    Record<string, unknown>,
+  ];
   const fe = footerEditContent as Record<string, unknown>;
-  expect(fe["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$answer-1" });
+  expect(fe["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$answer-1",
+  });
 
   await adapter.stop();
 });
@@ -1497,7 +1547,10 @@ test("matrix adapter sends message normally when no reasoning was received", asy
   });
 
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
   expect(client.redactEvent).not.toHaveBeenCalled();
 
@@ -1506,7 +1559,10 @@ test("matrix adapter sends message normally when no reasoning was received", asy
 
 test("matrix adapter skips reasoning drawer when showReasoning is false", async () => {
   const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
-  const adapter = createMatrixAdapter({ ...TEST_ACCOUNT, showReasoning: false });
+  const adapter = createMatrixAdapter({
+    ...TEST_ACCOUNT,
+    showReasoning: false,
+  });
   await adapter.start();
   const client = getFakeClient();
 
@@ -1531,7 +1587,10 @@ test("matrix adapter skips reasoning drawer when showReasoning is false", async 
   });
 
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const [, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
   expect(client.redactEvent).not.toHaveBeenCalled();
 
@@ -1546,7 +1605,7 @@ test("matrix adapter: thinking placeholder (no reasoning content) stays, plain a
   client.sendMessage
     .mockResolvedValueOnce("$thinking-placeholder") // from tool call path
     .mockResolvedValueOnce("$tool-block-1")
-    .mockResolvedValueOnce("$plain-response");       // plain answer (buffer empty, no final edit)
+    .mockResolvedValueOnce("$plain-response"); // plain answer (buffer empty, no final edit)
 
   const source = {
     channel: "matrix" as const,
@@ -1580,9 +1639,14 @@ test("matrix adapter: thinking placeholder (no reasoning content) stays, plain a
   // (no final edit because buffer was empty)
   expect(client.sendMessage).toHaveBeenCalledTimes(3);
 
-  const [, responseContent] = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
+  const [, responseContent] = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect((responseContent as Record<string, unknown>).body).toBe("Done.");
-  expect((responseContent as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+  expect(
+    (responseContent as Record<string, unknown>)["m.relates_to"],
+  ).toBeUndefined();
   expect(result.messageId).toBe("$plain-response");
 
   await adapter.stop();
@@ -1593,7 +1657,7 @@ test("matrix adapter: thinking finalized when turn ends without response", async
   await adapter.start();
   const client = getFakeClient();
   client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")    // initial thinking message
+    .mockResolvedValueOnce("$thinking-1") // initial thinking message
     .mockResolvedValueOnce("$thinking-final"); // final edit
 
   const source = {
@@ -1620,13 +1684,19 @@ test("matrix adapter: thinking finalized when turn ends without response", async
 
   // Final edit sent (summary changes from "Thinking..." to "Thinking")
   expect(client.sendMessage).toHaveBeenCalledTimes(2);
-  const [, editContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
   const ec = editContent as Record<string, unknown>;
-  expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
+  expect(ec["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
   const newContent = ec["m.new_content"] as Record<string, unknown>;
-  expect((newContent.formatted_body as string)).toContain("<b>Thinking</b>");
-  expect((newContent.formatted_body as string)).toContain("<blockquote>");
-  expect((newContent.formatted_body as string)).not.toContain("Thinking...");
+  expect(newContent.formatted_body as string).toContain("<b>Thinking</b>");
+  expect(newContent.formatted_body as string).toContain("<blockquote>");
+  expect(newContent.formatted_body as string).not.toContain("Thinking...");
 
   await adapter.stop();
 });
@@ -1636,9 +1706,9 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   await adapter.start();
   const client = getFakeClient();
   client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")    // initial thinking message
-    .mockResolvedValueOnce("$tool-block-1")  // tool block
-    .mockResolvedValueOnce("$answer-1")      // response
+    .mockResolvedValueOnce("$thinking-1") // initial thinking message
+    .mockResolvedValueOnce("$tool-block-1") // tool block
+    .mockResolvedValueOnce("$answer-1") // response
     .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
     .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
 
@@ -1696,9 +1766,15 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   expect(client.sendMessage).toHaveBeenCalledTimes(5);
 
   // 4th call: final edit of thinking message
-  const [, editContent] = client.sendMessage.mock.calls[3] as [string, Record<string, unknown>];
+  const [, editContent] = client.sendMessage.mock.calls[3] as [
+    string,
+    Record<string, unknown>,
+  ];
   const ec = editContent as Record<string, unknown>;
-  expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
+  expect(ec["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
   const newContent = ec["m.new_content"] as Record<string, unknown>;
   const editHtml = newContent.formatted_body as string;
   expect(editHtml).toContain("First thought.");
@@ -1706,9 +1782,15 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   expect(editHtml).toContain("<hr>"); // separator between segments
 
   // 5th call: completion footer edit on the answer message
-  const [, footerEditContent] = client.sendMessage.mock.calls[4] as [string, Record<string, unknown>];
+  const [, footerEditContent] = client.sendMessage.mock.calls[4] as [
+    string,
+    Record<string, unknown>,
+  ];
   const fe = footerEditContent as Record<string, unknown>;
-  expect(fe["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$answer-1" });
+  expect(fe["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$answer-1",
+  });
 
   await adapter.stop();
 });
@@ -1879,8 +1961,7 @@ test("matrix adapter !compact replies Compaction triggered.", async () => {
   });
 
   const call = client.sendMessage.mock.calls.find(
-    (c) =>
-      (c[1] as Record<string, unknown>).body === "Compaction triggered.",
+    (c) => (c[1] as Record<string, unknown>).body === "Compaction triggered.",
   );
   expect(call).toBeDefined();
 });
@@ -2129,7 +2210,11 @@ test("matrix adapter !conv switch 2 uses cached list", async () => {
       agents: { messages: { compact: async () => ({}) } },
       conversations: {
         list: async () => [
-          { id: "named-conv-1", agent_id: "agent-1", summary: "My Conv" } as unknown as Record<string, unknown>,
+          {
+            id: "named-conv-1",
+            agent_id: "agent-1",
+            summary: "My Conv",
+          } as unknown as Record<string, unknown>,
         ],
         create: async () => ({ id: "c1" }),
         fork: async () => ({ id: "cf" }),
@@ -2160,8 +2245,7 @@ test("matrix adapter !conv switch 2 uses cached list", async () => {
   });
 
   const call = client.sendMessage.mock.calls.find(
-    (c) =>
-      (c[1] as Record<string, unknown>).body === "Switched to: My Conv.",
+    (c) => (c[1] as Record<string, unknown>).body === "Switched to: My Conv.",
   );
   expect(call).toBeDefined();
   expect(updateRouteConversation).toHaveBeenCalled();
@@ -2184,7 +2268,11 @@ test("matrix adapter !conv delete 2 deletes named conv and replies Deleted.", as
       agents: { messages: { compact: async () => ({}) } },
       conversations: {
         list: async () => [
-          { id: "named-conv-del", agent_id: "agent-1", summary: "To Delete" } as unknown as Record<string, unknown>,
+          {
+            id: "named-conv-del",
+            agent_id: "agent-1",
+            summary: "To Delete",
+          } as unknown as Record<string, unknown>,
         ],
         create: async () => ({ id: "c1" }),
         fork: async () => ({ id: "cf" }),
@@ -2237,7 +2325,11 @@ test("matrix adapter stop() clears convListCache", async () => {
       agents: { messages: { compact: async () => ({}) } },
       conversations: {
         list: async () => [
-          { id: "conv-cached", agent_id: "agent-1", summary: "Cached" } as unknown as Record<string, unknown>,
+          {
+            id: "conv-cached",
+            agent_id: "agent-1",
+            summary: "Cached",
+          } as unknown as Record<string, unknown>,
         ],
         create: async () => ({ id: "c1" }),
         fork: async () => ({ id: "cf" }),
@@ -2267,8 +2359,7 @@ test("matrix adapter stop() clears convListCache", async () => {
     content: { msgtype: "m.text", body: "!conv switch 2" },
   });
   const switchBeforeStop = client.sendMessage.mock.calls.find(
-    (c) =>
-      (c[1] as Record<string, unknown>).body === "Switched to: Cached.",
+    (c) => (c[1] as Record<string, unknown>).body === "Switched to: Cached.",
   );
   expect(switchBeforeStop).toBeDefined();
 
@@ -2289,11 +2380,10 @@ test("matrix adapter stop() clears convListCache", async () => {
     event_id: "$conv-switch-after-stop",
     content: { msgtype: "m.text", body: "!conv switch 2" },
   });
-  const switchAfterStop = client2.sendMessage.mock.calls.find(
-    (c) =>
-      ((c[1] as Record<string, unknown>).body as string)?.includes(
-        "Run conv list first",
-      ),
+  const switchAfterStop = client2.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.includes(
+      "Run conv list first",
+    ),
   );
   expect(switchAfterStop).toBeDefined();
 });
@@ -2310,9 +2400,8 @@ test("matrix adapter !help replies with all command names", async () => {
     content: { msgtype: "m.text", body: "!help" },
   });
 
-  const helpCall = client.sendMessage.mock.calls.find(
-    (c) =>
-      ((c[1] as Record<string, unknown>).body as string)?.includes("!cancel"),
+  const helpCall = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.includes("!cancel"),
   );
   expect(helpCall).toBeDefined();
   const body = (helpCall![1] as Record<string, unknown>).body as string;
@@ -2593,7 +2682,7 @@ test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis",
   expect(lastEdit).not.toContain("buildArgsPreview");
 });
 
-test("Matrix tool progress: MessageChannel does not trigger tool-progress UI", async () => {
+test("Matrix tool progress: ChannelAction and NotifyUser do not trigger tool-progress UI", async () => {
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2601,16 +2690,16 @@ test("Matrix tool progress: MessageChannel does not trigger tool-progress UI", a
   await adapter.handleTurnLifecycleEvent!({
     type: "tool_started",
     batchId: "batch-1",
-    toolCallId: "call-mc",
-    toolName: "MessageChannel",
-    args: { channel: "matrix", action: "send", message: "hi" },
+    toolCallId: "call-ca",
+    toolName: "ChannelAction",
+    args: { action: "react", emoji: "👍" },
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
   await new Promise((r) => setTimeout(r, 50));
 
   const edits = getEditedFormattedBodies(client);
-  // No placeholder edits — MessageChannel is the bot's outbound path, not work
-  // we're surfacing as "running".
+  // No placeholder edits — ChannelAction is the bot's outbound channel path,
+  // not work we're surfacing as "running".
   expect(edits.length).toBe(0);
 });
 
@@ -2646,11 +2735,9 @@ test("Matrix tool progress: tool that completes inside grace window is invisible
   expect(edits.length).toBe(0);
   // And no thinking placeholder was created either (since tool was suppressed
   // and there was no reasoning content).
-  const placeholderCreates = (client.sendMessage.mock.calls as Array<
-    [string, Record<string, unknown>]
-  >).filter(
-    (c) => c[1]["m.relates_to"] === undefined,
-  );
+  const placeholderCreates = (
+    client.sendMessage.mock.calls as Array<[string, Record<string, unknown>]>
+  ).filter((c) => c[1]["m.relates_to"] === undefined);
   expect(placeholderCreates.length).toBe(0);
 });
 
@@ -2694,10 +2781,12 @@ test("Matrix turn state: finished(error) with thinking block appends error foote
   const client = getLifecycleFakeClient();
 
   client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")   // initial thinking placeholder
-    .mockResolvedValueOnce("$finalize-1");  // final edit at finished
+    .mockResolvedValueOnce("$thinking-1") // initial thinking placeholder
+    .mockResolvedValueOnce("$finalize-1"); // final edit at finished
 
-  await adapter.handleStreamReasoning!("Checking email…", [MATRIX_LIFECYCLE_SOURCE]);
+  await adapter.handleStreamReasoning!("Checking email…", [
+    MATRIX_LIFECYCLE_SOURCE,
+  ]);
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
   await adapter.handleTurnLifecycleEvent!({
@@ -2709,7 +2798,10 @@ test("Matrix turn state: finished(error) with thinking block appends error foote
 
   expect(client.sendMessage).toHaveBeenCalledTimes(2);
 
-  const [, editContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(editContent["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$thinking-1",
@@ -2718,7 +2810,7 @@ test("Matrix turn state: finished(error) with thinking block appends error foote
   const newContent = editContent["m.new_content"] as Record<string, unknown>;
   const html = newContent.formatted_body as string;
   expect(html).toContain("Checking email");
-  expect(html).toContain("data-mx-color=\"#f85149\"");
+  expect(html).toContain('data-mx-color="#f85149"');
   expect(html).toContain("⚠ Turn failed");
   expect(html).not.toContain("✓");
 });
@@ -2739,12 +2831,15 @@ test("Matrix turn state: finished(error) with no thinking block sends fallback e
 
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
-  const [room, content] = client.sendMessage.mock.calls[0] as [string, Record<string, unknown>];
+  const [room, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(room).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
   expect(content["m.relates_to"]).toBeUndefined();
 
   const html = content.formatted_body as string;
-  expect(html).toContain("data-mx-color=\"#f85149\"");
+  expect(html).toContain('data-mx-color="#f85149"');
   expect(html).toContain("⚠ Turn failed");
   expect(html).toContain("didn't complete");
 });
@@ -2758,7 +2853,9 @@ test("Matrix turn state: finished(cancelled) with thinking block appends cancell
     .mockResolvedValueOnce("$thinking-1")
     .mockResolvedValueOnce("$finalize-1");
 
-  await adapter.handleStreamReasoning!("Drafting essay…", [MATRIX_LIFECYCLE_SOURCE]);
+  await adapter.handleStreamReasoning!("Drafting essay…", [
+    MATRIX_LIFECYCLE_SOURCE,
+  ]);
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
   await adapter.handleTurnLifecycleEvent!({
@@ -2770,7 +2867,10 @@ test("Matrix turn state: finished(cancelled) with thinking block appends cancell
 
   expect(client.sendMessage).toHaveBeenCalledTimes(2);
 
-  const [, editContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
   expect(editContent["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$thinking-1",
@@ -2779,7 +2879,7 @@ test("Matrix turn state: finished(cancelled) with thinking block appends cancell
   const newContent = editContent["m.new_content"] as Record<string, unknown>;
   const html = newContent.formatted_body as string;
   expect(html).toContain("Drafting essay");
-  expect(html).toContain("data-mx-color=\"#e3b341\"");
+  expect(html).toContain('data-mx-color="#e3b341"');
   expect(html).toContain("· Cancelled");
 });
 

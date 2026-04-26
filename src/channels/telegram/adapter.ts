@@ -9,7 +9,7 @@ import type { Letta } from "@letta-ai/letta-client";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
 import { getClient } from "../../agent/client";
-import { markdownToTelegramHtml } from "../../tools/impl/MessageChannel";
+import { markdownToTelegramHtml } from "../format";
 import { formatChannelControlRequestPrompt } from "../interactive";
 import {
   handleOperatorCommand,
@@ -899,7 +899,11 @@ export function createTelegramAdapter(
       }
 
       if (event.type === "tool_call") {
-        if (event.toolName === "MessageChannel") return;
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
         for (const source of event.sources) {
           scheduleToolBlockUpdate(
             source.chatId,

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import {
   markdownToMatrixHtml,
   stripMarkdownToPlainText,
-} from "../../tools/impl/MessageChannel";
+} from "../../channels/format";
 
 test("markdownToMatrixHtml converts bold", () => {
   const result = markdownToMatrixHtml("**hello world**");

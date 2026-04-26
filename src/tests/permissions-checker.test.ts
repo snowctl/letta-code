@@ -484,10 +484,22 @@ test("TodoWrite defaults to allow", () => {
   expect(result.decision).toBe("allow");
 });
 
-test("MessageChannel defaults to allow", () => {
+test("ChannelAction defaults to allow", () => {
   const result = checkPermission(
-    "MessageChannel",
-    { channel: "telegram", message: "hello there" },
+    "ChannelAction",
+    { action: "react", emoji: "👍" },
+    { allow: [], deny: [], ask: [] },
+    "/Users/test/project",
+  );
+
+  expect(result.decision).toBe("allow");
+  expect(result.reason).toBe("Default behavior for tool");
+});
+
+test("NotifyUser defaults to allow", () => {
+  const result = checkPermission(
+    "NotifyUser",
+    { channel: "telegram", chat_id: "123", message: "hello there" },
     { allow: [], deny: [], ask: [] },
     "/Users/test/project",
   );

@@ -15,7 +15,6 @@ import {
   clearChannelAccountStores,
   upsertChannelAccount,
 } from "../../channels/accounts";
-import { clearDynamicMessageChannelToolCache } from "../../channels/messageTool";
 import { ChannelRegistry, getChannelRegistry } from "../../channels/registry";
 import { setRouteInMemory } from "../../channels/routing";
 import type { ChannelAdapter } from "../../channels/types";
@@ -73,7 +72,6 @@ describe("tool execution context snapshot", () => {
     if (registry) {
       await registry.stopAll();
     }
-    clearDynamicMessageChannelToolCache();
     clearCapturedToolExecutionContexts();
     clearChannelAccountStores();
     __testOverrideLoadChannelAccounts(null);
@@ -168,39 +166,17 @@ describe("tool execution context snapshot", () => {
     expect(prepared.loadedToolNames).not.toContain("RunShellCommand");
   });
 
-  test("prepares current tool snapshots with fresh MessageChannel discovery", async () => {
+  test("prepares current tool snapshots with ChannelAction and NotifyUser when channels are active", async () => {
     await loadSpecificTools(["Read"]);
 
     const registry = new ChannelRegistry();
     registry.registerAdapter(createRunningAdapter("slack", "acct-slack"));
 
     const prepared = await prepareCurrentToolExecutionContext();
-    const messageChannel = prepared.clientTools.find(
-      (tool) => tool.name === "MessageChannel",
-    );
 
-    expect(prepared.loadedToolNames).toContain("MessageChannel");
-    expect(messageChannel).toBeDefined();
-    expect(messageChannel?.description).toContain(
-      "Currently active channels: Slack.",
-    );
-
-    if (!messageChannel) {
-      throw new Error("MessageChannel tool was not prepared");
-    }
-
-    if (!messageChannel.parameters) {
-      throw new Error("MessageChannel tool is missing parameters");
-    }
-
-    const actionParameter = (
-      messageChannel.parameters.properties as Record<
-        string,
-        { enum?: string[] }
-      >
-    ).action;
-
-    expect(actionParameter?.enum).toEqual(["send", "react", "upload-file"]);
+    expect(prepared.loadedToolNames).toContain("ChannelAction");
+    expect(prepared.loadedToolNames).toContain("NotifyUser");
+    expect(prepared.loadedToolNames).not.toContain("MessageChannel");
   });
 
   test("captures scoped working directories per execution context", async () => {
@@ -252,24 +228,21 @@ describe("tool execution context snapshot", () => {
     }
   });
 
-  test("refreshes the loaded MessageChannel schema for synchronous readers", async () => {
+  test("refreshDynamicChannelToolsInLoadedRegistry is a no-op (ChannelAction/NotifyUser have static schemas)", async () => {
     await loadSpecificTools(["Read"]);
 
     const registry = new ChannelRegistry();
     registry.registerAdapter(createRunningAdapter("telegram", "acct-telegram"));
 
+    // Should not throw
     await refreshDynamicChannelToolsInLoadedRegistry();
 
-    const schema = getToolSchema("MessageChannel");
-    expect(schema?.description).toContain(
-      "Currently active channels: Telegram.",
-    );
-    expect(
-      (schema?.input_schema.properties?.channel as { enum?: string[] }).enum,
-    ).toEqual(["telegram"]);
+    // ChannelAction and NotifyUser are not in the loaded registry (only Read was loaded)
+    const channelActionSchema = getToolSchema("ChannelAction");
+    expect(channelActionSchema).toBeUndefined();
   });
 
-  test("omits MessageChannel from scoped snapshots when the conversation has no bound channel routes", async () => {
+  test("omits ChannelAction and NotifyUser from scoped snapshots when the conversation has no bound channel routes", async () => {
     await loadSpecificTools(["Read"]);
 
     const registry = new ChannelRegistry();
@@ -282,20 +255,17 @@ describe("tool execution context snapshot", () => {
       },
     );
 
+    expect(prepared.loadedToolNames).not.toContain("ChannelAction");
+    expect(prepared.loadedToolNames).not.toContain("NotifyUser");
     expect(prepared.loadedToolNames).not.toContain("MessageChannel");
-    expect(
-      prepared.clientTools.some((tool) => tool.name === "MessageChannel"),
-    ).toBe(false);
   });
 
-  test("preserves scoped MessageChannel discovery even when the global cache was seeded differently", async () => {
+  test("includes ChannelAction and NotifyUser when channelToolScope has active channels", async () => {
     await loadSpecificTools(["Read"]);
 
     const registry = new ChannelRegistry();
     registry.registerAdapter(createRunningAdapter("slack", "acct-slack"));
     registry.registerAdapter(createRunningAdapter("telegram", "acct-telegram"));
-
-    await refreshDynamicChannelToolsInLoadedRegistry();
 
     const prepared = await prepareToolExecutionContextForModel(
       "anthropic/claude-opus-4-1-20250805",
@@ -305,26 +275,13 @@ describe("tool execution context snapshot", () => {
         },
       },
     );
-    const messageChannel = prepared.clientTools.find(
-      (tool) => tool.name === "MessageChannel",
-    );
 
-    expect(prepared.loadedToolNames).toContain("MessageChannel");
-    expect(messageChannel?.description).toContain(
-      "Currently active channels: Slack.",
-    );
-    expect(messageChannel?.description).not.toContain("Telegram");
-    expect(
-      (
-        messageChannel?.parameters?.properties as Record<
-          string,
-          { enum?: string[] }
-        >
-      ).channel?.enum,
-    ).toEqual(["slack"]);
+    expect(prepared.loadedToolNames).toContain("ChannelAction");
+    expect(prepared.loadedToolNames).toContain("NotifyUser");
+    expect(prepared.loadedToolNames).not.toContain("MessageChannel");
   });
 
-  test("does not leak MessageChannel into conversations that only share an agent-level Slack account", async () => {
+  test("does not leak ChannelAction/NotifyUser into conversations that only share an agent-level Slack account", async () => {
     installChannelAccountTestOverrides();
     await loadSpecificTools(["Read"]);
 
@@ -357,10 +314,12 @@ describe("tool execution context snapshot", () => {
       },
     );
 
+    expect(prepared.loadedToolNames).not.toContain("ChannelAction");
+    expect(prepared.loadedToolNames).not.toContain("NotifyUser");
     expect(prepared.loadedToolNames).not.toContain("MessageChannel");
   });
 
-  test("includes MessageChannel in scoped snapshots when the conversation has a Slack route", async () => {
+  test("includes ChannelAction and NotifyUser in scoped snapshots when the conversation has a Slack route", async () => {
     installChannelAccountTestOverrides();
     await loadSpecificTools(["Read"]);
 
@@ -406,10 +365,12 @@ describe("tool execution context snapshot", () => {
       },
     );
 
-    expect(prepared.loadedToolNames).toContain("MessageChannel");
+    expect(prepared.loadedToolNames).toContain("ChannelAction");
+    expect(prepared.loadedToolNames).toContain("NotifyUser");
+    expect(prepared.loadedToolNames).not.toContain("MessageChannel");
   });
 
-  test("does not grant proactive MessageChannel scope for Telegram-only accounts", async () => {
+  test("does not grant ChannelAction/NotifyUser scope for Telegram-only accounts (no explicit route)", async () => {
     installChannelAccountTestOverrides();
     await loadSpecificTools(["Read"]);
 
@@ -442,6 +403,8 @@ describe("tool execution context snapshot", () => {
       },
     );
 
+    expect(prepared.loadedToolNames).not.toContain("ChannelAction");
+    expect(prepared.loadedToolNames).not.toContain("NotifyUser");
     expect(prepared.loadedToolNames).not.toContain("MessageChannel");
   });
 });

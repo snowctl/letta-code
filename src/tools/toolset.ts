@@ -125,10 +125,7 @@ function getToolNamesForToolset(
       ? (channelToolScope?.channels.length ?? 0) > 0
       : (getChannelRegistry()?.getActiveChannelIds().length ?? 0) > 0;
 
-  // Append channel tool if channels are active (covers ALL pinned toolsets)
-  if (hasScopedChannelTool && !tools.includes("MessageChannel" as ToolName)) {
-    tools.push("MessageChannel" as ToolName);
-  }
+  // Append channel tools if channels are active (covers ALL pinned toolsets)
   if (hasScopedChannelTool && !tools.includes("ChannelAction" as ToolName)) {
     tools.push("ChannelAction" as ToolName);
     tools.push("NotifyUser" as ToolName);

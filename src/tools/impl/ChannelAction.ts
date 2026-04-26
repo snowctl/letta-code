@@ -1,7 +1,7 @@
+import { formatOutboundChannelMessage } from "../../channels/format";
 import { loadChannelPlugin } from "../../channels/pluginRegistry";
 import type { ChannelRegistry } from "../../channels/registry";
 import { getChannelRegistry } from "../../channels/registry";
-import { formatOutboundChannelMessage } from "./MessageChannel";
 
 export type ChannelActionArgs = {
   action: "react" | "edit" | "thread-reply" | "upload-file";

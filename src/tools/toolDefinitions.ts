@@ -16,7 +16,6 @@ import ListDirectoryGeminiDescription from "./descriptions/ListDirectoryGemini.m
 import LSDescription from "./descriptions/LS.md";
 import MemoryDescription from "./descriptions/Memory.md";
 import MemoryApplyPatchDescription from "./descriptions/MemoryApplyPatch.md";
-import MessageChannelDescription from "./descriptions/MessageChannel.md";
 import MultiEditDescription from "./descriptions/MultiEdit.md";
 import ReadDescription from "./descriptions/Read.md";
 import ReadFileCodexDescription from "./descriptions/ReadFileCodex.md";
@@ -61,7 +60,6 @@ import { list_directory } from "./impl/ListDirectoryGemini";
 import { ls } from "./impl/LS";
 import { memory } from "./impl/Memory";
 import { memory_apply_patch } from "./impl/MemoryApplyPatch";
-import { message_channel } from "./impl/MessageChannel";
 import { multi_edit } from "./impl/MultiEdit";
 import {
   NotifyUserDescription,
@@ -106,7 +104,6 @@ import ListDirectoryGeminiSchema from "./schemas/ListDirectoryGemini.json";
 import LSSchema from "./schemas/LS.json";
 import MemorySchema from "./schemas/Memory.json";
 import MemoryApplyPatchSchema from "./schemas/MemoryApplyPatch.json";
-import MessageChannelSchema from "./schemas/MessageChannel.json";
 import MultiEditSchema from "./schemas/MultiEdit.json";
 import ReadSchema from "./schemas/Read.json";
 import ReadFileCodexSchema from "./schemas/ReadFileCodex.json";
@@ -212,11 +209,6 @@ const toolDefinitions = {
     schema: MemoryApplyPatchSchema,
     description: MemoryApplyPatchDescription.trim(),
     impl: memory_apply_patch as unknown as ToolImplementation,
-  },
-  MessageChannel: {
-    schema: MessageChannelSchema,
-    description: MessageChannelDescription.trim(),
-    impl: message_channel as unknown as ToolImplementation,
   },
   MultiEdit: {
     schema: MultiEditSchema,

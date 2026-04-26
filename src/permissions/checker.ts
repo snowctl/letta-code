@@ -772,7 +772,8 @@ function getDefaultDecision(
     "memory",
     "memory_apply_patch",
     // Channel sends are scoped by routing + parentScope checks in the tool.
-    "MessageChannel",
+    "ChannelAction",
+    "NotifyUser",
   ];
 
   if (autoAllowTools.includes(toolName)) {
