@@ -481,7 +481,7 @@ const CHANNEL_OUTBOUND_FORMATTERS: Partial<
   },
   matrix(text) {
     return {
-      text: stripMarkdownToPlainText(text),
+      text,
       parseMode: "HTML",
     };
   },
