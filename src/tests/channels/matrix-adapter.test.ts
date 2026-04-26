@@ -216,12 +216,12 @@ function getFakeClient(): FakeMatrixClient {
 
 // ── messageActions tests ───────────────────────────────────────────────────────
 
-test("matrixMessageActions.describeMessageTool returns send, react, upload-file", async () => {
+test("matrixMessageActions.describeMessageTool returns send, react, upload-file, edit", async () => {
   const { matrixMessageActions } = await import(
     "../../channels/matrix/messageActions"
   );
   const desc = matrixMessageActions.describeMessageTool({ accountId: "acc1" });
-  expect(desc.actions).toEqual(["send", "react", "upload-file"]);
+  expect(desc.actions).toEqual(["send", "react", "upload-file", "edit"]);
 });
 
 test("matrixMessageActions.handleAction send calls adapter.sendMessage", async () => {
@@ -250,6 +250,104 @@ test("matrixMessageActions.handleAction send calls adapter.sendMessage", async (
 
   expect(result).toContain("Message sent");
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
+});
+
+test("matrixMessageActions.handleAction edit sends m.replace with new content", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$edit-event");
+
+  const { matrixMessageActions } = await import(
+    "../../channels/matrix/messageActions"
+  );
+
+  const result = await matrixMessageActions.handleAction({
+    request: {
+      action: "edit",
+      chatId: "!room:example.com",
+      messageId: "$original-msg",
+      message: "updated body",
+    },
+    route: {
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      agentId: "a1",
+      conversationId: "c1",
+      enabled: true,
+      createdAt: "",
+    },
+    adapter,
+    formatText: (t: string) => ({ text: t }),
+  } as any);
+
+  expect(result).toContain("Message edited");
+  expect(result).toContain("$edit-event");
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const callArgs = client.sendMessage.mock.calls[0]![1] as Record<
+    string,
+    unknown
+  >;
+  expect(callArgs["m.relates_to"]).toEqual({
+    rel_type: "m.replace",
+    event_id: "$original-msg",
+  });
+  expect(callArgs["m.new_content"]).toBeDefined();
+  const newContent = callArgs["m.new_content"] as Record<string, unknown>;
+  expect(newContent.body).toBe("updated body");
+  expect((callArgs.body as string).startsWith("* ")).toBe(true);
+});
+
+test("matrixMessageActions.handleAction edit returns error when messageId missing", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const { matrixMessageActions } = await import(
+    "../../channels/matrix/messageActions"
+  );
+  const result = await matrixMessageActions.handleAction({
+    request: {
+      action: "edit",
+      chatId: "!room:example.com",
+      message: "x",
+    },
+    route: {
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      agentId: "a1",
+      conversationId: "c1",
+      enabled: true,
+      createdAt: "",
+    },
+    adapter,
+    formatText: (t: string) => ({ text: t }),
+  } as any);
+  expect(result).toMatch(/edit requires messageId/);
+});
+
+test("matrixMessageActions.handleAction edit returns error when message body missing", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const { matrixMessageActions } = await import(
+    "../../channels/matrix/messageActions"
+  );
+  const result = await matrixMessageActions.handleAction({
+    request: {
+      action: "edit",
+      chatId: "!room:example.com",
+      messageId: "$x",
+    },
+    route: {
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      agentId: "a1",
+      conversationId: "c1",
+      enabled: true,
+      createdAt: "",
+    },
+    adapter,
+    formatText: (t: string) => ({ text: t }),
+  } as any);
+  expect(result).toMatch(/edit requires message/);
 });
 
 test("matrixMessageActions.handleAction react calls adapter.sendMessage with reaction", async () => {

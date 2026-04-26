@@ -288,6 +288,11 @@ export interface OutboundChannelMessage {
   removeReaction?: boolean;
   /** Optional: target message id for reactions. */
   targetMessageId?: string;
+  /** Optional: target message id for edits. When set, the adapter rewrites
+   *  the body of the existing message (using the platform's native edit
+   *  primitive — `m.replace` on Matrix) instead of sending a new message.
+   *  Mutually exclusive with reaction/removeReaction/mediaPath. */
+  editTargetMessageId?: string;
 }
 
 // ── Routing ───────────────────────────────────────────────────────

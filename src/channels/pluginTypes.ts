@@ -30,7 +30,11 @@ export interface ChannelPluginMetadata {
   runtimeOverrides?: Readonly<Record<string, string>>;
 }
 
-export type ChannelMessageActionName = "send" | "react" | "upload-file";
+export type ChannelMessageActionName =
+  | "send"
+  | "react"
+  | "upload-file"
+  | "edit";
 
 export interface ChannelMessageToolSchemaContribution {
   properties: Record<string, unknown>;

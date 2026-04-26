@@ -1004,6 +1004,36 @@ export function createMatrixAdapter(
     ): Promise<{ messageId: string }> {
       const client = await ensureClient();
 
+      // Edit existing message via m.replace. The edit must be one the bot
+      // itself sent — Matrix homeservers reject m.replace events whose
+      // sender doesn't match the original. We don't enforce that here; the
+      // homeserver will fail the request and the error surfaces back to
+      // the agent.
+      if (msg.editTargetMessageId) {
+        const html = markdownToMatrixHtml(msg.text);
+        const eventId = await client.sendMessage(msg.chatId, {
+          msgtype: "m.text",
+          // Element clients render `* <text>` as the fallback for users on
+          // older clients that don't honor m.replace. Match the format the
+          // adapter already uses for thinking-placeholder edits so behavior
+          // stays consistent.
+          body: `* ${msg.text}`,
+          format: "org.matrix.custom.html",
+          formatted_body: `* ${html}`,
+          "m.new_content": {
+            msgtype: "m.text",
+            body: msg.text,
+            format: "org.matrix.custom.html",
+            formatted_body: html,
+          },
+          "m.relates_to": {
+            rel_type: "m.replace",
+            event_id: msg.editTargetMessageId,
+          },
+        });
+        return { messageId: String(eventId) };
+      }
+
       // Reaction add
       if (msg.reaction) {
         const eventId = await client.sendEvent(msg.chatId, "m.reaction", {

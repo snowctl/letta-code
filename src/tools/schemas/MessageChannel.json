@@ -3,7 +3,7 @@
   "properties": {
     "action": {
       "type": "string",
-      "description": "Action to perform. Prefer explicit values like 'send', 'react', or 'upload-file'."
+      "description": "Action to perform. Prefer explicit values like 'send', 'react', 'edit', or 'upload-file'."
     },
     "channel": {
       "type": "string",
@@ -23,7 +23,7 @@
     },
     "message": {
       "type": "string",
-      "description": "Text body for action='send'."
+      "description": "Text body. Required for action='send' (the message text) and action='edit' (the new message body that replaces the original)."
     },
     "replyTo": {
       "type": "string",
@@ -35,7 +35,7 @@
     },
     "messageId": {
       "type": "string",
-      "description": "Target message ID for actions like react."
+      "description": "Target message ID. Required for action='react' (the message you're reacting to) and action='edit' (the message you're editing — must be one *you* sent earlier)."
     },
     "emoji": {
       "type": "string",
