@@ -290,6 +290,7 @@ export function createDiscordAdapter(
     { state: LifecycleState; updatedAt: number }
   >();
   const lifecycleOperationByMessageKey = new Map<string, Promise<void>>();
+  const lastSentMessageIdByConversationId = new Map<string, string>();
 
   function buildIngressMessageKey(
     channelId: string | undefined,
@@ -886,6 +887,35 @@ export function createDiscordAdapter(
         content: text,
         ...(reply ?? {}),
       });
+    },
+
+    async handleAutoForward(
+      text: string,
+      sources: ChannelTurnSource[],
+    ): Promise<string | undefined> {
+      const source = sources[0];
+      if (!source) return undefined;
+      if (!client) throw new Error("Discord not started");
+      const targetChannelId = source.threadId ?? source.chatId;
+      const channel = await client.channels.fetch(targetChannelId);
+      if (!isDiscordSendableChannel(channel)) return undefined;
+      const chunks = splitMessageText(text, DISCORD_SPLIT_THRESHOLD);
+      let lastMessageId = "";
+      for (const chunk of chunks) {
+        const result = await channel.send({ content: chunk });
+        lastMessageId = result.id;
+      }
+      if (lastMessageId) {
+        lastSentMessageIdByConversationId.set(
+          source.conversationId,
+          lastMessageId,
+        );
+      }
+      return lastMessageId || undefined;
+    },
+
+    getLastSentMessageId(conversationId: string): string | null {
+      return lastSentMessageIdByConversationId.get(conversationId) ?? null;
     },
 
     async prepareInboundMessage(

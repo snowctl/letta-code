@@ -494,6 +494,7 @@ export function createSlackAdapter(
     { state: SlackLifecycleState; updatedAt: number }
   >();
   const lifecycleOperationByMessageKey = new Map<string, Promise<void>>();
+  const lastSentMessageIdByConversationId = new Map<string, string>();
 
   // ── Inbound debounce (optional) ───────────────────────────────
   // When `inboundDebounceMs > 0`, short back-to-back messages from the same
@@ -1382,6 +1383,30 @@ export function createSlackAdapter(
         response.ts,
         options?.replyToMessageId ?? response.ts ?? null,
       );
+    },
+
+    async handleAutoForward(
+      text: string,
+      sources: ChannelTurnSource[],
+    ): Promise<string | undefined> {
+      const source = sources[0];
+      if (!source) return undefined;
+      await ensureApp();
+      const slackClient = await ensureWriteClient();
+      const response = await slackClient.chat.postMessage({
+        channel: source.chatId,
+        text,
+        ...(source.threadId ? { thread_ts: source.threadId } : {}),
+      });
+      const messageId = response.ts ?? "";
+      if (messageId) {
+        lastSentMessageIdByConversationId.set(source.conversationId, messageId);
+      }
+      return messageId || undefined;
+    },
+
+    getLastSentMessageId(conversationId: string): string | null {
+      return lastSentMessageIdByConversationId.get(conversationId) ?? null;
     },
 
     async handleControlRequestEvent(
