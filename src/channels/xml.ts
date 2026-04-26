@@ -132,6 +132,16 @@ function buildResponseDirectives(msg: InboundChannelMessage): string[] {
   const channel = msg.channel;
   const lines: string[] = [];
 
+  // Lead with the strongest possible imperative. Plain assistant text
+  // does not reach the user on any channel — the platform delivery path
+  // is exclusively the MessageChannel tool. Without this header the
+  // model frequently produces a normal text reply, which silently
+  // disappears and looks to the user like the bot ignored them.
+  lines.push(
+    "**You MUST respond via the `MessageChannel` tool.** Plain assistant text is not delivered to the user on any channel — only `MessageChannel` calls reach the chat platform. The only way to stay silent is to end the turn without calling any tool. Do not write a final assistant message intending it to reach the user; it will be discarded.",
+  );
+  lines.push("");
+
   lines.push(
     `- **Reply with text** — call \`MessageChannel\` with \`action="send"\`, \`channel="${channel}"\`, and \`chat_id\` from the metadata above. Put your reply text in \`message\`.`,
   );
@@ -153,7 +163,7 @@ function buildResponseDirectives(msg: InboundChannelMessage): string[] {
   }
 
   lines.push(
-    "- **Stay silent** — if no reply is warranted (an old message you already addressed, an autonomous self-prompt, or an acknowledgment-only nudge), end the turn without calling `MessageChannel`. Nothing routes assistant text to the user automatically — silence is silence.",
+    "- **Stay silent (rare)** — only when no reply is warranted at all (an old message you already addressed, an autonomous self-prompt, or a duplicate notification). End the turn without calling any tool. Default expectation is to respond; silence is the exception, not the fallback.",
   );
 
   lines.push(

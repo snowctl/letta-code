@@ -96,9 +96,25 @@ describe("formatChannelNotification", () => {
     expect(reminder).toContain("**React without text**");
     expect(reminder).toContain('action="react"');
     expect(reminder).toContain("**Remove a reaction**");
-    expect(reminder).toContain("**Stay silent**");
-    expect(reminder).toContain("silence is silence");
+    expect(reminder).toContain("**Stay silent (rare)**");
+    expect(reminder).toContain("silence is the exception");
     expect(reminder).toContain("`replyTo`");
+  });
+
+  test("response directives lead with strong MUST-use-MessageChannel imperative", () => {
+    // Plain assistant text is dropped on every channel. The reminder must
+    // be unambiguous that MessageChannel is the only delivery path.
+    const msg: InboundChannelMessage = {
+      channel: "matrix",
+      chatId: "!room:server",
+      senderId: "@alice:server",
+      text: "ping",
+      timestamp: FIXED_TS,
+    };
+    const reminder = buildChannelReminderText(msg);
+    expect(reminder).toContain("**You MUST respond via the `MessageChannel` tool.**");
+    expect(reminder).toContain("Plain assistant text is not delivered");
+    expect(reminder).toContain("only `MessageChannel` calls reach the chat platform");
   });
 
   test("react directive uses unicode-emoji hint by default, name-emoji hint for slack, and custom-emoji hint for discord", () => {
