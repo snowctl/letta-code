@@ -2748,3 +2748,52 @@ test("Matrix turn state: finished(error) with no thinking block sends fallback e
   expect(html).toContain("⚠ Turn failed");
   expect(html).toContain("didn't complete");
 });
+
+test("Matrix turn state: finished(cancelled) with thinking block appends cancelled footer", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$finalize-1");
+
+  await adapter.handleStreamReasoning!("Drafting essay…", [MATRIX_LIFECYCLE_SOURCE]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "cancelled",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  const [, editContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  expect(editContent["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
+
+  const newContent = editContent["m.new_content"] as Record<string, unknown>;
+  const html = newContent.formatted_body as string;
+  expect(html).toContain("Drafting essay");
+  expect(html).toContain("data-mx-color=\"#e3b341\"");
+  expect(html).toContain("· Cancelled");
+});
+
+test("Matrix turn state: finished(cancelled) with no thinking block sends no extra message", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "cancelled",
+  });
+
+  expect(client.sendMessage).not.toHaveBeenCalled();
+});

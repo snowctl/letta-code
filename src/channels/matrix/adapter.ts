@@ -1396,8 +1396,14 @@ export function createMatrixAdapter(
               .catch(() => {});
           }
         } else {
-          // "cancelled" — handled in Task 3
-          await finalizeReasoningMessage(chatId);
+          // "cancelled"
+          if (hasThinkingBlock) {
+            const footerHtml = `<span data-mx-color="#e3b341">· Cancelled</span>`;
+            const footerText = "· Cancelled";
+            await finalizeReasoningMessage(chatId, { html: footerHtml, text: footerText });
+          } else {
+            await finalizeReasoningMessage(chatId);
+          }
           clearReasoningState(chatId);
         }
       }
