@@ -9,6 +9,7 @@ import type { Letta } from "@letta-ai/letta-client";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
 import { getClient } from "../../agent/client";
+import { markdownToTelegramHtml } from "../../tools/impl/MessageChannel";
 import { formatChannelControlRequestPrompt } from "../interactive";
 import {
   handleOperatorCommand,
@@ -253,6 +254,7 @@ export function createTelegramAdapter(
   >();
   const pendingReasoningByChatId = new Map<string, string>();
   const reasoningByKey = new Map<string, string>();
+  const lastSentMessageIdByConversationId = new Map<string, string>();
 
   function startTypingInterval(chatId: string): void {
     if (typingIntervalByChatId.has(chatId) || !bot) return;
@@ -1060,6 +1062,27 @@ export function createTelegramAdapter(
         text,
         reply_parameters ? { reply_parameters } : {},
       );
+    },
+
+    async handleAutoForward(
+      text: string,
+      sources: ChannelTurnSource[],
+    ): Promise<string | undefined> {
+      const source = sources[0];
+      if (!source) return undefined;
+      const telegramBot = await ensureBot();
+      const result = await telegramBot.api.sendMessage(
+        source.chatId,
+        markdownToTelegramHtml(text),
+        { parse_mode: "HTML" },
+      );
+      const messageId = String(result.message_id);
+      lastSentMessageIdByConversationId.set(source.conversationId, messageId);
+      return messageId;
+    },
+
+    getLastSentMessageId(conversationId: string): string | null {
+      return lastSentMessageIdByConversationId.get(conversationId) ?? null;
     },
 
     async handleControlRequestEvent(
