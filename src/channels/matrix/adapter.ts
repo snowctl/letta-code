@@ -347,6 +347,11 @@ export function createMatrixAdapter(
     { eventId: string; text: string; html: string }
   >();
 
+  // Text stored by handleAutoForward; sent by the "finished" lifecycle handler after
+  // thinking-block finalization to maintain correct Matrix timeline order.
+  const pendingResponseTextByChatId = new Map<string, string>();
+  const lastSentMessageIdByConversationId = new Map<string, string>();
+
   // ── Typing interval helpers ───────────────────────────────────────
 
   function startTypingInterval(chatId: string): void {
@@ -390,17 +395,19 @@ export function createMatrixAdapter(
    * accidental disclosure when tool output gets quoted into other rooms.
    */
   function redactSecrets(text: string): string {
-    return text
-      // Authorization: Bearer xxxxx (HTTP header, with or without leading dashes)
-      .replace(
-        /(authorization\s*[:=]\s*(?:bearer|basic)\s+)\S+/gi,
-        "$1<redacted>",
-      )
-      // --foo-key=value, --foo_token=value, password=value, etc.
-      .replace(
-        /((?:^|[\s"'-])(?:[\w-]*?(?:api[_-]?key|secret|token|password|bearer|auth))[=:\s]\s*)\S+/gi,
-        "$1<redacted>",
-      );
+    return (
+      text
+        // Authorization: Bearer xxxxx (HTTP header, with or without leading dashes)
+        .replace(
+          /(authorization\s*[:=]\s*(?:bearer|basic)\s+)\S+/gi,
+          "$1<redacted>",
+        )
+        // --foo-key=value, --foo_token=value, password=value, etc.
+        .replace(
+          /((?:^|[\s"'-])(?:[\w-]*?(?:api[_-]?key|secret|token|password|bearer|auth))[=:\s]\s*)\S+/gi,
+          "$1<redacted>",
+        )
+    );
   }
 
   /**
@@ -594,6 +601,7 @@ export function createMatrixAdapter(
     lastCompletedToolByChatId.delete(chatId);
     lastResponseByChatId.delete(chatId);
     turnStartedAtByChatId.delete(chatId);
+    pendingResponseTextByChatId.delete(chatId);
   }
 
   async function finalizeReasoningMessage(
@@ -1156,6 +1164,22 @@ export function createMatrixAdapter(
       await client.sendMessage(chatId, content);
     },
 
+    async handleAutoForward(
+      text: string,
+      sources: ChannelTurnSource[],
+    ): Promise<string | undefined> {
+      // Deferred: store text for the "finished" lifecycle handler to send
+      // after finalizeReasoningMessage() to maintain Matrix timeline order.
+      for (const source of sources) {
+        pendingResponseTextByChatId.set(source.chatId, text);
+      }
+      return undefined;
+    },
+
+    getLastSentMessageId(conversationId: string): string | null {
+      return lastSentMessageIdByConversationId.get(conversationId) ?? null;
+    },
+
     async handleControlRequestEvent(
       event: ChannelControlRequestEvent,
     ): Promise<void> {
@@ -1338,10 +1362,71 @@ export function createMatrixAdapter(
           !!reasoningMsgId && reasoningMsgId !== "__pending__";
 
         if (event.outcome === "completed") {
+          const pendingText = pendingResponseTextByChatId.get(chatId);
+          pendingResponseTextByChatId.delete(chatId);
+
+          // Finalize thinking block first, then send response below it.
           await finalizeReasoningMessage(chatId);
           clearReasoningState(chatId);
 
-          if (lastResponse && matrixClient) {
+          if (pendingText && matrixClient) {
+            const html = markdownToMatrixHtml(pendingText);
+            const sentEventId = await matrixClient
+              .sendMessage(chatId, {
+                msgtype: "m.text",
+                body: pendingText,
+                format: "org.matrix.custom.html",
+                formatted_body: html,
+              })
+              .catch((err: unknown) => {
+                console.warn(
+                  "[Matrix] handleAutoForward send failed:",
+                  err instanceof Error ? err.message : err,
+                );
+                return null;
+              });
+
+            if (sentEventId) {
+              const messageId = String(sentEventId);
+              // Track for ChannelAction edits
+              const source = event.sources.find((s) => s.chatId === chatId);
+              if (source) {
+                lastSentMessageIdByConversationId.set(
+                  source.conversationId,
+                  messageId,
+                );
+              }
+              // Append completion footer to the sent message
+              const footerHtml =
+                `<hr><span data-mx-color="#3fb950">✓</span> ` +
+                `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;
+              const footerText = `\n✓ completed in ${durationStr}`;
+              await matrixClient
+                .sendMessage(chatId, {
+                  msgtype: "m.text",
+                  body: `* ${pendingText}${footerText}`,
+                  format: "org.matrix.custom.html",
+                  formatted_body: `* ${html}${footerHtml}`,
+                  "m.new_content": {
+                    msgtype: "m.text",
+                    body: pendingText + footerText,
+                    format: "org.matrix.custom.html",
+                    formatted_body: html + footerHtml,
+                  },
+                  "m.relates_to": {
+                    rel_type: "m.replace",
+                    event_id: messageId,
+                  },
+                })
+                .catch((err: unknown) => {
+                  console.warn(
+                    "[Matrix] Failed to append completion footer:",
+                    err instanceof Error ? err.message : err,
+                  );
+                });
+            }
+          } else if (lastResponse && matrixClient) {
+            // Fallback: no pending text from auto-forward (legacy path or MessageChannel was used)
             const footerHtml =
               `<hr><span data-mx-color="#3fb950">✓</span> ` +
               `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;
@@ -1371,6 +1456,7 @@ export function createMatrixAdapter(
               });
           }
         } else if (event.outcome === "error") {
+          pendingResponseTextByChatId.delete(chatId);
           const footerHtml =
             `<span data-mx-color="#f85149">⚠ Turn failed</span> ` +
             `<span data-mx-color="#8b949e">· tool error</span>`;
@@ -1397,10 +1483,14 @@ export function createMatrixAdapter(
           }
         } else {
           // "cancelled"
+          pendingResponseTextByChatId.delete(chatId);
           if (hasThinkingBlock) {
             const footerHtml = `<span data-mx-color="#e3b341">· Cancelled</span>`;
             const footerText = "· Cancelled";
-            await finalizeReasoningMessage(chatId, { html: footerHtml, text: footerText });
+            await finalizeReasoningMessage(chatId, {
+              html: footerHtml,
+              text: footerText,
+            });
           } else {
             await finalizeReasoningMessage(chatId);
           }
