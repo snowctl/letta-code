@@ -1736,11 +1736,11 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   // Second reasoning segment (after tool)
   await adapter.handleStreamReasoning!("Second thought.", [source]);
 
-  // MessageChannel tool call (response send)
+  // ChannelAction tool call (response send) — skipped by adapter, no tool block
   await adapter.handleTurnLifecycleEvent!({
     type: "tool_call",
     batchId: "b1",
-    toolName: "MessageChannel",
+    toolName: "ChannelAction",
     sources: [source],
   });
 

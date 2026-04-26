@@ -1468,10 +1468,11 @@ export function createMatrixAdapter(
           }
         } else if (event.outcome === "error") {
           pendingResponseTextByChatId.delete(chatId);
+          const errorDetail = event.error ? `: ${event.error}` : "";
           const footerHtml =
-            `<span data-mx-color="#f85149">⚠ Turn failed</span> ` +
-            `<span data-mx-color="#8b949e">· tool error</span>`;
-          const footerText = "⚠ Turn failed · tool error";
+            `<span data-mx-color="#f85149">⚠ Turn failed</span>` +
+            `<span data-mx-color="#8b949e"> · tool error${escapeHtml(errorDetail)}</span>`;
+          const footerText = `⚠ Turn failed · tool error${errorDetail}`;
 
           if (hasThinkingBlock) {
             await finalizeReasoningMessage(chatId, {
@@ -1481,14 +1482,17 @@ export function createMatrixAdapter(
             clearReasoningState(chatId);
           } else {
             clearReasoningState(chatId);
+            const fallbackDetail = event.error
+              ? `: ${event.error}`
+              : " — the turn didn't complete.";
             await matrixClient
               ?.sendMessage(chatId, {
                 msgtype: "m.text",
-                body: "⚠ Turn failed — the turn didn't complete.",
+                body: `⚠ Turn failed${fallbackDetail}`,
                 format: "org.matrix.custom.html",
                 formatted_body:
-                  `<span data-mx-color="#f85149">⚠ Turn failed</span> ` +
-                  `<span data-mx-color="#8b949e">— the turn didn't complete.</span>`,
+                  `<span data-mx-color="#f85149">⚠ Turn failed</span>` +
+                  `<span data-mx-color="#8b949e">${escapeHtml(fallbackDetail)}</span>`,
               })
               .catch(() => {});
           }
