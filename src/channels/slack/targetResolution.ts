@@ -84,7 +84,7 @@ function normalizeSlackTarget(
       return normalizeSlackTarget(value);
     }
     if (prefix === "user") {
-      return 'Error: Slack proactive MessageChannel currently supports channel targets only. Use a channel target like "#general" or "channel:C123".';
+      return 'Error: Slack proactive notifications support channel targets only. Use a channel target like "#general" or "channel:C123".';
     }
     return `Error: Unsupported Slack channel target prefix "${prefix}".`;
   }

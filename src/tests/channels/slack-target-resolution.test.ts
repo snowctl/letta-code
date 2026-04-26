@@ -148,7 +148,7 @@ describe("Slack MessageChannel target resolution", () => {
         target: "user:U12345678",
       }),
     ).rejects.toThrow(
-      'Error: Slack proactive MessageChannel currently supports channel targets only. Use a channel target like "#general" or "channel:C123".',
+      'Error: Slack proactive notifications support channel targets only. Use a channel target like "#general" or "channel:C123".',
     );
   });
 });

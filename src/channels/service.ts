@@ -144,7 +144,7 @@ export interface ChannelTargetSnapshot {
   lastMessageId?: string;
 }
 
-async function refreshLoadedMessageChannelTool(): Promise<void> {
+async function refreshChannelToolRegistry(): Promise<void> {
   await refreshDynamicChannelToolsInLoadedRegistry();
 }
 
@@ -883,7 +883,7 @@ export async function setChannelConfigLive(
   if (!snapshot) {
     throw new Error(`Failed to write ${channelId} channel config`);
   }
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return snapshot;
 }
 
@@ -937,7 +937,7 @@ export async function startChannelLive(
   if (!summary) {
     throw new Error(`Channel "${channelId}" summary not found after start`);
   }
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return summary;
 }
 
@@ -968,7 +968,7 @@ export async function stopChannelLive(
   if (!summary) {
     throw new Error(`Channel "${channelId}" summary not found after stop`);
   }
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return summary;
 }
 
@@ -1179,7 +1179,7 @@ export async function startChannelAccountLive(
       force: channelId === "slack" || channelId === "discord",
     },
   );
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return snapshot;
 }
 
@@ -1204,7 +1204,7 @@ export async function stopChannelAccountLive(
     : existing;
 
   await getChannelRegistry()?.stopChannelAccount(channelId, accountId);
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return toAccountSnapshot(next);
 }
 
@@ -1226,7 +1226,7 @@ export async function removeChannelAccountLive(
   removeChannelTargetsForAccount(channelId, accountId);
   removePairingStateForAccount(channelId, accountId);
   const removed = removeChannelAccount(channelId, accountId);
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return removed;
 }
 
