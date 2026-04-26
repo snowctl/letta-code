@@ -1122,7 +1122,7 @@ export function createMatrixAdapter(
       lastResponseByChatId.set(msg.chatId, {
         eventId: String(eventId),
         text: msg.text,
-        html: markdownToMatrixHtml(msg.text),
+        html: content.formatted_body as string,
       });
 
       return { messageId: String(eventId) };
@@ -1325,10 +1325,10 @@ export function createMatrixAdapter(
         const durationMs = startedAt !== undefined ? Date.now() - startedAt : 0;
         const durationStr = formatElapsed(durationMs);
         const lastResponse = lastResponseByChatId.get(chatId);
+        const reasoningMsgId = reasoningMessageIdByChatId.get(chatId);
         // biome-ignore lint/correctness/noUnusedVariables: used in Tasks 2 and 3
         const hasThinkingBlock =
-          !!reasoningMessageIdByChatId.get(chatId) &&
-          reasoningMessageIdByChatId.get(chatId) !== "__pending__";
+          !!reasoningMsgId && reasoningMsgId !== "__pending__";
 
         if (event.outcome === "completed") {
           await finalizeReasoningMessage(chatId);
