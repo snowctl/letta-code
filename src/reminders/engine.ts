@@ -467,7 +467,7 @@ export function prependReminderPartsToContent(
   if (mergedInnerSections.length > 0) {
     const firstTextIdx = contentArray.findIndex((p) => p["type"] === "text");
     if (firstTextIdx !== -1) {
-      const firstText = contentArray[firstTextIdx]["text"];
+      const firstText = contentArray[firstTextIdx]?.["text"];
       if (typeof firstText === "string") {
         const inner = extractSystemReminderInner(firstText);
         if (inner !== null) {

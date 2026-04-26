@@ -92,9 +92,13 @@ function buildChatContextLines(msg: InboundChannelMessage): string[] {
 
   if (msg.attachments?.length) {
     for (const att of msg.attachments) {
-      const parts: string[] = [`kind=${att.kind}`, `local_path=${att.localPath}`];
+      const parts: string[] = [
+        `kind=${att.kind}`,
+        `local_path=${att.localPath}`,
+      ];
       if (att.mimeType) parts.push(`mime_type=${att.mimeType}`);
-      if (typeof att.sizeBytes === "number") parts.push(`size=${att.sizeBytes}`);
+      if (typeof att.sizeBytes === "number")
+        parts.push(`size=${att.sizeBytes}`);
       if (att.name) parts.push(`name=${att.name}`);
       lines.push(`- **Attachment**: ${parts.join(", ")}`);
       if (att.transcription) {
@@ -105,11 +109,7 @@ function buildChatContextLines(msg: InboundChannelMessage): string[] {
 
   // Slack: replies in a threaded channel stay in-thread automatically.
   const threadKey = msg.threadId ?? msg.messageId;
-  if (
-    msg.channel === "slack" &&
-    chatType === "channel" &&
-    threadKey?.trim()
-  ) {
+  if (msg.channel === "slack" && chatType === "channel" && threadKey?.trim()) {
     lines.push(
       "- **Slack threading**: replies via MessageChannel will stay in this thread automatically",
     );
@@ -129,48 +129,17 @@ function emojiHintForChannel(channel: string): string {
 }
 
 function buildResponseDirectives(msg: InboundChannelMessage): string[] {
-  const channel = msg.channel;
-  const lines: string[] = [];
+  const emojiHint = msg.chatType === "channel" ? "`👀`" : "`👍`";
 
-  // Lead with the strongest possible imperative. Plain assistant text
-  // does not reach the user on any channel — the platform delivery path
-  // is exclusively the MessageChannel tool. Without this header the
-  // model frequently produces a normal text reply, which silently
-  // disappears and looks to the user like the bot ignored them.
-  lines.push(
-    "**You MUST respond via the `MessageChannel` tool.** Plain assistant text is not delivered to the user on any channel — only `MessageChannel` calls reach the chat platform. The only way to stay silent is to end the turn without calling any tool. Do not write a final assistant message intending it to reach the user; it will be discarded.",
-  );
-  lines.push("");
-
-  lines.push(
-    `- **Reply with text** — call \`MessageChannel\` with \`action="send"\`, \`channel="${channel}"\`, and \`chat_id\` from the metadata above. Put your reply text in \`message\`.`,
-  );
-
-  // All four supported channels (matrix, telegram, slack, discord) accept
-  // reactions via MessageChannel — see channels/*/messageActions.ts.
-  lines.push(
-    `- **React without text** — for acknowledgments, affirmations, or "I saw it" signals, prefer this over a short text reply. Call \`MessageChannel\` with \`action="react"\`, \`channel="${channel}"\`, \`chat_id\` and \`messageId\` from the metadata above, and \`emoji\` set to ${emojiHintForChannel(channel)} (e.g. \`👍\`, \`❤️\`, \`👀\`, \`🔥\`, \`🎉\`).`,
-  );
-
-  lines.push(
-    `- **Remove a reaction** — call \`MessageChannel\` with \`action="react"\`, \`remove=true\`, and the same \`chat_id\` / \`messageId\` / \`emoji\` you previously sent.`,
-  );
-
-  if (msg.attachments?.length) {
-    lines.push(
-      "- **Inspect attachments** — local file/image tools (e.g. `Read`, `ViewImage`) can open the `local_path` of any attachment listed in the chat context above.",
-    );
-  }
-
-  lines.push(
-    "- **Stay silent (rare)** — only when no reply is warranted at all (an old message you already addressed, an autonomous self-prompt, or a duplicate notification). End the turn without calling any tool. Default expectation is to respond; silence is the exception, not the fallback.",
-  );
-
-  lines.push(
-    "- `replyTo` — set only if you intentionally want the platform's quote/reply UI on a text reply.",
-  );
-
-  return lines;
+  return [
+    "**Responding:**",
+    "- Your response text is delivered automatically to the user — just write your reply.",
+    "- To stay silent (e.g. the message wasn't for you, or no reply is needed), produce no response text.",
+    `- Use \`ChannelAction\` with \`action="react"\` for acknowledgments instead of a short text reply — prefer ${emojiHint}, \`❤️\`, \`🎉\`.`,
+    `- Use \`ChannelAction\` with \`action="thread-reply"\` to reply into a specific thread rather than the main chat.`,
+    `- Use \`ChannelAction\` with \`action="edit"\` to edit your most recently sent message.`,
+    "- Use local file/image tools (e.g. `Read`, `ViewImage`) to inspect attachments listed in the chat context above.",
+  ];
 }
 
 /**
@@ -187,9 +156,11 @@ export function buildChannelReminderText(msg: InboundChannelMessage): string {
   sections.push(
     `## Response Directives\n${buildResponseDirectives(msg).join("\n")}`,
   );
-  return [SYSTEM_REMINDER_OPEN, sections.join("\n\n"), SYSTEM_REMINDER_CLOSE].join(
-    "\n",
-  );
+  return [
+    SYSTEM_REMINDER_OPEN,
+    sections.join("\n\n"),
+    SYSTEM_REMINDER_CLOSE,
+  ].join("\n");
 }
 
 // ── message-body builders ────────────────────────────────────────────────────
@@ -199,7 +170,8 @@ function buildThreadContextEntryXml(
   entry: ChannelThreadContextEntry,
 ): string {
   const attrs: string[] = [];
-  if (entry.senderId) attrs.push(`sender_id="${escapeXmlAttribute(entry.senderId)}"`);
+  if (entry.senderId)
+    attrs.push(`sender_id="${escapeXmlAttribute(entry.senderId)}"`);
   if (entry.senderName) {
     attrs.push(`sender_name="${escapeXmlAttribute(entry.senderName)}"`);
   }
@@ -210,10 +182,14 @@ function buildThreadContextEntryXml(
   return `<${tagName}${attrString}>\n${escapeXmlText(entry.text)}\n</${tagName}>`;
 }
 
-function buildThreadContextXml(threadContext: ChannelThreadContext): string | null {
+function buildThreadContextXml(
+  threadContext: ChannelThreadContext,
+): string | null {
   const parts: string[] = [];
   if (threadContext.starter) {
-    parts.push(buildThreadContextEntryXml("thread-starter", threadContext.starter));
+    parts.push(
+      buildThreadContextEntryXml("thread-starter", threadContext.starter),
+    );
   }
   const historyEntries = threadContext.history ?? [];
   if (historyEntries.length > 0) {
@@ -253,7 +229,9 @@ export function buildChannelMessageBody(msg: InboundChannelMessage): string {
 
 // ── top-level formatter ──────────────────────────────────────────────────────
 
-function imageContentParts(attachments: ChannelMessageAttachment[] | undefined) {
+function imageContentParts(
+  attachments: ChannelMessageAttachment[] | undefined,
+) {
   if (!attachments?.length) return [];
   return attachments.flatMap((attachment) => {
     if (

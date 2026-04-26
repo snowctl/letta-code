@@ -218,6 +218,22 @@ export interface ChannelAdapter {
   ): Promise<void>;
 
   /**
+   * Optional hook called after a turn completes to auto-forward the final
+   * assistant_text to the channel. Returns the sent message ID if applicable,
+   * or undefined if the adapter does not surface a message ID.
+   */
+  handleAutoForward?(
+    text: string,
+    sources: ChannelTurnSource[],
+  ): Promise<string | undefined>;
+
+  /**
+   * Returns the ID of the last message sent by the adapter in the given
+   * conversation, or null if unavailable.
+   */
+  getLastSentMessageId?(conversationId: string): string | null;
+
+  /**
    * Called by the registry when the adapter receives an inbound message.
    * Set by ChannelRegistry during initialization.
    */

@@ -13,7 +13,9 @@
  */
 
 import type WebSocket from "ws";
+import { getRoutesForChannel } from "../channels/routing";
 import type { CronPromptQueueItem, DequeuedBatch } from "../queue/queueRuntime";
+import { resolveConversationChannelToolScope } from "../tools/toolset";
 import { ensureConversationQueueRuntime } from "../websocket/listener/client";
 import { scheduleQueuePump } from "../websocket/listener/queue";
 import {
@@ -38,6 +40,12 @@ import {
 } from "./index";
 
 // ── Types ───────────────────────────────────────────────────────────
+
+export interface CronTarget {
+  channel: string;
+  chatId: string;
+  label?: string;
+}
 
 type ProcessQueuedTurn = (
   queuedTurn: IncomingMessage,
@@ -73,7 +81,19 @@ function minuteKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-function wrapCronPrompt(task: CronTask): string {
+export function wrapCronPrompt(task: CronTask, targets: CronTarget[]): string {
+  const targetLines =
+    targets.length > 0
+      ? [
+          "",
+          "**Available targets (for NotifyUser):**",
+          ...targets.map(
+            (t) =>
+              `- channel: \`${t.channel}\`, chat_id: \`${t.chatId}\`${t.label ? ` (${t.label})` : ""}`,
+          ),
+        ]
+      : [];
+
   const lines = [
     "<system-reminder>",
     `Scheduled task "${task.name}" is firing.`,
@@ -82,10 +102,55 @@ function wrapCronPrompt(task: CronTask): string {
       ? `This is fire #${task.fire_count + 1} (cron: ${task.cron}).`
       : `This is a one-off scheduled task.`,
     "",
+    "**Quiet run — no inbound message.**",
+    "Your response text is NOT delivered automatically in scheduled runs.",
+    "Use the `NotifyUser` tool to send a message to a channel user.",
+    "If no notification is needed, produce no response text.",
+    ...targetLines,
+    "",
     task.prompt,
     "</system-reminder>",
   ];
   return lines.join("\n");
+}
+
+function getFirstChatIdForRoute(
+  channelId: string,
+  agentId: string,
+  conversationId: string,
+): string | null {
+  for (const route of getRoutesForChannel(channelId)) {
+    if (
+      route.agentId === agentId &&
+      route.conversationId === conversationId &&
+      route.enabled
+    ) {
+      return route.chatId ?? null;
+    }
+  }
+  return null;
+}
+
+function resolveTargetsForTask(task: CronTask): CronTarget[] {
+  try {
+    const scope = resolveConversationChannelToolScope(
+      task.agent_id,
+      task.conversation_id,
+    );
+    return scope.channels
+      .map((ch) => ({
+        channel: ch.channelId,
+        chatId:
+          getFirstChatIdForRoute(
+            ch.channelId,
+            task.agent_id,
+            task.conversation_id,
+          ) ?? "",
+      }))
+      .filter((t) => t.chatId !== "");
+  } catch {
+    return [];
+  }
 }
 
 // ── Core tick logic ─────────────────────────────────────────────────
@@ -136,7 +201,7 @@ function fireCronTask(
     rawRuntime,
   );
 
-  const text = wrapCronPrompt(task);
+  const text = wrapCronPrompt(task, resolveTargetsForTask(task));
 
   conversationRuntime.queueRuntime.enqueue({
     kind: "cron_prompt",

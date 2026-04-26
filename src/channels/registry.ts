@@ -249,6 +249,10 @@ export class ChannelRegistry {
     PendingChannelControlRequest
   >();
   private readonly pendingControlRequestIdByScope = new Map<string, string>();
+  private readonly activeTurnContextByConversationId = new Map<
+    string,
+    ChannelTurnSource
+  >();
   private cancelHandler: ChannelCancelHandler | null = null;
 
   constructor() {
@@ -293,6 +297,30 @@ export class ChannelRegistry {
     return Array.from(this.adapters.values())
       .filter((adapter) => adapter.isRunning())
       .map((adapter) => adapter.channelId ?? adapter.id);
+  }
+
+  setActiveTurnContext(
+    conversationId: string,
+    source: ChannelTurnSource,
+  ): void {
+    this.activeTurnContextByConversationId.set(conversationId, source);
+  }
+
+  clearActiveTurnContext(conversationId: string): void {
+    this.activeTurnContextByConversationId.delete(conversationId);
+  }
+
+  getActiveTurnContext(conversationId: string): ChannelTurnSource | null {
+    return this.activeTurnContextByConversationId.get(conversationId) ?? null;
+  }
+
+  getLastSentMessageId(
+    channel: string,
+    accountId: string | undefined,
+    conversationId: string,
+  ): string | null {
+    const adapter = this.getAdapter(channel, accountId);
+    return adapter?.getLastSentMessageId?.(conversationId) ?? null;
   }
 
   async dispatchTurnLifecycleEvent(
@@ -480,6 +508,47 @@ export class ChannelRegistry {
       } catch (error) {
         console.error(
           `[Channels] Failed to dispatch reasoning for ${adapter.channelId ?? adapter.id}/${adapter.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
+  async dispatchAutoForward(
+    text: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void> {
+    const groups = new Map<
+      string,
+      { adapter: ChannelAdapter; sources: ChannelTurnSource[] }
+    >();
+
+    for (const source of sources) {
+      const adapter = this.getAdapter(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      if (!adapter?.handleAutoForward) {
+        continue;
+      }
+      const groupKey = this.getAdapterKey(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      const existing = groups.get(groupKey);
+      if (existing) {
+        existing.sources.push(source);
+        continue;
+      }
+      groups.set(groupKey, { adapter, sources: [source] });
+    }
+
+    for (const { adapter, sources: groupedSources } of groups.values()) {
+      try {
+        await adapter.handleAutoForward!(text, groupedSources);
+      } catch (error) {
+        console.error(
+          `[Channels] dispatchAutoForward failed for ${adapter.channelId ?? adapter.id}:`,
           error instanceof Error ? error.message : error,
         );
       }

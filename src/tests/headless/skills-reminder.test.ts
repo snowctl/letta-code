@@ -84,7 +84,8 @@ describe("headless shared reminder content helpers", () => {
     expect(merged).toContain("session context");
     expect(merged).toContain("agent info");
     expect(merged).toContain("channel notification");
-    expect(result[1]).toEqual(imagePart);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(result[1] as any).toEqual(imagePart);
   });
 
   test("non-system-reminder parts stay separate from the merged block", () => {
