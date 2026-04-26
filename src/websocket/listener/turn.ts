@@ -25,6 +25,7 @@ import {
   isEmptyResponseRetryable,
   rebuildInputWithFreshDenials,
 } from "../../agent/turn-recovery-policy";
+import { getChannelRegistry } from "../../channels/registry";
 import { createBuffers, toLines } from "../../cli/helpers/accumulator";
 import { getRetryStatusMessage } from "../../cli/helpers/errorFormatter";
 import {
@@ -103,7 +104,6 @@ import {
   sendApprovalContinuationWithRetry,
   sendMessageStreamWithRetry,
 } from "./send";
-import { getChannelRegistry } from "../../channels/registry";
 import { injectQueuedSkillContent } from "./skill-injection";
 import { handleApprovalStop } from "./turn-approval";
 import type {
@@ -114,7 +114,9 @@ import type {
 
 const AUTO_REFLECTION_DESCRIPTION = "Reflect on recent conversations";
 
-export function extractAssistantText(chunk: Record<string, unknown>): string | null {
+export function extractAssistantText(
+  chunk: Record<string, unknown>,
+): string | null {
   if (chunk.message_type !== "assistant_message") return null;
   const content = chunk.content;
   if (typeof content === "string") return content || null;
@@ -126,7 +128,9 @@ export function extractAssistantText(chunk: Record<string, unknown>): string | n
   return text || null;
 }
 
-export function extractReasoningText(chunk: Record<string, unknown>): string | null {
+export function extractReasoningText(
+  chunk: Record<string, unknown>,
+): string | null {
   if (chunk.message_type !== "reasoning_message") return null;
   const reasoning = chunk.reasoning;
   if (typeof reasoning === "string") return reasoning || null;
@@ -743,7 +747,11 @@ export async function handleIncomingMessage(
               }
 
               const reasoningChunk = extractReasoningText(normalizedChunk);
-              if (reasoningChunk && channelSources && channelSources.length > 0) {
+              if (
+                reasoningChunk &&
+                channelSources &&
+                channelSources.length > 0
+              ) {
                 void getChannelRegistry()?.dispatchStreamReasoning(
                   reasoningChunk,
                   channelSources,
@@ -790,6 +798,7 @@ export async function handleIncomingMessage(
             }`,
           );
         }
+        runtime.finalAssistantText = accumulatedChannelText || null;
         runtime.lastStopReason = "end_turn";
         runtime.isProcessing = false;
         clearActiveRunState(runtime);

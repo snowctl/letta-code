@@ -466,6 +466,11 @@ async function drainQueuedMessages(
         });
       }
 
+      const channelRegistry = getChannelRegistry();
+      for (const source of channelTurnSources) {
+        channelRegistry?.setActiveTurnContext(source.conversationId, source);
+      }
+
       let turnError: string | undefined;
       let didThrow = false;
       runtime.activeChannelTurnSources = channelTurnSources;
@@ -477,7 +482,18 @@ async function drainQueuedMessages(
         throw error;
       } finally {
         runtime.activeChannelTurnSources = null;
+        for (const source of channelTurnSources) {
+          channelRegistry?.clearActiveTurnContext(source.conversationId);
+        }
         if (channelTurnSources.length > 0) {
+          const finalText = runtime.finalAssistantText ?? null;
+          runtime.finalAssistantText = null;
+          if (finalText) {
+            await channelRegistry?.dispatchAutoForward(
+              finalText,
+              channelTurnSources,
+            );
+          }
           await dispatchChannelTurnLifecycleEvent({
             type: "finished",
             batchId: dequeuedBatch.batchId,
