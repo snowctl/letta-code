@@ -488,7 +488,7 @@ async function drainQueuedMessages(
         if (channelTurnSources.length > 0) {
           const finalText = runtime.finalAssistantText ?? null;
           runtime.finalAssistantText = null;
-          if (finalText) {
+          if (finalText && !didThrow) {
             await channelRegistry?.dispatchAutoForward(
               finalText,
               channelTurnSources,

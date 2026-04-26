@@ -1401,6 +1401,7 @@ export function createSlackAdapter(
       const messageId = response.ts ?? "";
       if (messageId) {
         lastSentMessageIdByConversationId.set(source.conversationId, messageId);
+        rememberMessageThread(messageId, source.threadId ?? messageId);
       }
       return messageId || undefined;
     },
