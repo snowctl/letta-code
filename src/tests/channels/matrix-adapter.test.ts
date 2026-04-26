@@ -1175,6 +1175,61 @@ test("Matrix typing indicator: setTyping(false) called on finished event", async
   );
 });
 
+test("Matrix turn state: finished(completed) edits last response with completion footer", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  // processing stamps turn start; sendMessage captures last response event ID
+  client.sendMessage
+    .mockResolvedValueOnce("$response-1"); // plain text response
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "processing",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: MATRIX_LIFECYCLE_SOURCE.accountId,
+    chatId: MATRIX_LIFECYCLE_SOURCE.chatId,
+    text: "Here are the results.",
+  });
+
+  client.sendMessage.mockResolvedValueOnce("$footer-edit-1"); // completion footer edit
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  // Two sendMessage calls: response + footer edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  const [footerRoom, footerContent] = client.sendMessage.mock.calls[1] as [string, Record<string, unknown>];
+  expect(footerRoom).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+
+  // Must be an m.replace edit on the response event ID
+  expect(footerContent["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$response-1",
+  });
+
+  // formatted_body must contain the green check and "completed in"
+  const newContent = footerContent["m.new_content"] as Record<string, unknown>;
+  const html = newContent.formatted_body as string;
+  expect(html).toContain("data-mx-color=\"#3fb950\"");
+  expect(html).toContain("✓");
+  expect(html).toContain("completed in");
+
+  // plain body must also contain the footer
+  const body = newContent.body as string;
+  expect(body).toContain("✓ completed in");
+});
+
 test("Matrix tool block: first tool_call sends thinking placeholder then tool block", async () => {
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
@@ -1365,7 +1420,8 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   client.sendMessage
     .mockResolvedValueOnce("$thinking-1")    // initial thinking message
     .mockResolvedValueOnce("$answer-1")      // plain answer (sendMessage)
-    .mockResolvedValueOnce("$thinking-final"); // final edit at "finished"
+    .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
+    .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
 
   const source = {
     channel: "matrix" as const,
@@ -1405,7 +1461,8 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
     outcome: "completed",
   });
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(3);
+  // 4 calls total: thinking placeholder + answer + thinking finalize + completion footer edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(4);
 
   // Third call: final edit of thinking message
   const [, editContent] = client.sendMessage.mock.calls[2] as [string, Record<string, unknown>];
@@ -1418,6 +1475,11 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   expect(editHtml).not.toContain("Thinking...");
   expect(editHtml).toContain("I need to search for this.");
   expect(editHtml).toContain("Found 3 results.");
+
+  // Fourth call: completion footer edit on the answer message
+  const [, footerEditContent] = client.sendMessage.mock.calls[3] as [string, Record<string, unknown>];
+  const fe = footerEditContent as Record<string, unknown>;
+  expect(fe["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$answer-1" });
 
   await adapter.stop();
 });
@@ -1577,7 +1639,8 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
     .mockResolvedValueOnce("$thinking-1")    // initial thinking message
     .mockResolvedValueOnce("$tool-block-1")  // tool block
     .mockResolvedValueOnce("$answer-1")      // response
-    .mockResolvedValueOnce("$thinking-final"); // final edit at "finished"
+    .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
+    .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
 
   const source = {
     channel: "matrix" as const,
@@ -1629,9 +1692,10 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
     outcome: "completed",
   });
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(4);
+  // 5 calls: thinking + tool block + answer + thinking finalize + completion footer edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(5);
 
-  // Final edit contains both segments with separator
+  // 4th call: final edit of thinking message
   const [, editContent] = client.sendMessage.mock.calls[3] as [string, Record<string, unknown>];
   const ec = editContent as Record<string, unknown>;
   expect(ec["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$thinking-1" });
@@ -1640,6 +1704,11 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   expect(editHtml).toContain("First thought.");
   expect(editHtml).toContain("Second thought.");
   expect(editHtml).toContain("<hr>"); // separator between segments
+
+  // 5th call: completion footer edit on the answer message
+  const [, footerEditContent] = client.sendMessage.mock.calls[4] as [string, Record<string, unknown>];
+  const fe = footerEditContent as Record<string, unknown>;
+  expect(fe["m.relates_to"]).toMatchObject({ rel_type: "m.replace", event_id: "$answer-1" });
 
   await adapter.stop();
 });

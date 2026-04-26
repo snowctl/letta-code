@@ -335,6 +335,18 @@ export function createMatrixAdapter(
     ReturnType<typeof setTimeout>
   >();
 
+  // Tracks when the current turn entered "processing" state. Used to compute
+  // total turn wall time for the completion footer.
+  const turnStartedAtByChatId = new Map<string, number>();
+
+  // Stores the last plain-text response sent during the current turn, per
+  // chatId. The "finished" handler edits this message to append the completion
+  // footer.
+  const lastResponseByChatId = new Map<
+    string,
+    { eventId: string; text: string; html: string }
+  >();
+
   // ── Typing interval helpers ───────────────────────────────────────
 
   function startTypingInterval(chatId: string): void {
@@ -580,6 +592,8 @@ export function createMatrixAdapter(
     reasoningNeedsSeparatorByChatId.delete(chatId);
     runningToolByChatId.delete(chatId);
     lastCompletedToolByChatId.delete(chatId);
+    lastResponseByChatId.delete(chatId);
+    turnStartedAtByChatId.delete(chatId);
   }
 
   async function finalizeReasoningMessage(chatId: string): Promise<void> {
@@ -1103,6 +1117,14 @@ export function createMatrixAdapter(
       }
 
       const eventId = await client.sendMessage(msg.chatId, content);
+
+      // Record the last plain-text response for the completion footer.
+      lastResponseByChatId.set(msg.chatId, {
+        eventId: String(eventId),
+        text: msg.text,
+        html: markdownToMatrixHtml(msg.text),
+      });
+
       return { messageId: String(eventId) };
     },
 
@@ -1190,6 +1212,7 @@ export function createMatrixAdapter(
       if (event.type === "processing") {
         for (const source of event.sources) {
           startTypingInterval(source.chatId);
+          turnStartedAtByChatId.set(source.chatId, Date.now());
         }
         return;
       }
@@ -1286,17 +1309,65 @@ export function createMatrixAdapter(
 
       // "finished"
       for (const source of event.sources) {
-        await stopTypingInterval(source.chatId);
+        const { chatId } = source;
+        await stopTypingInterval(chatId);
 
-        const pending = toolBlockOperationByChatId.get(source.chatId);
+        const pending = toolBlockOperationByChatId.get(chatId);
         if (pending) await pending.catch(() => {});
-        toolBlockStateByChatId.delete(source.chatId);
-        toolBlockOperationByChatId.delete(source.chatId);
+        toolBlockStateByChatId.delete(chatId);
+        toolBlockOperationByChatId.delete(chatId);
 
-        await waitForPendingPlaceholder(source.chatId);
-        stopReasoningFlush(source.chatId);
-        await finalizeReasoningMessage(source.chatId);
-        clearReasoningState(source.chatId);
+        await waitForPendingPlaceholder(chatId);
+        stopReasoningFlush(chatId);
+
+        // Capture turn state before clearReasoningState() deletes both Maps.
+        const startedAt = turnStartedAtByChatId.get(chatId);
+        const durationMs = startedAt !== undefined ? Date.now() - startedAt : 0;
+        const durationStr = formatElapsed(durationMs);
+        const lastResponse = lastResponseByChatId.get(chatId);
+        // biome-ignore lint/correctness/noUnusedVariables: used in Tasks 2 and 3
+        const hasThinkingBlock =
+          !!reasoningMessageIdByChatId.get(chatId) &&
+          reasoningMessageIdByChatId.get(chatId) !== "__pending__";
+
+        if (event.outcome === "completed") {
+          await finalizeReasoningMessage(chatId);
+          clearReasoningState(chatId);
+
+          if (lastResponse && matrixClient) {
+            const footerHtml =
+              `<hr><span data-mx-color="#3fb950">✓</span> ` +
+              `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;
+            const footerText = `\n✓ completed in ${durationStr}`;
+            await matrixClient
+              .sendMessage(chatId, {
+                msgtype: "m.text",
+                body: `* ${lastResponse.text}${footerText}`,
+                format: "org.matrix.custom.html",
+                formatted_body: `* ${lastResponse.html}${footerHtml}`,
+                "m.new_content": {
+                  msgtype: "m.text",
+                  body: lastResponse.text + footerText,
+                  format: "org.matrix.custom.html",
+                  formatted_body: lastResponse.html + footerHtml,
+                },
+                "m.relates_to": {
+                  rel_type: "m.replace",
+                  event_id: lastResponse.eventId,
+                },
+              })
+              .catch((err: unknown) => {
+                console.warn(
+                  "[Matrix] Failed to append completion footer:",
+                  err instanceof Error ? err.message : err,
+                );
+              });
+          }
+        } else {
+          // error / cancelled — handled in later tasks
+          await finalizeReasoningMessage(chatId);
+          clearReasoningState(chatId);
+        }
       }
     },
 
