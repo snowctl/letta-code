@@ -60,6 +60,36 @@ describe("ChannelRegistry turn context", () => {
   });
 });
 
+describe("ChannelRegistry getLastSentMessageId", () => {
+  test("delegates to adapter.getLastSentMessageId when present", () => {
+    const registry = new ChannelRegistry();
+    const adapter = makeMockAdapter();
+    adapter.getLastSentMessageId = mock((_convId: string) => "msg-42");
+    registry.registerAdapter(adapter);
+
+    const result = registry.getLastSentMessageId("telegram", "acc-1", "conv-1");
+    expect(result).toBe("msg-42");
+    expect(adapter.getLastSentMessageId).toHaveBeenCalledWith("conv-1");
+  });
+
+  test("returns null when adapter lacks getLastSentMessageId", () => {
+    const registry = new ChannelRegistry();
+    const adapter = makeMockAdapter();
+    registry.registerAdapter(adapter);
+
+    expect(
+      registry.getLastSentMessageId("telegram", "acc-1", "conv-1"),
+    ).toBeNull();
+  });
+
+  test("returns null when no adapter matches", () => {
+    const registry = new ChannelRegistry();
+    expect(
+      registry.getLastSentMessageId("telegram", "acc-unknown", "conv-1"),
+    ).toBeNull();
+  });
+});
+
 describe("ChannelRegistry dispatchAutoForward", () => {
   test("calls handleAutoForward on matching adapter grouped by adapter", async () => {
     const registry = new ChannelRegistry();

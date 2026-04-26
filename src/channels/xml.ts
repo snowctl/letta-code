@@ -111,7 +111,7 @@ function buildChatContextLines(msg: InboundChannelMessage): string[] {
   const threadKey = msg.threadId ?? msg.messageId;
   if (msg.channel === "slack" && chatType === "channel" && threadKey?.trim()) {
     lines.push(
-      "- **Slack threading**: replies via MessageChannel will stay in this thread automatically",
+      "- **Slack threading**: your reply will stay in this thread automatically",
     );
   }
 
