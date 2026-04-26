@@ -1456,6 +1456,13 @@ export function createMatrixAdapter(
       return;
     }
 
+    if (command === "!reset") {
+      const args = parts.slice(1).filter(Boolean);
+      const reply = await dispatchOperatorCommand("reset", args, roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
     if (command === "!help") {
       const reply = await dispatchOperatorCommand("help", [], roomId);
       await client.sendMessage(roomId, { msgtype: "m.text", body: reply });

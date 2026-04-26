@@ -34,6 +34,8 @@ export async function handleOperatorCommand(
         return await handleRecompile(ctx, deps);
       case "conv":
         return await handleConv(args, ctx);
+      case "reset":
+        return await handleReset(args, ctx);
       case "help":
         return handleHelp(ctx);
       default:
@@ -55,6 +57,8 @@ function handleHelp(ctx: OperatorCommandContext): string {
     `${p}conv fork — fork the current conversation`,
     `${p}conv switch <n> — switch to conversation <n>`,
     `${p}conv delete <n> — delete conversation <n>`,
+    `${p}reset — wipe messages on the current conversation`,
+    `${p}reset <n> — wipe messages on conversation <n> (run conv list first)`,
     `${p}help — show this message`,
   ].join("\n");
 }
@@ -204,4 +208,64 @@ async function convDelete(
     return "Deleted. Switched to default.";
   }
   return "Deleted.";
+}
+
+/**
+ * Wipe messages on a conversation. With no args, targets the currently active
+ * conversation. With a numeric arg, targets the conversation at that position
+ * in the cached `conv list` (1 = default, 2+ = named).
+ *
+ * Default conversation (position 1): uses `agents.messages.reset` which clears
+ * messages but keeps the conversation itself. Named conversations: letta-server
+ * has no per-conversation messages-purge endpoint, so reset means soft-deleting
+ * the named conversation; if it's the active one, switch back to default.
+ */
+async function handleReset(
+  args: string[],
+  ctx: OperatorCommandContext,
+): Promise<string> {
+  // Resolve the target conversation id (default or named).
+  let targetId: string;
+  let targetLabel: string;
+  if (args.length === 0) {
+    targetId = ctx.getCurrentConvId() || "default";
+    targetLabel = targetId === "default" ? "default" : targetId;
+  } else {
+    const n = parseInt(args[0] ?? "", 10);
+    if (Number.isNaN(n) || n < 1) {
+      return "Usage: reset [number]  (no number = current conversation)";
+    }
+    if (n === 1) {
+      targetId = "default";
+      targetLabel = "default";
+    } else {
+      const cache = ctx.getConvListCache();
+      if (!cache) {
+        return "Run conv list first to see available conversations.";
+      }
+      const target = cache[n - 1];
+      if (!target) {
+        return `No conversation at position ${n}. Run conv list to see options.`;
+      }
+      targetId = target.id;
+      targetLabel = target.id === "default" ? "default" : (target.summary ?? target.id);
+    }
+  }
+
+  if (targetId === "default") {
+    await ctx.client.agents.messages.reset(ctx.agentId, {
+      add_default_initial_messages: false,
+    });
+    return "Reset default conversation. All messages cleared.";
+  }
+
+  // Named conversation: no purge-messages endpoint exists; soft-delete instead.
+  const currentId = ctx.getCurrentConvId();
+  await ctx.client.conversations.delete(targetId);
+  ctx.setConvListCache(null);
+  if (currentId === targetId) {
+    await ctx.setCurrentConvId("default");
+    return `Reset conversation "${targetLabel}" (deleted, switched to default).`;
+  }
+  return `Reset conversation "${targetLabel}" (deleted).`;
 }

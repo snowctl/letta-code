@@ -779,6 +779,12 @@ export function createTelegramAdapter(
       await ctx.reply(await dispatchOperatorCommand("conv", args, chatId));
     });
 
+    instance.command("reset", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const args = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
+      await ctx.reply(await dispatchOperatorCommand("reset", args, chatId));
+    });
+
     instance.command("help", async (ctx) => {
       const chatId = String(ctx.chat.id);
       await ctx.reply(await dispatchOperatorCommand("help", [], chatId));

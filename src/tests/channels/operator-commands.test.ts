@@ -17,6 +17,7 @@ function makeCtx(
       agents: {
         messages: {
           compact: mock(async () => ({ status: "ok" })),
+          reset: mock(async () => ({ status: "ok" })),
         },
         recompile: mock(async () => "ok"),
       },
@@ -297,6 +298,82 @@ describe("handleOperatorCommand — help", () => {
     const result = await handleOperatorCommand("help", [], ctx);
     expect(result).toContain("/cancel");
     expect(result).not.toContain("!cancel");
+  });
+});
+
+describe("handleOperatorCommand — reset", () => {
+  test("with no args on default conv calls agents.messages.reset", async () => {
+    const ctx = makeCtx({ getCurrentConvId: () => "default" });
+    const result = await handleOperatorCommand("reset", [], ctx);
+    expect(result).toBe("Reset default conversation. All messages cleared.");
+    expect(ctx.client.agents.messages.reset).toHaveBeenCalledWith("agent-1", {
+      add_default_initial_messages: false,
+    });
+    // Must NOT delete the conversation — default reset is in-place.
+    expect(ctx.client.conversations.delete).not.toHaveBeenCalled();
+  });
+
+  test("with no args on named conv soft-deletes and switches to default", async () => {
+    const setCurrent = mock(async () => {});
+    const ctx = makeCtx({
+      getCurrentConvId: () => "conv-abc",
+      setCurrentConvId: setCurrent,
+    });
+    const result = await handleOperatorCommand("reset", [], ctx);
+    expect(result).toContain("conv-abc");
+    expect(result).toContain("switched to default");
+    expect(ctx.client.conversations.delete).toHaveBeenCalledWith("conv-abc");
+    expect(setCurrent).toHaveBeenCalledWith("default");
+    // Default-conv reset must not have fired for a named target.
+    expect(ctx.client.agents.messages.reset).not.toHaveBeenCalled();
+  });
+
+  test("with arg '1' resets default regardless of current conv", async () => {
+    const ctx = makeCtx({ getCurrentConvId: () => "conv-abc" });
+    const result = await handleOperatorCommand("reset", ["1"], ctx);
+    expect(result).toBe("Reset default conversation. All messages cleared.");
+    expect(ctx.client.agents.messages.reset).toHaveBeenCalledWith("agent-1", {
+      add_default_initial_messages: false,
+    });
+    expect(ctx.client.conversations.delete).not.toHaveBeenCalled();
+  });
+
+  test("with numeric arg uses cached conv list to resolve target", async () => {
+    const cache: Conversation[] = [
+      { id: "default", agent_id: "agent-1" } as Conversation,
+      { id: "conv-2", agent_id: "agent-1", summary: "alpha" } as Conversation,
+      { id: "conv-3", agent_id: "agent-1", summary: "beta" } as Conversation,
+    ];
+    const ctx = makeCtx({
+      getCurrentConvId: () => "default",
+      getConvListCache: () => cache,
+    });
+    const result = await handleOperatorCommand("reset", ["3"], ctx);
+    expect(result).toContain("beta");
+    expect(ctx.client.conversations.delete).toHaveBeenCalledWith("conv-3");
+    // Current conversation was default, so no switch needed.
+    expect(ctx.setCurrentConvId).not.toHaveBeenCalled();
+  });
+
+  test("with numeric arg requires a populated cache", async () => {
+    const ctx = makeCtx({ getConvListCache: () => null });
+    const result = await handleOperatorCommand("reset", ["2"], ctx);
+    expect(result).toContain("Run conv list first");
+  });
+
+  test("with out-of-range numeric arg returns helpful message", async () => {
+    const cache: Conversation[] = [
+      { id: "default", agent_id: "agent-1" } as Conversation,
+    ];
+    const ctx = makeCtx({ getConvListCache: () => cache });
+    const result = await handleOperatorCommand("reset", ["5"], ctx);
+    expect(result).toContain("No conversation at position 5");
+  });
+
+  test("with non-numeric arg returns usage", async () => {
+    const ctx = makeCtx();
+    const result = await handleOperatorCommand("reset", ["banana"], ctx);
+    expect(result).toContain("Usage: reset");
   });
 });
 
