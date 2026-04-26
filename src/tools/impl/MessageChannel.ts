@@ -594,6 +594,8 @@ function normalizeMessageAction(
       return "react";
     case "upload-file":
       return "upload-file";
+    case "edit":
+      return "edit";
     default:
       return null;
   }
