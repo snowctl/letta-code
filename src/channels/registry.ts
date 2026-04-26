@@ -544,8 +544,10 @@ export class ChannelRegistry {
     }
 
     for (const { adapter, sources: groupedSources } of groups.values()) {
+      const { handleAutoForward } = adapter;
+      if (!handleAutoForward) continue;
       try {
-        await adapter.handleAutoForward!(text, groupedSources);
+        await handleAutoForward(text, groupedSources);
       } catch (error) {
         console.error(
           `[Channels] dispatchAutoForward failed for ${adapter.channelId ?? adapter.id}:`,

@@ -129,17 +129,21 @@ function emojiHintForChannel(channel: string): string {
 }
 
 function buildResponseDirectives(msg: InboundChannelMessage): string[] {
-  const emojiHint = msg.chatType === "channel" ? "`👀`" : "`👍`";
-
-  return [
+  const emojiHint = emojiHintForChannel(msg.channel);
+  const lines = [
     "**Responding:**",
     "- Your response text is delivered automatically to the user — just write your reply.",
     "- To stay silent (e.g. the message wasn't for you, or no reply is needed), produce no response text.",
-    `- Use \`ChannelAction\` with \`action="react"\` for acknowledgments instead of a short text reply — prefer ${emojiHint}, \`❤️\`, \`🎉\`.`,
+    `- Use \`ChannelAction\` with \`action="react"\` for acknowledgments instead of a short text reply — set \`emoji\` to ${emojiHint}.`,
     `- Use \`ChannelAction\` with \`action="thread-reply"\` to reply into a specific thread rather than the main chat.`,
     `- Use \`ChannelAction\` with \`action="edit"\` to edit your most recently sent message.`,
-    "- Use local file/image tools (e.g. `Read`, `ViewImage`) to inspect attachments listed in the chat context above.",
   ];
+  if (msg.attachments?.length) {
+    lines.push(
+      "- Use local file/image tools (e.g. `Read`, `ViewImage`) to inspect attachments listed in the chat context above.",
+    );
+  }
+  return lines;
 }
 
 /**
