@@ -1062,10 +1062,9 @@ export function createMatrixAdapter(
         body: msg.text,
       };
 
-      if (msg.parseMode === "HTML") {
-        content.format = "org.matrix.custom.html";
-        content.formatted_body = markdownToMatrixHtml(msg.text);
-      }
+      // Always convert markdown to HTML for proper Matrix rendering
+      content.format = "org.matrix.custom.html";
+      content.formatted_body = markdownToMatrixHtml(msg.text);
 
       if (msg.replyToMessageId) {
         content["m.relates_to"] = {
