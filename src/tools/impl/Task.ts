@@ -42,7 +42,8 @@ import { LIMITS, truncateByChars } from "./truncation.js";
 import { validateRequiredParams } from "./validation";
 
 interface TaskArgs {
-  command?: "run" | "refresh";
+  command?: "run" | "refresh" | "list-models";
+  query?: string; // used with list-models
   subagent_type?: string;
   prompt?: string;
   description?: string;
@@ -75,6 +76,14 @@ export function formatInvalidModelError(
 
   const label = prefix ?? "available";
   return `Model '${model}' is not available on this server. Valid ${label} models: ${filtered.join(", ")}`;
+}
+
+export function filterModelHandles(
+  handles: Set<string>,
+  query: string | undefined,
+): string[] {
+  const q = query?.toLowerCase();
+  return [...handles].filter((h) => !q || h.toLowerCase().includes(q)).sort();
 }
 
 type TaskRunResult = {
@@ -634,6 +643,12 @@ export async function task(args: TaskArgs): Promise<string> {
 
     const errorSuffix = errors.length > 0 ? `, ${errors.length} error(s)` : "";
     return `Refreshed subagents list: found ${totalCount} total (${customCount} custom)${errorSuffix}`;
+  }
+
+  if (command === "list-models") {
+    const { handles } = await getAvailableModelHandles();
+    const models = filterModelHandles(handles, args.query);
+    return JSON.stringify({ models });
   }
 
   // Determine if deploying an existing agent

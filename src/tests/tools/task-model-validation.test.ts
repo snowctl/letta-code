@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { formatInvalidModelError } from "../../tools/impl/Task";
+import {
+  filterModelHandles,
+  formatInvalidModelError,
+} from "../../tools/impl/Task";
 
 describe("formatInvalidModelError", () => {
   test("lists available models from the same provider prefix", () => {
@@ -50,5 +53,44 @@ describe("formatInvalidModelError", () => {
     expect(modelsSection.indexOf("claude-opus")).toBeLessThan(
       modelsSection.indexOf("claude-sonnet"),
     );
+  });
+});
+
+describe("filterModelHandles", () => {
+  const handles = new Set([
+    "moonshot/kimi-k2",
+    "moonshot/kimi-latest",
+    "anthropic/claude-sonnet-4-6",
+    "anthropic/claude-haiku-4-5",
+    "openai/gpt-4o",
+  ]);
+
+  test("returns all models sorted when no query", () => {
+    const result = filterModelHandles(handles, undefined);
+    expect(result).toEqual([
+      "anthropic/claude-haiku-4-5",
+      "anthropic/claude-sonnet-4-6",
+      "moonshot/kimi-k2",
+      "moonshot/kimi-latest",
+      "openai/gpt-4o",
+    ]);
+  });
+
+  test("filters by case-insensitive substring match", () => {
+    const result = filterModelHandles(handles, "kimi");
+    expect(result).toEqual(["moonshot/kimi-k2", "moonshot/kimi-latest"]);
+  });
+
+  test("matches across provider and model name", () => {
+    const result = filterModelHandles(handles, "claude");
+    expect(result).toEqual([
+      "anthropic/claude-haiku-4-5",
+      "anthropic/claude-sonnet-4-6",
+    ]);
+  });
+
+  test("returns empty array when nothing matches", () => {
+    const result = filterModelHandles(handles, "llama");
+    expect(result).toEqual([]);
   });
 });
