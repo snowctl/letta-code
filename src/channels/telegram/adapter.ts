@@ -241,6 +241,7 @@ export function createTelegramAdapter(
   }
   const toolBlockStateByChatId = new Map<string, ToolBlockState>();
   const toolBlockOperationByChatId = new Map<string, Promise<void>>();
+  const toolBlockPendingGroupsByChatId = new Map<string, ToolCallGroup[]>();
 
   const bufferedMediaGroups = new Map<string, BufferedMediaGroup>();
   let callbackKeyCounter = 0;
@@ -279,52 +280,60 @@ export function createTelegramAdapter(
     toolName: string,
     description?: string,
   ): void {
-    const previous =
-      toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
-    const operation = previous
-      .catch(() => {})
-      .then(async () => {
-        if (!bot) return;
-        const state = toolBlockStateByChatId.get(chatId);
-        const newGroups = upsertToolCallGroup(
-          state?.groups ?? [],
-          toolName,
-          description,
-        );
-        const text = renderToolBlock(newGroups);
+    // Accumulate into pending groups immediately (no waiting for API)
+    const base =
+      toolBlockPendingGroupsByChatId.get(chatId) ??
+      toolBlockStateByChatId.get(chatId)?.groups ??
+      [];
+    toolBlockPendingGroupsByChatId.set(
+      chatId,
+      upsertToolCallGroup(base, toolName, description),
+    );
 
-        if (!state) {
-          const result = await bot.api.sendMessage(chatId, text);
-          toolBlockStateByChatId.set(chatId, {
-            messageId: result.message_id,
-            groups: newGroups,
-          });
-        } else if (text.length > 3800) {
-          const freshGroups = upsertToolCallGroup([], toolName, description);
-          const freshText = renderToolBlock(freshGroups);
-          const result = await bot.api.sendMessage(chatId, freshText);
-          toolBlockStateByChatId.set(chatId, {
-            messageId: result.message_id,
-            groups: freshGroups,
-          });
-        } else {
-          await bot.api
-            .editMessageText(chatId, state.messageId, text)
-            .catch(() => {});
-          toolBlockStateByChatId.set(chatId, { ...state, groups: newGroups });
+    // If a flush is already running it will pick up the latest pending state
+    if (toolBlockOperationByChatId.has(chatId)) return;
+
+    // Start a flush loop: drains pending groups, looping if more arrive during an API call
+    const operation = (async () => {
+      while (toolBlockPendingGroupsByChatId.has(chatId)) {
+        const groups = toolBlockPendingGroupsByChatId.get(chatId)!;
+        toolBlockPendingGroupsByChatId.delete(chatId);
+
+        if (!bot) break;
+        const state = toolBlockStateByChatId.get(chatId);
+        const text = renderToolBlock(groups);
+
+        try {
+          if (!state) {
+            const result = await bot.api.sendMessage(chatId, text);
+            toolBlockStateByChatId.set(chatId, {
+              messageId: result.message_id,
+              groups,
+            });
+          } else if (text.length > 3800) {
+            const freshGroups = upsertToolCallGroup([], toolName, description);
+            const freshText = renderToolBlock(freshGroups);
+            const result = await bot.api.sendMessage(chatId, freshText);
+            toolBlockStateByChatId.set(chatId, {
+              messageId: result.message_id,
+              groups: freshGroups,
+            });
+          } else {
+            await bot.api
+              .editMessageText(chatId, state.messageId, text)
+              .catch(() => {});
+            toolBlockStateByChatId.set(chatId, { ...state, groups });
+          }
+        } catch (error) {
+          console.warn(
+            `[Telegram] Failed to update tool block for ${chatId}:`,
+            error instanceof Error ? error.message : error,
+          );
         }
-      })
-      .catch((error) => {
-        console.warn(
-          `[Telegram] Failed to update tool block for ${chatId}:`,
-          error instanceof Error ? error.message : error,
-        );
-      })
-      .finally(() => {
-        if (toolBlockOperationByChatId.get(chatId) === operation) {
-          toolBlockOperationByChatId.delete(chatId);
-        }
-      });
+      }
+    })().finally(() => {
+      toolBlockOperationByChatId.delete(chatId);
+    });
     toolBlockOperationByChatId.set(chatId, operation);
   }
 
@@ -847,6 +856,7 @@ export function createTelegramAdapter(
       typingIntervalByChatId.clear();
       toolBlockStateByChatId.clear();
       toolBlockOperationByChatId.clear();
+      toolBlockPendingGroupsByChatId.clear();
       convListCache.clear();
 
       for (const entry of bufferedMediaGroups.values()) {
@@ -924,6 +934,7 @@ export function createTelegramAdapter(
         if (pending) await pending.catch(() => {});
         toolBlockStateByChatId.delete(source.chatId);
         toolBlockOperationByChatId.delete(source.chatId);
+        toolBlockPendingGroupsByChatId.delete(source.chatId);
         pendingReasoningByChatId.delete(source.chatId);
       }
     },

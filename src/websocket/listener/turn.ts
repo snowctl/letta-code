@@ -663,6 +663,7 @@ export async function handleIncomingMessage(
     const buffers = createBuffers(agentId);
     const channelSources = runtime.activeChannelTurnSources;
     let accumulatedChannelText = "";
+    let lastAssistantMsgId: string | null = null;
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -673,6 +674,7 @@ export async function handleIncomingMessage(
         }
       }
       accumulatedChannelText = "";
+      lastAssistantMsgId = null;
       runIdSent = false;
       let latestErrorText: string | null = null;
       const result = await drainStreamWithResume(
@@ -737,6 +739,18 @@ export async function handleIncomingMessage(
               // normalizeToolReturnWireMessage is a pass-through for assistant_message chunks
               const textChunk = extractAssistantText(normalizedChunk);
               if (textChunk) {
+                const chunkMsgId =
+                  typeof normalizedChunk.id === "string"
+                    ? normalizedChunk.id
+                    : null;
+                if (
+                  accumulatedChannelText !== "" &&
+                  chunkMsgId !== null &&
+                  chunkMsgId !== lastAssistantMsgId
+                ) {
+                  accumulatedChannelText += "\n";
+                }
+                lastAssistantMsgId = chunkMsgId;
                 accumulatedChannelText += textChunk;
                 if (channelSources && channelSources.length > 0) {
                   void getChannelRegistry()?.dispatchStreamText(
