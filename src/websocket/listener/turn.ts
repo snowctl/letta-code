@@ -384,6 +384,15 @@ export async function handleIncomingMessage(
   const requestedConversationId = msg.conversationId || undefined;
   const conversationId = requestedConversationId ?? "default";
   const normalizedAgentId = normalizeCwdAgentId(agentId);
+
+  // Track most recently used conversation so heartbeats/fallback routing can
+  // find the active conversation instead of always falling back to "default".
+  if (normalizedAgentId && conversationId && conversationId !== "default") {
+    runtime.listener.lastActiveConversationByAgentId.set(
+      normalizedAgentId,
+      conversationId,
+    );
+  }
   const turnWorkingDirectory = getConversationWorkingDirectory(
     runtime.listener,
     normalizedAgentId,

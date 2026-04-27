@@ -259,6 +259,7 @@ import {
   evictConversationRuntimeIfIdle,
   getActiveRuntime,
   getConversationRuntime,
+  getConversationRuntimeKey,
   getListenerStatus,
   getOrCreateConversationRuntime,
   getPendingControlRequestCount,
@@ -3294,7 +3295,11 @@ async function wireChannelIngress(
   );
 
   registry.setCancelHandler((agentId: string, conversationId: string) => {
-    const scopedRuntime = getConversationRuntime(listener, agentId, conversationId);
+    const scopedRuntime = getConversationRuntime(
+      listener,
+      agentId,
+      conversationId,
+    );
     if (!scopedRuntime?.isProcessing) return false;
     scopedRuntime.cancelRequested = true;
     if (
@@ -3467,12 +3472,21 @@ function getOrCreateScopedRuntime(
 
 /**
  * Fallback for unscoped task notifications (e.g., reflection/init spawned
- * outside turn processing). Picks the first ConversationRuntime that has a
- * QueueRuntime, or null if none exist.
+ * outside turn processing). Prefers the most recently active conversation,
+ * then falls back to the first ConversationRuntime that has a QueueRuntime.
  */
 function findFallbackRuntime(
   listener: ListenerRuntime,
 ): ConversationRuntime | null {
+  for (const [
+    agentId,
+    conversationId,
+  ] of listener.lastActiveConversationByAgentId) {
+    const cr = listener.conversationRuntimes.get(
+      getConversationRuntimeKey(agentId, conversationId),
+    );
+    if (cr?.queueRuntime) return cr;
+  }
   for (const cr of listener.conversationRuntimes.values()) {
     if (cr.queueRuntime) {
       return cr;
@@ -4034,6 +4048,7 @@ function createRuntime(): ListenerRuntime {
     approvalRuntimeKeyByRequestId: new Map(),
     memfsSyncedAgents: new Map(),
     lastEmittedStatus: null,
+    lastActiveConversationByAgentId: new Map(),
   };
 }
 
@@ -6123,6 +6138,7 @@ function createLegacyTestRuntime(): ConversationRuntime & {
   memfsSyncedAgents: ListenerRuntime["memfsSyncedAgents"];
   worktreeWatcherByConversation: ListenerRuntime["worktreeWatcherByConversation"];
   lastEmittedStatus: ListenerRuntime["lastEmittedStatus"];
+  lastActiveConversationByAgentId: ListenerRuntime["lastActiveConversationByAgentId"];
 } {
   const listener = createRuntime();
   const runtime = getOrCreateScopedRuntime(listener, null, "default");
@@ -6158,6 +6174,7 @@ function createLegacyTestRuntime(): ConversationRuntime & {
     memfsSyncedAgents: ListenerRuntime["memfsSyncedAgents"];
     worktreeWatcherByConversation: ListenerRuntime["worktreeWatcherByConversation"];
     lastEmittedStatus: ListenerRuntime["lastEmittedStatus"];
+    lastActiveConversationByAgentId: ListenerRuntime["lastActiveConversationByAgentId"];
   };
   for (const [prop, getSet] of Object.entries({
     socket: {
@@ -6323,6 +6340,12 @@ function createLegacyTestRuntime(): ConversationRuntime & {
       get: () => listener.lastEmittedStatus,
       set: (value: ListenerRuntime["lastEmittedStatus"]) => {
         listener.lastEmittedStatus = value;
+      },
+    },
+    lastActiveConversationByAgentId: {
+      get: () => listener.lastActiveConversationByAgentId,
+      set: (value: ListenerRuntime["lastActiveConversationByAgentId"]) => {
+        listener.lastActiveConversationByAgentId = value;
       },
     },
     activeAgentId: {

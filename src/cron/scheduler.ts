@@ -186,10 +186,16 @@ function fireCronTask(
   const listener = getActiveRuntime();
   if (!listener) return;
 
+  const effectiveConversationId =
+    task.conversation_id !== "default"
+      ? task.conversation_id
+      : (listener.lastActiveConversationByAgentId.get(task.agent_id) ??
+        undefined);
+
   const rawRuntime = getOrCreateConversationRuntime(
     listener,
     task.agent_id,
-    task.conversation_id === "default" ? undefined : task.conversation_id,
+    effectiveConversationId,
   );
 
   if (!rawRuntime) return;
