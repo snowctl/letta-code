@@ -181,15 +181,7 @@ export async function resolveSubagentModel(options: {
 
   if (userModel) return userModel;
 
-  if (options.subagentType === "reflection") {
-    return "letta/auto-memory";
-  }
-
-  let recommendedHandle: string | null = null;
-  if (recommendedModel && recommendedModel !== "inherit") {
-    recommendedHandle = resolveModel(recommendedModel);
-  }
-
+  // Build isAvailable helper early so it can be used by the reflection check.
   let availableHandles: Set<string> | null = options.availableHandles ?? null;
   const isAvailable = async (handle: string): Promise<boolean> => {
     try {
@@ -202,6 +194,25 @@ export async function resolveSubagentModel(options: {
       return false;
     }
   };
+
+  if (options.subagentType === "reflection") {
+    const autoMemory = process.env.AUTO_MEMORY;
+    const autoMemoryEnabled =
+      autoMemory === "1" || autoMemory?.toLowerCase() === "true";
+    if (autoMemoryEnabled) {
+      // Explicit override: always use letta/auto-memory regardless of availability.
+      return "letta/auto-memory";
+    }
+    if (await isAvailable("letta/auto-memory")) {
+      return "letta/auto-memory";
+    }
+    // letta/auto-memory not on this server — fall through to parentModelHandle below
+  }
+
+  let recommendedHandle: string | null = null;
+  if (recommendedModel && recommendedModel !== "inherit") {
+    recommendedHandle = resolveModel(recommendedModel);
+  }
 
   // Free-tier default for subagents: auto-fast, when available.
   const freeTierDefaultHandle = isFreeTier ? resolveModel("auto-fast") : null;

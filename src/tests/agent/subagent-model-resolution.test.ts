@@ -447,4 +447,23 @@ describe("resolveSubagentModel", () => {
 
     expect(result).toBe("anthropic/test-model");
   });
+
+  test("reflection falls back to parentModelHandle when letta/auto-memory is unavailable", async () => {
+    const result = await resolveSubagentModel({
+      subagentType: "reflection",
+      parentModelHandle: "anthropic/claude-sonnet-4-6",
+      availableHandles: new Set(["anthropic/claude-sonnet-4-6"]), // no letta/auto-memory
+    });
+
+    expect(result).toBe("anthropic/claude-sonnet-4-6");
+  });
+
+  test("reflection falls back to null when letta/auto-memory and parentModelHandle are both unavailable", async () => {
+    const result = await resolveSubagentModel({
+      subagentType: "reflection",
+      availableHandles: new Set(["anthropic/claude-sonnet-4-6"]), // no letta/auto-memory, no parent
+    });
+
+    expect(result).toBeNull();
+  });
 });
