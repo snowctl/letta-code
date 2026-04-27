@@ -1548,11 +1548,15 @@ export function createMatrixAdapter(
         }
 
         const _existing = reasoningBufferByChatId.get(chatId) ?? "";
-        // Ensure a space between chunks when the buffer ends with a sentence
-        // terminator and the new chunk starts without whitespace (kimi-k2.6
-        // streams reasoning without inter-sentence spaces).
-        const _spacer = _existing.length > 0 && /[.!?]$/.test(_existing) && /^[^ 
-]/.test(chunk) ? " " : "";
+        // Insert a space between chunks when the buffer ends with a sentence
+        // terminator and the new chunk starts with a non-whitespace character
+        // (kimi-k2.6 streams reasoning without inter-sentence spaces).
+        const _spacer =
+          _existing.length > 0 &&
+          /[.!?]$/.test(_existing) &&
+          /^\S/.test(chunk)
+            ? " "
+            : "";
         reasoningBufferByChatId.set(chatId, _existing + _spacer + chunk);
 
         if (!reasoningMessageIdByChatId.has(chatId)) {
