@@ -1547,10 +1547,13 @@ export function createMatrixAdapter(
             reasoningBufferByChatId.set(chatId, existing + "\n--\n");
         }
 
-        reasoningBufferByChatId.set(
-          chatId,
-          (reasoningBufferByChatId.get(chatId) ?? "") + chunk,
-        );
+        const _existing = reasoningBufferByChatId.get(chatId) ?? "";
+        // Ensure a space between chunks when the buffer ends with a sentence
+        // terminator and the new chunk starts without whitespace (kimi-k2.6
+        // streams reasoning without inter-sentence spaces).
+        const _spacer = _existing.length > 0 && /[.!?]$/.test(_existing) && /^[^ 
+]/.test(chunk) ? " " : "";
+        reasoningBufferByChatId.set(chatId, _existing + _spacer + chunk);
 
         if (!reasoningMessageIdByChatId.has(chatId)) {
           reasoningMessageIdByChatId.set(chatId, "__pending__"); // claim the slot immediately
