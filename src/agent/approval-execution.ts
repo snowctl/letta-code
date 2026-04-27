@@ -65,6 +65,21 @@ export function resolveToolTimeoutMs(
     const resolved = explicit ?? 120_000;
     return Math.min(Math.max(resolved, 1), 600_000);
   }
+  // ShellCommand / shell_command (Codex): timeout_ms arg, same defaults as Bash.
+  // Shell / shell / RunShellCommand / run_shell_command: also timeout_ms.
+  if (
+    toolName === "ShellCommand" ||
+    toolName === "shell_command" ||
+    toolName === "Shell" ||
+    toolName === "shell" ||
+    toolName === "RunShellCommand" ||
+    toolName === "run_shell_command"
+  ) {
+    const explicit =
+      typeof args.timeout_ms === "number" ? args.timeout_ms : null;
+    const resolved = explicit ?? 120_000;
+    return Math.min(Math.max(resolved, 1), 600_000);
+  }
   // BashOutput / KillBash: short polls, no useful "deadline" to surface.
   // Tools without a time concept return undefined.
   return undefined;
@@ -329,26 +344,22 @@ async function executeSingleDecision(
 
       let toolResult: ToolExecutionResult;
       try {
-        toolResult = await executeTool(
-          decision.approval.toolName,
-          parsedArgs,
-          {
-            signal: options?.abortSignal,
-            toolCallId: decision.approval.toolCallId,
-            toolContextId: options?.toolContextId,
-            parentScope: options?.parentScope,
-            onOutput: options?.onStreamingOutput
-              ? (chunk, stream) =>
-                  options.onStreamingOutput?.(
-                    decision.approval.toolCallId,
-                    chunk,
-                    stream === "stderr",
-                  )
-              : undefined,
-            onFileWrite: options?.onFileWrite,
-            onToolCall: options?.onToolCall,
-          },
-        );
+        toolResult = await executeTool(decision.approval.toolName, parsedArgs, {
+          signal: options?.abortSignal,
+          toolCallId: decision.approval.toolCallId,
+          toolContextId: options?.toolContextId,
+          parentScope: options?.parentScope,
+          onOutput: options?.onStreamingOutput
+            ? (chunk, stream) =>
+                options.onStreamingOutput?.(
+                  decision.approval.toolCallId,
+                  chunk,
+                  stream === "stderr",
+                )
+            : undefined,
+          onFileWrite: options?.onFileWrite,
+          onToolCall: options?.onToolCall,
+        });
       } catch (executeErr) {
         // Fire tool_ended on the throw path before re-throwing so the outer
         // catch's existing error-result logic remains the single source of

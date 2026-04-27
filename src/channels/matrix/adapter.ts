@@ -423,6 +423,21 @@ export function createMatrixAdapter(
     if (toolName === "Bash" && typeof args.command === "string") {
       raw = args.command;
     } else if (
+      // ShellCommand / shell_command: `command` is a plain string
+      (toolName === "ShellCommand" || toolName === "shell_command") &&
+      typeof args.command === "string"
+    ) {
+      raw = args.command;
+    } else if (
+      // Shell / shell / RunShellCommand / run_shell_command: `command` is string[]
+      (toolName === "Shell" ||
+        toolName === "shell" ||
+        toolName === "RunShellCommand" ||
+        toolName === "run_shell_command") &&
+      Array.isArray(args.command)
+    ) {
+      raw = (args.command as string[]).join(" ");
+    } else if (
       (toolName === "Read" || toolName === "Write" || toolName === "Edit") &&
       typeof args.file_path === "string"
     ) {
