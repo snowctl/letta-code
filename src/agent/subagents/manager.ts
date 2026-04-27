@@ -80,7 +80,11 @@ interface ExecutionState {
  */
 function getModelHandleFromAgent(agent: {
   model?: string | null;
-  llm_config?: { handle?: string | null; model_endpoint_type?: string | null; model?: string | null };
+  llm_config?: {
+    handle?: string | null;
+    model_endpoint_type?: string | null;
+    model?: string | null;
+  };
 }): string | null {
   // Prefer the canonical handle fields over reconstructing from endpoint_type/model,
   // since model_endpoint_type is "openai" for both openai and openai-proxy providers.
@@ -140,7 +144,7 @@ const BYOK_PROVIDER_TO_BASE: Record<string, string> = {
   "openai-proxy": "openai",
 };
 
-function getProviderPrefix(handle: string): string | null {
+export function getProviderPrefix(handle: string): string | null {
   const slashIndex = handle.indexOf("/");
   if (slashIndex === -1) return null;
   return handle.slice(0, slashIndex);
