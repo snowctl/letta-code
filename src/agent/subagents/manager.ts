@@ -256,9 +256,7 @@ export async function resolveSubagentModel(options: {
         return parentModelHandle;
       }
 
-      if (await isAvailable(recommendedHandle)) {
-        return recommendedHandle;
-      }
+      // Non-BYOK: parent model takes precedence (recommended is a hint, not an override)
     }
 
     return parentModelHandle;

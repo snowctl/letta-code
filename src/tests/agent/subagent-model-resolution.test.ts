@@ -311,14 +311,17 @@ describe("resolveSubagentModel", () => {
     expect(result).toBe("lc-anthropic/test-model");
   });
 
-  test("uses recommended model when parent is not BYOK and model is available", async () => {
+  test("inherits parent model when parent is not BYOK, regardless of recommended model", async () => {
     const result = await resolveSubagentModel({
       recommendedModel: "anthropic/test-model",
       parentModelHandle: "anthropic/parent-model",
-      availableHandles: new Set(["anthropic/test-model"]),
+      availableHandles: new Set([
+        "anthropic/test-model",
+        "anthropic/parent-model",
+      ]),
     });
 
-    expect(result).toBe("anthropic/test-model");
+    expect(result).toBe("anthropic/parent-model");
   });
 
   test("explicit user model overrides all other resolution", async () => {
