@@ -5,6 +5,7 @@
  * Supports both built-in subagent types and custom subagents defined in .letta/agents/.
  */
 
+import { getAvailableModelHandles } from "../../agent/available-models";
 import { getClient } from "../../agent/client";
 import { getConversationId, getCurrentAgentId } from "../../agent/context";
 import {
@@ -12,7 +13,10 @@ import {
   discoverSubagents,
   getAllSubagentConfigs,
 } from "../../agent/subagents";
-import { spawnSubagent } from "../../agent/subagents/manager";
+import {
+  getProviderPrefix,
+  spawnSubagent,
+} from "../../agent/subagents/manager";
 import { addToMessageQueue } from "../../cli/helpers/messageQueueBridge.js";
 import {
   completeSubagent,
@@ -55,6 +59,23 @@ interface TaskArgs {
 // Valid subagent_types when deploying an existing agent
 const VALID_DEPLOY_TYPES = new Set(["general-purpose"]);
 const BACKGROUND_STARTUP_POLL_MS = 50;
+
+export function formatInvalidModelError(
+  model: string,
+  handles: Set<string>,
+): string {
+  const prefix = getProviderPrefix(model);
+  const filtered = [...handles]
+    .filter((h) => !prefix || h.startsWith(`${prefix}/`))
+    .sort();
+
+  if (filtered.length === 0) {
+    return `Model '${model}' is not available on this server. Use \`command: list-models\` to see all available models.`;
+  }
+
+  const label = prefix ?? "available";
+  return `Model '${model}' is not available on this server. Valid ${label} models: ${filtered.join(", ")}`;
+}
 
 type TaskRunResult = {
   agentId: string;
@@ -576,6 +597,18 @@ export function spawnBackgroundSubagentTask(
  */
 export async function task(args: TaskArgs): Promise<string> {
   const { command = "run", model, toolCallId, signal } = args;
+
+  // Validate user-provided model early to avoid cryptic downstream errors.
+  if (model && command === "run") {
+    try {
+      const { handles } = await getAvailableModelHandles();
+      if (!handles.has(model)) {
+        return formatInvalidModelError(model, handles);
+      }
+    } catch {
+      // Can't reach the server to validate — let it proceed and fail downstream.
+    }
+  }
 
   // Handle refresh command - re-discover subagents from .letta/agents/ directories
   if (command === "refresh") {
