@@ -476,13 +476,40 @@ export function createMatrixAdapter(
     return null;
   }
 
+  /** Sliding-window cap on the reasoning buffer when rendered to Matrix.
+   *  The Matrix homeserver limit is 65 536 bytes per event after JSON
+   *  encoding. Each finalize sends the buffer ~3× in the event payload
+   *  (top-level body, m.new_content.body, HTML-escaped formatted_body),
+   *  so we keep the raw character cap well below 65 536/3 to leave
+   *  headroom for HTML escaping, the wrapper markup, the tool-status
+   *  block, and the m.relates_to / m.new_content overhead. */
+  const MATRIX_REASONING_MAX_CHARS = 12_000;
+  const MATRIX_REASONING_TRUNCATION_NOTICE =
+    "[…earlier reasoning truncated to fit Matrix size limit…]";
+
+  /** Returns the tail of `buffer` that fits inside the Matrix size budget,
+   *  prefixed with a notice when truncation actually happened. We keep the
+   *  *end* of the buffer because the most recent thinking is the most
+   *  useful for the user watching live — earlier thoughts are usually
+   *  already implied by what's on screen, the tool calls that ran, and
+   *  the eventual answer message. */
+  function clipReasoningForMatrix(buffer: string): string {
+    if (buffer.length <= MATRIX_REASONING_MAX_CHARS) return buffer;
+    const noticeWithSeparator = `${MATRIX_REASONING_TRUNCATION_NOTICE}\n\n`;
+    const tail = buffer.slice(
+      -(MATRIX_REASONING_MAX_CHARS - noticeWithSeparator.length),
+    );
+    return noticeWithSeparator + tail;
+  }
+
   /** Build the full thinking-placeholder HTML: reasoning buffer plus the
    *  current tool-status block (running or just-completed) when present.
    *  Returns `null` when there's nothing meaningful to flush — the
    *  placeholder was already created with the bare "Thinking..." HTML, so
    *  emitting that again would be a wasted edit. */
   function buildPlaceholderHtml(chatId: string): string | null {
-    const buffer = reasoningBufferByChatId.get(chatId) ?? "";
+    const rawBuffer = reasoningBufferByChatId.get(chatId) ?? "";
+    const buffer = clipReasoningForMatrix(rawBuffer);
     const reasoningHtml = buffer
       ? `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer)
           .replace(/\n--\n/g, "<hr>")
@@ -625,9 +652,13 @@ export function createMatrixAdapter(
   ): Promise<void> {
     const messageId = reasoningMessageIdByChatId.get(chatId);
     if (!messageId || messageId === "__pending__" || !matrixClient) return;
-    const buffer = reasoningBufferByChatId.get(chatId) ?? "";
+    const rawBuffer = reasoningBufferByChatId.get(chatId) ?? "";
     // Skip if nothing to show and no footer to append.
-    if (!buffer && !footer) return;
+    if (!rawBuffer && !footer) return;
+    // Clip to Matrix's 64 KiB-per-event limit; keep the most recent thinking
+    // (sliding window) since the early portion is usually already implied
+    // by tool calls + the final answer.
+    const buffer = clipReasoningForMatrix(rawBuffer);
     const innerHtml =
       (buffer
         ? escapeHtml(buffer)
@@ -1552,9 +1583,7 @@ export function createMatrixAdapter(
         // terminator and the new chunk starts with a non-whitespace character
         // (kimi-k2.6 streams reasoning without inter-sentence spaces).
         const _spacer =
-          _existing.length > 0 &&
-          /[.!?]$/.test(_existing) &&
-          /^\S/.test(chunk)
+          _existing.length > 0 && /[.!?]$/.test(_existing) && /^\S/.test(chunk)
             ? " "
             : "";
         reasoningBufferByChatId.set(chatId, _existing + _spacer + chunk);

@@ -1701,6 +1701,106 @@ test("matrix adapter: thinking finalized when turn ends without response", async
   await adapter.stop();
 });
 
+test("matrix adapter: very long reasoning is sliding-window truncated to fit Matrix size cap", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1") // initial thinking placeholder
+    .mockResolvedValueOnce("$thinking-final"); // final edit at "finished"
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // 30k of plain ASCII reasoning — well over the 12k MATRIX_REASONING_MAX_CHARS cap.
+  // Use distinct head/tail markers so we can prove which side was kept.
+  const headMarker = "AAAAAAAAAA-very-early-thoughts-AAAAAAAAAA";
+  const tailMarker = "ZZZZZZZZZZ-most-recent-conclusion-ZZZZZZZZZZ";
+  const filler = "x".repeat(30_000);
+  const longReasoning = `${headMarker}${filler}${tailMarker}`;
+
+  await adapter.handleStreamReasoning!(longReasoning, [source]);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const ec = editContent as Record<string, unknown>;
+  const newContent = ec["m.new_content"] as Record<string, unknown>;
+  const editHtml = newContent.formatted_body as string;
+  const editBody = newContent.body as string;
+
+  // Sliding window: the *tail* is preserved, the *head* is dropped.
+  expect(editBody).toContain(tailMarker);
+  expect(editBody).not.toContain(headMarker);
+  expect(editHtml).toContain(tailMarker);
+  expect(editHtml).not.toContain(headMarker);
+
+  // A truncation notice is prepended so the user knows content was clipped.
+  expect(editBody).toContain("truncated");
+  expect(editHtml).toContain("truncated");
+
+  // The total formatted_body must comfortably fit under Matrix's 64 KiB
+  // event-size limit even with HTML escaping and wrapper markup.
+  expect(editHtml.length).toBeLessThan(60_000);
+
+  await adapter.stop();
+});
+
+test("matrix adapter: short reasoning is NOT truncated (no notice)", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$thinking-final");
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // Short reasoning — well under the cap, must pass through unchanged.
+  await adapter.handleStreamReasoning!("Just a brief thought.", [source]);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const newContent = (editContent as Record<string, unknown>)[
+    "m.new_content"
+  ] as Record<string, unknown>;
+  const editBody = newContent.body as string;
+
+  expect(editBody).toContain("Just a brief thought.");
+  expect(editBody).not.toContain("truncated");
+
+  await adapter.stop();
+});
+
 test("matrix adapter: multi-run thinking within one turn is appended with separator", async () => {
   const adapter = await makeAdapter();
   await adapter.start();
