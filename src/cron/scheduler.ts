@@ -131,21 +131,22 @@ function getFirstChatIdForRoute(
   return null;
 }
 
-function resolveTargetsForTask(task: CronTask): CronTarget[] {
+function resolveTargetsForTask(
+  task: CronTask,
+  effectiveConversationId?: string,
+): CronTarget[] {
+  const conversationId = effectiveConversationId ?? task.conversation_id;
   try {
     const scope = resolveConversationChannelToolScope(
       task.agent_id,
-      task.conversation_id,
+      conversationId,
     );
     return scope.channels
       .map((ch) => ({
         channel: ch.channelId,
         chatId:
-          getFirstChatIdForRoute(
-            ch.channelId,
-            task.agent_id,
-            task.conversation_id,
-          ) ?? "",
+          getFirstChatIdForRoute(ch.channelId, task.agent_id, conversationId) ??
+          "",
       }))
       .filter((t) => t.chatId !== "");
   } catch {
@@ -207,7 +208,10 @@ function fireCronTask(
     rawRuntime,
   );
 
-  const text = wrapCronPrompt(task, resolveTargetsForTask(task));
+  const text = wrapCronPrompt(
+    task,
+    resolveTargetsForTask(task, effectiveConversationId),
+  );
 
   conversationRuntime.queueRuntime.enqueue({
     kind: "cron_prompt",
