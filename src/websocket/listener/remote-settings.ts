@@ -24,6 +24,8 @@ export interface PersistedPermissionModeState {
 export interface RemoteSettings {
   cwdMap?: Record<string, string>;
   permissionModeMap?: Record<string, PersistedPermissionModeState>;
+  /** Most recently active (non-default) conversationId per agentId. */
+  lastActiveConversationMap?: Record<string, string>;
 }
 
 // Module-level cache to avoid repeated disk reads and enable cheap merges.
@@ -99,6 +101,29 @@ export function saveRemoteSettings(updates: Partial<RemoteSettings>): void {
     .catch(() => {
       // Silently ignore write failures.
     });
+}
+
+export function loadLastActiveConversationMap(): Map<string, string> {
+  try {
+    const settings = loadRemoteSettings();
+    const map = new Map<string, string>();
+    if (settings.lastActiveConversationMap) {
+      for (const [key, value] of Object.entries(
+        settings.lastActiveConversationMap,
+      )) {
+        map.set(key, value);
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+export function persistLastActiveConversationMap(
+  map: Map<string, string>,
+): void {
+  saveRemoteSettings({ lastActiveConversationMap: Object.fromEntries(map) });
 }
 
 /**

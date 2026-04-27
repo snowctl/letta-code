@@ -250,6 +250,7 @@ import {
   resolveRecoveredApprovalResponse,
   shouldAttemptPostStopApprovalRecovery,
 } from "./recovery";
+import { loadLastActiveConversationMap } from "./remote-settings";
 import {
   clearActiveRunState,
   clearConversationRuntimeState,
@@ -4048,7 +4049,7 @@ function createRuntime(): ListenerRuntime {
     approvalRuntimeKeyByRequestId: new Map(),
     memfsSyncedAgents: new Map(),
     lastEmittedStatus: null,
-    lastActiveConversationByAgentId: new Map(),
+    lastActiveConversationByAgentId: loadLastActiveConversationMap(),
   };
 }
 

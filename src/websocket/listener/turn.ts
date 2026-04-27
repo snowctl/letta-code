@@ -92,6 +92,7 @@ import {
   isRetriablePostStopError,
   shouldAttemptPostStopApprovalRecovery,
 } from "./recovery";
+import { persistLastActiveConversationMap } from "./remote-settings";
 import {
   clearActiveRunState,
   clearRecoveredApprovalStateForScope,
@@ -387,10 +388,14 @@ export async function handleIncomingMessage(
 
   // Track most recently used conversation so heartbeats/fallback routing can
   // find the active conversation instead of always falling back to "default".
+  // Persisted so the mapping survives server restarts.
   if (normalizedAgentId && conversationId && conversationId !== "default") {
     runtime.listener.lastActiveConversationByAgentId.set(
       normalizedAgentId,
       conversationId,
+    );
+    persistLastActiveConversationMap(
+      runtime.listener.lastActiveConversationByAgentId,
     );
   }
   const turnWorkingDirectory = getConversationWorkingDirectory(
