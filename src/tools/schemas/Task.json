@@ -4,11 +4,11 @@
     "command": {
       "type": "string",
       "enum": ["run", "refresh", "list-models"],
-      "description": "Command to run. 'run' (default) spawns a subagent. 'refresh' re-discovers custom subagents from .letta/agents/. 'list-models' returns available model handles without spawning anything."
+      "description": "Command to run. 'run' (default) spawns a subagent. 'refresh' re-discovers custom subagents from .letta/agents/. 'list-models' returns available model handles as JSON {models: string[]} without spawning anything."
     },
     "query": {
       "type": "string",
-      "description": "Fuzzy search query for list-models. Case-insensitive substring match against the full model handle (e.g. 'kimi', 'claude-sonnet', 'anthropic'). Only used with command: list-models."
+      "description": "Substring search query for list-models. Case-insensitive match against the full model handle (e.g. 'kimi', 'claude-sonnet', 'anthropic'). Only used with command: list-models."
     },
     "description": {
       "type": "string",
@@ -39,7 +39,7 @@
       "description": "Resume from an existing conversation. Does NOT require agent_id (conversation IDs are unique and encode the agent)."
     }
   },
-  "required": [],
+  "required": ["description", "prompt", "subagent_type"],
   "additionalProperties": false,
   "$schema": "http://json-schema.org/draft-07/schema#"
 }

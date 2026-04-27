@@ -646,9 +646,13 @@ export async function task(args: TaskArgs): Promise<string> {
   }
 
   if (command === "list-models") {
-    const { handles } = await getAvailableModelHandles();
-    const models = filterModelHandles(handles, args.query);
-    return JSON.stringify({ models });
+    try {
+      const { handles } = await getAvailableModelHandles();
+      const models = filterModelHandles(handles, args.query);
+      return JSON.stringify({ models });
+    } catch {
+      return "Error: Could not reach server to fetch model list.";
+    }
   }
 
   // Determine if deploying an existing agent
