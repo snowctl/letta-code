@@ -1237,6 +1237,8 @@ export function createMatrixAdapter(
       const replyContent: Record<string, unknown> = {
         msgtype: "m.text",
         body: promptText,
+        format: "org.matrix.custom.html",
+        formatted_body: markdownToMatrixHtml(promptText),
       };
       const replyToId = threadId ?? messageId;
       if (replyToId) {
