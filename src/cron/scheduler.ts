@@ -219,7 +219,7 @@ function fireCronTask(
     text,
     cronTaskId: task.id,
     agentId: task.agent_id,
-    conversationId: task.conversation_id,
+    conversationId: effectiveConversationId ?? task.conversation_id,
   } as Omit<CronPromptQueueItem, "id" | "enqueuedAt">);
 
   scheduleQueuePump(conversationRuntime, socket, opts, processQueuedTurn);
