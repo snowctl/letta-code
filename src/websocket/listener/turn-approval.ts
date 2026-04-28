@@ -166,6 +166,8 @@ export async function handleApprovalStop(params: {
   buildSendOptions: () => Parameters<
     typeof sendApprovalContinuationWithRetry
   >[2];
+  /** Context source — when "cron", skip alwaysRequiresUserInput and auto-deny. */
+  source?: "user" | "cron";
 }): Promise<ApprovalBranchResult> {
   const {
     approvals,
@@ -173,6 +175,7 @@ export async function handleApprovalStop(params: {
     socket,
     agentId,
     conversationId,
+    source,
     turnWorkingDirectory,
     turnPermissionModeState,
     dequeuedBatchId,
@@ -230,7 +233,11 @@ export async function handleApprovalStop(params: {
 
   const { autoAllowed, autoDenied, needsUserInput } =
     await classifyApprovalsWithSuggestions(approvals, {
-      alwaysRequiresUserInput: isInteractiveApprovalTool,
+      alwaysRequiresUserInput: (toolName: string) => {
+        // During cron/heartbeat runs, skip interactive tools that need user input
+        if (source === "cron") return false;
+        return isInteractiveApprovalTool(toolName);
+      },
       treatAskAsDeny: false,
       requireArgsForAutoApprove: true,
       missingNameReason: "Tool call incomplete - missing name",

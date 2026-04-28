@@ -56,6 +56,8 @@ export interface IncomingMessage {
   agentId?: string;
   conversationId?: string;
   channelTurnSources?: ChannelTurnSource[];
+  /** Distinguishes user messages from cron/heartbeat prompts. */
+  source?: "user" | "cron";
   messages: Array<
     (MessageCreate & { client_message_id?: string }) | ApprovalCreate
   >;

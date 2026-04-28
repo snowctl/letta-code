@@ -1155,6 +1155,7 @@ export async function handleIncomingMessage(
         pendingNormalizationInterruptedToolCallIds,
         turnToolContextId,
         buildSendOptions,
+        source: msg.source,
       });
       if (approvalResult.terminated || !approvalResult.stream) {
         return;
