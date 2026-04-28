@@ -92,6 +92,10 @@ const TOOL_NAME_MAPPINGS: Partial<Record<ToolName, string>> = {
   read_file_gemini: "read_file",
   list_directory: "list_directory",
   run_shell_command: "run_shell_command",
+  // Align subagent-spawning tool with Claude Code: surface internal `Task` as `Agent`.
+  // Internal implementation name stays `Task` for backward compat with existing
+  // agent states; getInternalToolName("Agent") resolves back to "Task".
+  Task: "Agent",
 };
 
 /**

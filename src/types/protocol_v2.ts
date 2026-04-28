@@ -15,6 +15,7 @@ import type {
   SlackDefaultPermissionMode,
 } from "../channels/types";
 import type { CronTask } from "../cron";
+import type { ExperimentId, ExperimentSnapshot } from "../experiments/types";
 
 /**
  * Runtime identity for all state and delta events.
@@ -183,6 +184,7 @@ export type ChannelConfigSnapshot =
       enabled: boolean;
       dm_policy: DmPolicy;
       allowed_users: string[];
+      allowed_channels: string[];
       has_token: boolean;
     };
 
@@ -230,6 +232,7 @@ export type ChannelAccountSnapshot =
       running: boolean;
       dm_policy: DmPolicy;
       allowed_users: string[];
+      allowed_channels: string[];
       has_token: boolean;
       agent_id: string | null;
       created_at: string;
@@ -300,6 +303,7 @@ export interface DeviceStatus {
   current_available_skills: AvailableSkillSummary[];
   background_processes: BackgroundProcessSummary[];
   pending_control_requests: PendingControlRequest[];
+  experiments: ExperimentSnapshot[];
   memory_directory: string | null;
   should_doctor?: boolean;
   reflection_settings: ReflectionSettingsSnapshot | null;
@@ -578,6 +582,12 @@ export interface AbortMessageCommand {
 export interface SyncCommand {
   type: "sync";
   runtime: RuntimeScope;
+  /**
+   * Whether the device should probe backend state for stale pending approvals.
+   * Defaults to true for older clients. Lightweight status/recovery syncs should
+   * set this false and only replay in-memory listener state.
+   */
+  recover_approvals?: boolean;
 }
 
 export interface TerminalSpawnCommand {
@@ -984,6 +994,18 @@ export interface SetReflectionSettingsCommand {
   scope?: ReflectionSettingsScope;
 }
 
+export interface GetExperimentsCommand {
+  type: "get_experiments";
+  request_id: string;
+}
+
+export interface SetExperimentCommand {
+  type: "set_experiment";
+  request_id: string;
+  experiment_id: ExperimentId;
+  enabled: boolean;
+}
+
 export interface ChannelsListCommand {
   type: "channels_list";
   request_id: string;
@@ -1015,6 +1037,16 @@ export type ChannelAccountCreatePayload =
       default_permission_mode?: SlackDefaultPermissionMode;
       dm_policy?: DmPolicy;
       allowed_users?: string[];
+    }
+  | {
+      account_id?: string;
+      display_name?: string;
+      enabled?: boolean;
+      token?: string;
+      agent_id?: string | null;
+      dm_policy?: DmPolicy;
+      allowed_users?: string[];
+      allowed_channels?: string[];
     };
 
 export interface ChannelAccountCreateCommand {
@@ -1047,6 +1079,15 @@ export interface ChannelAccountUpdateCommand {
         default_permission_mode?: SlackDefaultPermissionMode;
         dm_policy?: DmPolicy;
         allowed_users?: string[];
+      }
+    | {
+        display_name?: string;
+        enabled?: boolean;
+        token?: string;
+        agent_id?: string | null;
+        dm_policy?: DmPolicy;
+        allowed_users?: string[];
+        allowed_channels?: string[];
       };
 }
 
@@ -1103,6 +1144,7 @@ export interface ChannelSetConfigCommand {
         token?: string;
         dm_policy?: DmPolicy;
         allowed_users?: string[];
+        allowed_channels?: string[];
       }
     | {
         bot_token?: string;
@@ -1259,6 +1301,22 @@ export interface SetReflectionSettingsResponseMessage {
   success: boolean;
   reflection_settings: ReflectionSettingsSnapshot | null;
   scope: ReflectionSettingsScope;
+  error?: string;
+}
+
+export interface GetExperimentsResponseMessage {
+  type: "get_experiments_response";
+  request_id: string;
+  success: boolean;
+  experiments: ExperimentSnapshot[];
+  error?: string;
+}
+
+export interface SetExperimentResponseMessage {
+  type: "set_experiment_response";
+  request_id: string;
+  success: boolean;
+  experiments: ExperimentSnapshot[];
   error?: string;
 }
 
@@ -1581,6 +1639,8 @@ export type WsProtocolCommand =
   | CreateAgentCommand
   | GetReflectionSettingsCommand
   | SetReflectionSettingsCommand
+  | GetExperimentsCommand
+  | SetExperimentCommand
   | ChannelsListCommand
   | ChannelAccountsListCommand
   | ChannelAccountCreateCommand
@@ -1614,6 +1674,8 @@ export type WsProtocolMessage =
   | ListModelsResponseMessage
   | UpdateModelResponseMessage
   | UpdateToolsetResponseMessage
+  | GetExperimentsResponseMessage
+  | SetExperimentResponseMessage
   | ChannelsListResponseMessage
   | ChannelAccountsListResponseMessage
   | ChannelAccountCreateResponseMessage

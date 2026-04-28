@@ -39,6 +39,12 @@ function cloneAccount<T extends ChannelAccount>(account: T): T {
     (cloned as TelegramChannelAccount).binding = { ...account.binding };
   }
 
+  if (account.channel === "discord" && account.allowedChannels) {
+    (cloned as DiscordChannelAccount).allowedChannels = [
+      ...account.allowedChannels,
+    ];
+  }
+
   return cloned;
 }
 
@@ -111,6 +117,9 @@ function makeDefaultLegacyAccount(
       token: config.token,
       dmPolicy: config.dmPolicy,
       allowedUsers: [...config.allowedUsers],
+      allowedChannels: config.allowedChannels
+        ? [...config.allowedChannels]
+        : undefined,
       agentId: null,
       createdAt: now,
       updatedAt: now,

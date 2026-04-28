@@ -94,7 +94,7 @@ import {
 } from "./reminders/state";
 import { getCurrentWorkingDirectory } from "./runtime-context";
 import { settingsManager, shouldPersistSessionState } from "./settings-manager";
-import { writeWireMessage } from "./streamJsonWriter";
+import { writeWireMessage, writeWireMessageAsync } from "./streamJsonWriter";
 import { telemetry } from "./telemetry";
 import { trackBoundaryError } from "./telemetry/errorReporting";
 import { extractTelemetryInputText } from "./telemetry/input";
@@ -365,6 +365,7 @@ async function prepareHeadlessToolExecutionContext(params: {
   agentId: string;
   conversationId: string;
   overrideModel?: string | null;
+  cachedAgent?: AgentState | null;
 }): Promise<{
   preparedToolContext: Awaited<
     ReturnType<typeof prepareToolExecutionContextForScope>
@@ -377,6 +378,7 @@ async function prepareHeadlessToolExecutionContext(params: {
     overrideModel: params.overrideModel,
     workingDirectory: getCurrentWorkingDirectory(),
     exclude: ["AskUserQuestion"],
+    cachedAgent: params.cachedAgent,
   });
 
   return {
@@ -424,6 +426,18 @@ async function flushAndExit(code: number): Promise<never> {
   ]);
 
   process.exit(code);
+}
+
+// For one-shot headless outputs (json/text), await the final stdout write before
+// exiting so CI pipes don't occasionally observe an empty stdout buffer.
+async function writeFinalHeadlessStdout(text: string): Promise<void> {
+  await new Promise<void>((resolve) => {
+    if (process.stdout.destroyed || process.stdout.writableEnded) {
+      resolve();
+      return;
+    }
+    process.stdout.write(text, () => resolve());
+  });
 }
 
 export async function handleHeadlessCommand(
@@ -975,7 +989,9 @@ export async function handleHeadlessCommand(
   // Priority 2: Try to use --agent specified ID
   if (!agent && specifiedAgentId) {
     try {
-      agent = await client.agents.retrieve(specifiedAgentId);
+      agent = await client.agents.retrieve(specifiedAgentId, {
+        include: ["agent.secrets", "agent.tools"],
+      });
     } catch (_error) {
       console.error(`Agent ${specifiedAgentId} not found`);
       process.exit(1);
@@ -1110,7 +1126,7 @@ export async function handleHeadlessCommand(
   const secretsAgentId = agent?.id;
   const secretsInitPromise = secretsAgentId
     ? import("./utils/secretsStore").then(({ initSecretsFromServer }) =>
-        initSecretsFromServer(secretsAgentId),
+        initSecretsFromServer(secretsAgentId, agent ?? undefined),
       )
     : Promise.resolve();
 
@@ -1263,7 +1279,7 @@ export async function handleHeadlessCommand(
   }
 
   const startupAgentId = agent.id;
-  void clearPersistedClientToolRules(startupAgentId)
+  void clearPersistedClientToolRules(startupAgentId, agent)
     .then((cleanup) => {
       if (cleanup) {
         const count = cleanup.removedToolNames.length;
@@ -1393,12 +1409,24 @@ export async function handleHeadlessCommand(
 
   let availableTools =
     agent.tools?.map((t) => t.name).filter((n): n is string => !!n) || [];
+  // Cache the agent from the initial fetch to avoid redundant agents.retrieve
+  // calls on every while-loop iteration.
+  let cachedAgent: AgentState | null = null;
+  // Capture the resolved model (conversation override → agent fallback) so
+  // subsequent while-loop iterations can prepare the correct toolset without
+  // re-fetching the conversation model. This is only for local tool context;
+  // request-scoped override_model should remain reserved for provider fallback.
+  let preparedEffectiveModel: string | null | undefined;
   {
     const initialToolContext = await prepareHeadlessToolExecutionContext({
       agentId: agent.id,
       conversationId,
+      cachedAgent: agent as AgentState,
     });
     availableTools = initialToolContext.availableTools;
+    cachedAgent = initialToolContext.preparedToolContext.agent;
+    preparedEffectiveModel =
+      initialToolContext.preparedToolContext.effectiveModel;
   }
 
   // If input-format is stream-json, use bidirectional mode
@@ -1733,7 +1761,7 @@ ${SYSTEM_REMINDER_CLOSE}
           session_id: sessionId,
           uuid: `error-max-turns-${randomUUID()}`,
         };
-        writeWireMessage(errorMsg);
+        await writeWireMessageAsync(errorMsg);
       } else {
         console.error(
           `Maximum turns limit reached (${buffers.usage.stepCount}/${maxTurns} steps)`,
@@ -1785,7 +1813,8 @@ ${SYSTEM_REMINDER_CLOSE}
         const turnToolContext = await prepareHeadlessToolExecutionContext({
           agentId: agent.id,
           conversationId,
-          overrideModel: overrideModelHandle,
+          overrideModel: overrideModelHandle ?? preparedEffectiveModel,
+          cachedAgent,
         });
         availableTools = turnToolContext.availableTools;
         stream = await sendMessageStream(conversationId, currentInput, {
@@ -2367,7 +2396,7 @@ ${SYSTEM_REMINDER_CLOSE}
               session_id: sessionId,
               uuid: `error-${lastRunId || randomUUID()}`,
             };
-            writeWireMessage(errorMsg);
+            await writeWireMessageAsync(errorMsg);
           } else {
             console.error("Failed to fetch pending approvals for resync");
           }
@@ -2604,7 +2633,7 @@ ${SYSTEM_REMINDER_CLOSE}
           session_id: sessionId,
           uuid: `error-${lastRunId || randomUUID()}`,
         };
-        writeWireMessage(errorMsg);
+        await writeWireMessageAsync(errorMsg);
       } else {
         console.error(`Error: ${errorMessage}`);
       }
@@ -2631,7 +2660,7 @@ ${SYSTEM_REMINDER_CLOSE}
         session_id: sessionId,
         uuid: `error-${lastKnownRunId || randomUUID()}`,
       };
-      writeWireMessage(errorMsg);
+      await writeWireMessageAsync(errorMsg);
     } else {
       console.error(`Error: ${errorDetails}`);
     }
@@ -2705,7 +2734,7 @@ ${SYSTEM_REMINDER_CLOSE}
       conversation_id: conversationId,
       usage,
     };
-    console.log(JSON.stringify(output, null, 2));
+    await writeFinalHeadlessStdout(`${JSON.stringify(output, null, 2)}\n`);
   } else if (outputFormat === "stream-json") {
     // Output final result event
     // Collect all run_ids from buffers
@@ -2737,14 +2766,14 @@ ${SYSTEM_REMINDER_CLOSE}
       usage,
       uuid: resultUuid,
     };
-    writeWireMessage(resultEvent);
+    await writeWireMessageAsync(resultEvent);
   } else {
     // text format (default)
     if (!resultText || resultText === "No assistant response found") {
       console.error("No assistant response found");
       await exitHeadless(1, "headless_missing_result_text");
     }
-    console.log(resultText);
+    await writeFinalHeadlessStdout(`${resultText}\n`);
   }
 
   // Report all milestones at the end for latency audit
