@@ -148,6 +148,7 @@ const PARALLEL_SAFE_TOOLS = new Set([
   "TaskOutput",
   // Task spawns independent subagents
   "Task",
+  "Agent",
   // Plan mode tools (no parameters, no file operations)
   "EnterPlanMode",
   "ExitPlanMode",

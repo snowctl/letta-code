@@ -5,7 +5,6 @@ import type {
   ApprovalCreate,
   LettaStreamingResponse,
 } from "@letta-ai/letta-client/resources/agents/messages";
-import WebSocket from "ws";
 import {
   type ApprovalResult,
   executeApprovalBatch,
@@ -57,6 +56,7 @@ import {
   sendApprovalContinuationWithRetry,
 } from "./send";
 import { injectQueuedSkillContent } from "./skill-injection";
+import { isListenerTransportOpen, type ListenerTransport } from "./transport";
 import type { ConversationRuntime } from "./types";
 
 type Decision =
@@ -152,7 +152,7 @@ export async function handleApprovalStop(params: {
     toolArgs: string;
   }>;
   runtime: ConversationRuntime;
-  socket: WebSocket;
+  socket: ListenerTransport;
   agentId: string;
   conversationId: string;
   turnWorkingDirectory: string;
@@ -490,7 +490,7 @@ export async function handleApprovalStop(params: {
   // Broadcast new file content to web clients when a file-mutating tool
   // (Edit, Write, MultiEdit) writes to disk, so all windows update immediately.
   const onFileWrite = (filePath: string, content: string) => {
-    if (socket.readyState === WebSocket.OPEN) {
+    if (isListenerTransportOpen(socket)) {
       socket.send(
         JSON.stringify({
           type: "file_ops",
@@ -564,18 +564,23 @@ export async function handleApprovalStop(params: {
         }
       : undefined;
 
-  const executionResults = await executeApprovalBatch(decisions, undefined, {
-    toolContextId: turnToolContextId ?? undefined,
-    abortSignal: abortController.signal,
-    onStreamingOutput: emitToolExecutionOutput,
-    workingDirectory: turnWorkingDirectory,
-    parentScope:
-      agentId && conversationId ? { agentId, conversationId } : undefined,
-    onFileWrite,
-    onToolCall,
-    onToolStarted,
-    onToolEnded,
-  });
+  let executionResults: Awaited<ReturnType<typeof executeApprovalBatch>>;
+  try {
+    executionResults = await executeApprovalBatch(decisions, undefined, {
+      toolContextId: turnToolContextId ?? undefined,
+      abortSignal: abortController.signal,
+      onStreamingOutput: emitToolExecutionOutput,
+      workingDirectory: turnWorkingDirectory,
+      parentScope:
+        agentId && conversationId ? { agentId, conversationId } : undefined,
+      onFileWrite,
+      onToolCall,
+      onToolStarted,
+      onToolEnded,
+    });
+  } finally {
+    emitToolExecutionOutput.flush();
+  }
   const persistedExecutionResults = normalizeExecutionResultsForInterruptParity(
     runtime,
     executionResults,
@@ -615,6 +620,7 @@ export async function handleApprovalStop(params: {
     {
       type: "approval",
       approvals: persistedExecutionResults,
+      otid: crypto.randomUUID(),
     },
   ];
   let continuationBatchId = dequeuedBatchId;

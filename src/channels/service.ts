@@ -94,6 +94,7 @@ export type ChannelConfigSnapshot =
       enabled: boolean;
       dmPolicy: DmPolicy;
       allowedUsers: string[];
+      allowedChannels: string[];
       hasToken: boolean;
     }
   | {
@@ -193,6 +194,7 @@ export type ChannelAccountSnapshot =
       running: boolean;
       dmPolicy: DmPolicy;
       allowedUsers: string[];
+      allowedChannels: string[];
       hasToken: boolean;
       agentId: string | null;
       createdAt: string;
@@ -228,6 +230,8 @@ export interface ChannelConfigPatch {
   e2ee?: boolean;
   dmPolicy?: DmPolicy;
   allowedUsers?: string[];
+  /** Discord-only: allowlist of guild channel IDs (parent channel for threads). */
+  allowedChannels?: string[];
 }
 
 export interface ChannelAccountPatch {
@@ -245,6 +249,8 @@ export interface ChannelAccountPatch {
   defaultPermissionMode?: SlackDefaultPermissionMode;
   dmPolicy?: DmPolicy;
   allowedUsers?: string[];
+  /** Discord-only: allowlist of guild channel IDs (parent channel for threads). */
+  allowedChannels?: string[];
   transcribeVoice?: boolean;
   maxMediaDownloadBytes?: number;
 }
@@ -515,6 +521,7 @@ function toAccountSnapshot(account: ChannelAccount): ChannelAccountSnapshot {
       running,
       dmPolicy: account.dmPolicy,
       allowedUsers: [...account.allowedUsers],
+      allowedChannels: [...(account.allowedChannels ?? [])],
       hasToken: account.token.trim().length > 0,
       agentId: account.agentId,
       createdAt: account.createdAt,
@@ -596,6 +603,7 @@ function createAccountFromPatch(
       agentId: patch.agentId ?? null,
       dmPolicy: patch.dmPolicy ?? "pairing",
       allowedUsers: patch.allowedUsers ?? [],
+      allowedChannels: patch.allowedChannels ?? [],
       createdAt: now,
       updatedAt: now,
     };
@@ -652,6 +660,7 @@ function mergeAccountPatch(
       agentId: patch.agentId ?? existing.agentId,
       dmPolicy: patch.dmPolicy ?? existing.dmPolicy,
       allowedUsers: patch.allowedUsers ?? existing.allowedUsers,
+      allowedChannels: patch.allowedChannels ?? existing.allowedChannels,
       updatedAt: nextUpdatedAt,
     };
   }
@@ -770,6 +779,7 @@ export function getChannelConfigSnapshot(
       enabled: account.enabled,
       dmPolicy: account.dmPolicy,
       allowedUsers: [...account.allowedUsers],
+      allowedChannels: [...(account.allowedChannels ?? [])],
       hasToken: account.token.trim().length > 0,
     };
   }
@@ -824,6 +834,7 @@ export async function setChannelConfigLive(
       e2ee: patch.e2ee,
       dmPolicy: patch.dmPolicy,
       allowedUsers: patch.allowedUsers,
+      allowedChannels: patch.allowedChannels,
       displayName: existing.displayName,
     });
     shouldRefreshDisplayName =
@@ -849,6 +860,7 @@ export async function setChannelConfigLive(
         e2ee: patch.e2ee,
         dmPolicy: patch.dmPolicy,
         allowedUsers: patch.allowedUsers,
+        allowedChannels: patch.allowedChannels,
       },
       accountId ? { accountId } : undefined,
     );
