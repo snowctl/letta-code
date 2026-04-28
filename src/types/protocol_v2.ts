@@ -184,6 +184,7 @@ export type ChannelConfigSnapshot =
       enabled: boolean;
       dm_policy: DmPolicy;
       allowed_users: string[];
+      allowed_channels: string[];
       has_token: boolean;
     };
 
@@ -231,6 +232,7 @@ export type ChannelAccountSnapshot =
       running: boolean;
       dm_policy: DmPolicy;
       allowed_users: string[];
+      allowed_channels: string[];
       has_token: boolean;
       agent_id: string | null;
       created_at: string;
@@ -1035,6 +1037,16 @@ export type ChannelAccountCreatePayload =
       default_permission_mode?: SlackDefaultPermissionMode;
       dm_policy?: DmPolicy;
       allowed_users?: string[];
+    }
+  | {
+      account_id?: string;
+      display_name?: string;
+      enabled?: boolean;
+      token?: string;
+      agent_id?: string | null;
+      dm_policy?: DmPolicy;
+      allowed_users?: string[];
+      allowed_channels?: string[];
     };
 
 export interface ChannelAccountCreateCommand {
@@ -1067,6 +1079,15 @@ export interface ChannelAccountUpdateCommand {
         default_permission_mode?: SlackDefaultPermissionMode;
         dm_policy?: DmPolicy;
         allowed_users?: string[];
+      }
+    | {
+        display_name?: string;
+        enabled?: boolean;
+        token?: string;
+        agent_id?: string | null;
+        dm_policy?: DmPolicy;
+        allowed_users?: string[];
+        allowed_channels?: string[];
       };
 }
 
@@ -1123,6 +1144,7 @@ export interface ChannelSetConfigCommand {
         token?: string;
         dm_policy?: DmPolicy;
         allowed_users?: string[];
+        allowed_channels?: string[];
       }
     | {
         bot_token?: string;

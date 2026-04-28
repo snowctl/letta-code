@@ -117,6 +117,8 @@ import type {
   ListMemoryCommand,
   ListModelsResponseMessage,
   ListModelsResponseModelEntry,
+  ChannelAccountSnapshot as ProtocolChannelAccountSnapshot,
+  ChannelConfigSnapshot as ProtocolChannelConfigSnapshot,
   ReflectionSettingsScope,
   SetExperimentCommand,
   SetExperimentResponseMessage,
@@ -1678,7 +1680,7 @@ async function handleChannelsProtocolCommand(
 
   const mapChannelConfig = (
     snapshot: ReturnType<typeof getChannelConfigSnapshot>,
-  ) => {
+  ): ProtocolChannelConfigSnapshot | null => {
     if (!snapshot) {
       return null;
     }
@@ -1701,6 +1703,7 @@ async function handleChannelsProtocolCommand(
         enabled: snapshot.enabled,
         dm_policy: snapshot.dmPolicy,
         allowed_users: snapshot.allowedUsers,
+        allowed_channels: snapshot.allowedChannels,
         has_token: snapshot.hasToken,
       };
     }
@@ -1719,7 +1722,7 @@ async function handleChannelsProtocolCommand(
 
   const mapChannelAccount = (
     snapshot: ReturnType<typeof listChannelAccountSnapshots>[number],
-  ) => {
+  ): ProtocolChannelAccountSnapshot => {
     if (snapshot.channelId === "telegram") {
       return {
         channel_id: snapshot.channelId,
@@ -1750,6 +1753,7 @@ async function handleChannelsProtocolCommand(
         running: snapshot.running,
         dm_policy: snapshot.dmPolicy,
         allowed_users: snapshot.allowedUsers,
+        allowed_channels: snapshot.allowedChannels,
         has_token: snapshot.hasToken,
         agent_id: snapshot.agentId,
         created_at: snapshot.createdAt,
@@ -1937,6 +1941,10 @@ async function handleChannelsProtocolCommand(
               : undefined,
           dmPolicy: parsed.account.dm_policy,
           allowedUsers: parsed.account.allowed_users,
+          allowedChannels:
+            "allowed_channels" in parsed.account
+              ? parsed.account.allowed_channels
+              : undefined,
         },
         {
           accountId:
@@ -2017,6 +2025,10 @@ async function handleChannelsProtocolCommand(
               : undefined,
           dmPolicy: parsed.patch.dm_policy,
           allowedUsers: parsed.patch.allowed_users,
+          allowedChannels:
+            "allowed_channels" in parsed.patch
+              ? parsed.patch.allowed_channels
+              : undefined,
         },
       );
       const shouldRefreshDisplayName =
@@ -2358,6 +2370,10 @@ async function handleChannelsProtocolCommand(
           mode: "mode" in parsed.config ? parsed.config.mode : undefined,
           dmPolicy: parsed.config.dm_policy,
           allowedUsers: parsed.config.allowed_users,
+          allowedChannels:
+            "allowed_channels" in parsed.config
+              ? parsed.config.allowed_channels
+              : undefined,
         },
         parsed.account_id,
       );
