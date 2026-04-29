@@ -34,18 +34,18 @@ describe("formatChannelNotification", () => {
     const content = formatChannelNotification(msg);
     const [reminderPart, bodyPart] = expectTextParts(content, 2);
 
-    expect(reminderPart!.text).toContain("<system-reminder>");
-    expect(reminderPart!.text).toContain("</system-reminder>");
-    expect(reminderPart!.text).toContain("## Message Metadata");
-    expect(reminderPart!.text).toContain("- **Channel**: telegram");
-    expect(reminderPart!.text).toContain("- **Chat ID**: 12345");
-    expect(reminderPart!.text).toContain("- **Sender**: John (67890)");
-    expect(reminderPart!.text).toContain("- **Message ID**: msg-42");
+    expect(reminderPart?.text).toContain("<system-reminder>");
+    expect(reminderPart?.text).toContain("</system-reminder>");
+    expect(reminderPart?.text).toContain("## Message Metadata");
+    expect(reminderPart?.text).toContain("- **Channel**: telegram");
+    expect(reminderPart?.text).toContain("- **Chat ID**: 12345");
+    expect(reminderPart?.text).toContain("- **Sender**: John (67890)");
+    expect(reminderPart?.text).toContain("- **Message ID**: msg-42");
 
     // The body part is the user's text *outside* any XML — no
     // <channel-notification> wrapping, no nested envelope.
-    expect(bodyPart!.text).toBe("Hello from Telegram!");
-    expect(bodyPart!.text).not.toContain("<channel-notification");
+    expect(bodyPart?.text).toBe("Hello from Telegram!");
+    expect(bodyPart?.text).not.toContain("<channel-notification");
   });
 
   test("renders sectioned markdown with metadata, chat context, and response directives", () => {
@@ -229,8 +229,8 @@ describe("formatChannelNotification", () => {
     // No body part — only reminder, since text is empty and no thread context.
     const [reminderPart] = expectTextParts(content, 1);
 
-    expect(reminderPart!.text).toContain("**Reaction event**");
-    expect(reminderPart!.text).toContain(
+    expect(reminderPart?.text).toContain("**Reaction event**");
+    expect(reminderPart?.text).toContain(
       "Charlie added `eyes` on message `1712800000.000100`",
     );
   });

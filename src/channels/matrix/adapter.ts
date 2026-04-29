@@ -1150,7 +1150,7 @@ export function createMatrixAdapter(
 
       // Drain all pending tool block operations to ensure tool block messages are above the response.
       while (toolBlockOperationByChatId.has(msg.chatId)) {
-        await toolBlockOperationByChatId.get(msg.chatId)!.catch(() => {});
+        await toolBlockOperationByChatId.get(msg.chatId)?.catch(() => {});
       }
 
       // If handleStreamReasoning is currently sending the thinking placeholder (__pending__),
@@ -1577,7 +1577,7 @@ export function createMatrixAdapter(
           reasoningNeedsSeparatorByChatId.delete(chatId);
           const existing = reasoningBufferByChatId.get(chatId) ?? "";
           if (existing)
-            reasoningBufferByChatId.set(chatId, existing + "\n--\n");
+            reasoningBufferByChatId.set(chatId, `${existing}\n--\n`);
         }
 
         const _existing = reasoningBufferByChatId.get(chatId) ?? "";
@@ -1846,7 +1846,7 @@ function buildMatrixControlRequestPrompt(event: ChannelControlRequestEvent): {
     case "generic_tool_approval": {
       const inputStr = JSON.stringify(event.input, null, 2);
       const truncated =
-        inputStr.length > 1200 ? inputStr.slice(0, 1197) + "..." : inputStr;
+        inputStr.length > 1200 ? `${inputStr.slice(0, 1197)}...` : inputStr;
       const lines = [`The agent wants approval to run \`${event.toolName}\`.`];
       if (truncated && truncated !== "{}")
         lines.push("", "Tool input:", truncated);
@@ -1868,7 +1868,7 @@ function buildMatrixControlRequestPrompt(event: ChannelControlRequestEvent): {
       if (event.planContent?.trim()) {
         const preview =
           event.planContent.length > 1800
-            ? event.planContent.slice(0, 1797) + "..."
+            ? `${event.planContent.slice(0, 1797)}...`
             : event.planContent;
         lines.push("", "Proposed plan:", preview);
         if (event.planFilePath?.trim())

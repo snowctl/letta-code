@@ -69,14 +69,14 @@ function normalizeLoadedAccount<T extends ChannelAccount>(account: T): T {
     ).defaultPermissionMode ?? "default") as SlackDefaultPermissionMode;
   }
   if (next.channel === "telegram") {
-    (next as TelegramChannelAccount).defaultPermissionMode =
-      ((next as TelegramChannelAccount).defaultPermissionMode ??
-        "default") as SlackDefaultPermissionMode;
+    (next as TelegramChannelAccount).defaultPermissionMode = ((
+      next as TelegramChannelAccount
+    ).defaultPermissionMode ?? "default") as SlackDefaultPermissionMode;
   }
   if (next.channel === "matrix") {
-    (next as MatrixChannelAccount).defaultPermissionMode =
-      ((next as MatrixChannelAccount).defaultPermissionMode ??
-        "default") as SlackDefaultPermissionMode;
+    (next as MatrixChannelAccount).defaultPermissionMode = ((
+      next as MatrixChannelAccount
+    ).defaultPermissionMode ?? "default") as SlackDefaultPermissionMode;
   }
   return next;
 }

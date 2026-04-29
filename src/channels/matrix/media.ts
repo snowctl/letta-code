@@ -179,7 +179,9 @@ export async function downloadMatrixAttachment(
         attachment.transcription = result.text;
       }
       // Ephemeral: delete audio immediately after transcription (privacy)
-      try { unlinkSync(localPath); } catch {}
+      try {
+        unlinkSync(localPath);
+      } catch {}
     }
 
     return attachment;
