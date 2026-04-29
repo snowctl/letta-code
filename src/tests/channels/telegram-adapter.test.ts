@@ -1326,7 +1326,7 @@ test("typing indicator: sendChatAction called on queued event", async () => {
   await adapter.start();
   const bot = FakeBot.instances.at(-1)!;
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "queued",
     source: LIFECYCLE_SOURCE,
   });
@@ -1340,12 +1340,12 @@ test("typing indicator: idempotent — second queued for same chat does not doub
   await adapter.start();
   const bot = FakeBot.instances.at(-1)!;
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "queued",
     source: LIFECYCLE_SOURCE,
   });
   const callsAfterFirst = bot.api.sendChatAction.mock.calls.length;
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "queued",
     source: LIFECYCLE_SOURCE,
   });
@@ -1360,7 +1360,7 @@ test("typing indicator: processing event starts interval for new chats", async (
   const bot = FakeBot.instances.at(-1)!;
   const newSource = { ...LIFECYCLE_SOURCE, chatId: "chat-99" };
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "processing",
     batchId: "batch-1",
     sources: [newSource],
@@ -1375,7 +1375,7 @@ test("tool block: first tool_call sends a new message", async () => {
   await adapter.start();
   const bot = FakeBot.instances.at(-1)!;
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "read_file",
@@ -1400,13 +1400,13 @@ test("tool block: second tool_call edits the existing message", async () => {
   await adapter.start();
   const bot = FakeBot.instances.at(-1)!;
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "read_file",
     sources: [LIFECYCLE_SOURCE],
   });
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "read_file",
@@ -1430,14 +1430,14 @@ test("tool block: tool with description grouped correctly", async () => {
   await adapter.start();
   const bot = FakeBot.instances.at(-1)!;
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "bash",
     description: "Run tests",
     sources: [LIFECYCLE_SOURCE],
   });
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "bash",
@@ -1460,7 +1460,7 @@ test("tool block: exceeding 3800 chars sends new message", async () => {
   const bot = FakeBot.instances.at(-1)!;
 
   // First tool call creates the block
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "bash",
@@ -1469,7 +1469,7 @@ test("tool block: exceeding 3800 chars sends new message", async () => {
 
   // Push 100 distinct descriptions to exceed 3800 chars
   for (let i = 0; i < 100; i++) {
-    await adapter.handleTurnLifecycleEvent!({
+    await adapter.handleTurnLifecycleEvent?.({
       type: "tool_call",
       batchId: "batch-1",
       toolName: "bash",
@@ -1491,7 +1491,7 @@ test("tool block: cleared on finished (state does not persist across turns)", as
   await adapter.start();
   const bot = FakeBot.instances.at(-1)!;
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "read_file",
@@ -1503,7 +1503,7 @@ test("tool block: cleared on finished (state does not persist across turns)", as
 
   const sendCallsBefore = bot.api.sendMessage.mock.calls.length;
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [LIFECYCLE_SOURCE],
@@ -1511,7 +1511,7 @@ test("tool block: cleared on finished (state does not persist across turns)", as
   });
 
   // New turn — tool_call should create a fresh message, not edit
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-2",
     toolName: "glob",
@@ -1547,8 +1547,8 @@ test("telegram adapter appends Show reasoning button when reasoning was received
     conversationId: "conv1",
   };
 
-  await adapter.handleStreamReasoning!("I need to think.", [source]);
-  await adapter.handleStreamReasoning!(" Done.", [source]);
+  await adapter.handleStreamReasoning?.("I need to think.", [source]);
+  await adapter.handleStreamReasoning?.(" Done.", [source]);
 
   await adapter.sendMessage({
     channel: "telegram",
@@ -1558,7 +1558,7 @@ test("telegram adapter appends Show reasoning button when reasoning was received
   });
 
   expect(bot?.api.sendMessage).toHaveBeenCalledTimes(1);
-  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+  const [, , opts] = bot?.api.sendMessage.mock.calls[0] as unknown as [
     string,
     string,
     Record<string, unknown>,
@@ -1569,7 +1569,7 @@ test("telegram adapter appends Show reasoning button when reasoning was received
   expect(keyboard.inline_keyboard[0]?.[0]?.text).toBe("🧠 Show reasoning");
 
   const callbackData = JSON.parse(
-    keyboard.inline_keyboard[0]![0]!.callback_data,
+    keyboard.inline_keyboard[0]?.[0]?.callback_data ?? "",
   ) as {
     k: string;
     a: string;
@@ -1600,7 +1600,7 @@ test("telegram adapter sends reasoning as reply when Show reasoning button is ta
     conversationId: "conv1",
   };
 
-  await adapter.handleStreamReasoning!("My reasoning.", [source]);
+  await adapter.handleStreamReasoning?.("My reasoning.", [source]);
 
   await adapter.sendMessage({
     channel: "telegram",
@@ -1610,7 +1610,7 @@ test("telegram adapter sends reasoning as reply when Show reasoning button is ta
   });
 
   // Capture callback_data from the sent message
-  const [, , sendOpts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+  const [, , sendOpts] = bot?.api.sendMessage.mock.calls[0] as unknown as [
     string,
     string,
     Record<string, unknown>,
@@ -1618,12 +1618,12 @@ test("telegram adapter sends reasoning as reply when Show reasoning button is ta
   const keyboard = sendOpts.reply_markup as {
     inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
   };
-  const callbackData = keyboard.inline_keyboard[0]![0]!.callback_data;
+  const callbackData = keyboard.inline_keyboard[0]?.[0]?.callback_data;
 
-  bot!.api.sendMessage.mockClear();
+  bot?.api.sendMessage.mockClear();
 
   // Simulate user tapping the button
-  await bot!.emit("callback_query", {
+  await bot?.emit("callback_query", {
     callbackQuery: {
       id: "cq1",
       from: { id: 7, username: "user" },
@@ -1633,7 +1633,7 @@ test("telegram adapter sends reasoning as reply when Show reasoning button is ta
   });
 
   expect(bot?.api.sendMessage).toHaveBeenCalledTimes(1);
-  const [chatId, text] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+  const [chatId, text] = bot?.api.sendMessage.mock.calls[0] as unknown as [
     string,
     string,
   ];
@@ -1664,12 +1664,12 @@ test("telegram adapter sends message without button when no reasoning received",
     text: "No reasoning here.",
   });
 
-  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+  const [, , opts] = bot?.api.sendMessage.mock.calls[0] as unknown as [
     string,
     string,
     Record<string, unknown> | undefined,
   ];
-  expect((opts ?? {}).reply_markup).toBeUndefined();
+  expect(opts?.reply_markup).toBeUndefined();
 
   await adapter.stop();
 });
@@ -1696,7 +1696,7 @@ test("telegram adapter skips reasoning button when showReasoning is false", asyn
     conversationId: "conv1",
   };
 
-  await adapter.handleStreamReasoning!("thinking...", [source]);
+  await adapter.handleStreamReasoning?.("thinking...", [source]);
 
   await adapter.sendMessage({
     channel: "telegram",
@@ -1705,12 +1705,12 @@ test("telegram adapter skips reasoning button when showReasoning is false", asyn
     text: "Answer.",
   });
 
-  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+  const [, , opts] = bot?.api.sendMessage.mock.calls[0] as unknown as [
     string,
     string,
     Record<string, unknown> | undefined,
   ];
-  expect((opts ?? {}).reply_markup).toBeUndefined();
+  expect(opts?.reply_markup).toBeUndefined();
 
   await adapter.stop();
 });

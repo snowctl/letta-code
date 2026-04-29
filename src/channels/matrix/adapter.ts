@@ -272,21 +272,10 @@ export function createMatrixAdapter(
   const awaitingFreeformByChat = new Map<string, string>();
 
   // ── Typing indicator state ────────────────────────────────────────
-  const typingIntervalByChatId = new Map<string, ReturnType<typeof setInterval>>();
-
-  // ── Streaming state ──────────────────────────────────────────────
-  const MATRIX_STREAM_INTERVAL_MS = 500;
-  const MATRIX_STREAM_INTERVAL_MAX_MS = 8000;
-
-  interface MatrixStreamState {
-    messageId: string;
-    lastText: string;
-    lastEditAt: number;
-    pendingTimer: ReturnType<typeof setTimeout> | null;
-    currentInterval: number;
-    cleanupTimeout: ReturnType<typeof setTimeout> | null;
-  }
-  const streamStates = new Map<string, MatrixStreamState>();
+  const typingIntervalByChatId = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >();
 
   // ── Tool block state ─────────────────────────────────────────────
   interface MatrixToolBlockState {
@@ -296,13 +285,80 @@ export function createMatrixAdapter(
   const toolBlockStateByChatId = new Map<string, MatrixToolBlockState>();
   const toolBlockOperationByChatId = new Map<string, Promise<void>>();
 
+  // ── Reasoning display state ───────────────────────────────────────────────
+  const reasoningMessageIdByChatId = new Map<string, string>();
+  const reasoningBufferByChatId = new Map<string, string>();
+  // Set when a tool call interrupts reasoning; causes next chunk to prepend \n--\n separator
+  const reasoningNeedsSeparatorByChatId = new Set<string>();
+  const reasoningFlushIntervalByChatId = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >();
+
+  // ── Live tool-progress state ──────────────────────────────────────────────
+  // Tracks the currently-executing tool per chat so the thinking placeholder
+  // shows "Running `Bash` · 0:32 / 2:00" with a ticking elapsed counter
+  // instead of looking frozen during long tool runs. The most recently
+  // ended tool stays visible as a "Bash took 1:47" annotation until the
+  // next tool starts or reasoning resumes — gives the user a record of how
+  // long each step took.
+  //
+  // Tools that complete inside `toolProgressGraceMs` are *invisible*: the
+  // running block is never shown and no took-annotation is left behind.
+  // This keeps the room from flashing "Running `Read` · 0:00" for 200 ms
+  // every time the agent inspects a file. The grace also covers the
+  // took-annotation: if the running block never appeared, neither does
+  // the receipt.
+  interface RunningToolState {
+    toolCallId: string;
+    toolName: string;
+    argsPreview: string;
+    timeoutMs?: number;
+    startedAt: number;
+  }
+  interface CompletedToolState {
+    toolName: string;
+    argsPreview: string;
+    durationMs: number;
+    outcome: "success" | "error";
+  }
+  const runningToolByChatId = new Map<string, RunningToolState>();
+  const lastCompletedToolByChatId = new Map<string, CompletedToolState>();
+  const toolProgressTickerByChatId = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >();
+  // Per-chat grace timer: pending until either the timer fires (running block
+  // becomes visible) or tool_ended arrives first (state cleared silently).
+  const toolProgressGraceTimerByChatId = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+
+  // Tracks when the current turn entered "processing" state. Used to compute
+  // total turn wall time for the completion footer.
+  const turnStartedAtByChatId = new Map<string, number>();
+
+  // Stores the last plain-text response sent during the current turn, per
+  // chatId. The "finished" handler edits this message to append the completion
+  // footer.
+  const lastResponseByChatId = new Map<
+    string,
+    { eventId: string; text: string; html: string }
+  >();
+
+  // Text stored by handleAutoForward; sent by the "finished" lifecycle handler after
+  // thinking-block finalization to maintain correct Matrix timeline order.
+  const pendingResponseTextByChatId = new Map<string, string>();
+  const lastSentMessageIdByConversationId = new Map<string, string>();
+
   // ── Typing interval helpers ───────────────────────────────────────
 
   function startTypingInterval(chatId: string): void {
     if (typingIntervalByChatId.has(chatId) || !matrixClient) return;
     const fire = () => {
       if (!matrixClient) return;
-      void matrixClient.sendTyping(chatId, true, 8000).catch(() => {});
+      void matrixClient.setTyping(chatId, true, 8000).catch(() => {});
     };
     fire();
     typingIntervalByChatId.set(chatId, setInterval(fire, 4000));
@@ -314,51 +370,379 @@ export function createMatrixAdapter(
       clearInterval(timer);
       typingIntervalByChatId.delete(chatId);
       if (matrixClient) {
-        await matrixClient.sendTyping(chatId, false).catch(() => {});
+        await matrixClient.setTyping(chatId, false).catch(() => {});
       }
     }
   }
 
-  // ── Stream edit helper ────────────────────────────────────────────
+  /**
+   * Format ms as `m:ss` (e.g. `0:32`, `2:14`). Always two-digit seconds; the
+   * minute count grows as needed without padding so the field doesn't shift
+   * width across the 1-min boundary on phones that render edits in place.
+   */
+  function formatElapsed(ms: number): string {
+    const totalSec = Math.max(0, Math.floor(ms / 1000));
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  }
 
-  async function editStreamMessage(roomId: string, text: string): Promise<void> {
-    const state = streamStates.get(roomId);
-    if (!state || !matrixClient) return;
-    try {
-      await matrixClient.sendEvent(roomId, "m.room.message", {
-        "m.new_content": { msgtype: "m.text", body: text },
-        "m.relates_to": { rel_type: "m.replace", event_id: state.messageId },
-        body: "[editing…]",
-      });
-      state.lastEditAt = Date.now();
-      state.lastText = text;
-    } catch (error: unknown) {
-      const errCode = (error as { errcode?: string }).errcode;
-      if (errCode === "M_LIMIT_EXCEEDED") {
-        state.currentInterval = Math.min(
-          state.currentInterval * 2,
-          MATRIX_STREAM_INTERVAL_MAX_MS,
+  /**
+   * Redact common secret-like substrings before showing tool args back to
+   * the user. Matches `--api-key=…`, `Authorization: Bearer …`,
+   * `password=…`, `token=…`, `--header "x-api-key: …"`, etc. The single-bot
+   * Argos use case has self-talk privacy, but a careful default prevents
+   * accidental disclosure when tool output gets quoted into other rooms.
+   */
+  function redactSecrets(text: string): string {
+    return (
+      text
+        // Authorization: Bearer xxxxx (HTTP header, with or without leading dashes)
+        .replace(
+          /(authorization\s*[:=]\s*(?:bearer|basic)\s+)\S+/gi,
+          "$1<redacted>",
+        )
+        // --foo-key=value, --foo_token=value, password=value, etc.
+        .replace(
+          /((?:^|[\s"'-])(?:[\w-]*?(?:api[_-]?key|secret|token|password|bearer|auth))[=:\s]\s*)\S+/gi,
+          "$1<redacted>",
+        )
+    );
+  }
+
+  /**
+   * Build the args preview shown inside the running-tool block. Limits to
+   * 80 chars, redacts secret-shaped substrings, and falls back gracefully
+   * when args don't have a "natural" string representation per tool.
+   */
+  function buildArgsPreview(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): string {
+    let raw: string;
+    if (toolName === "Bash" && typeof args.command === "string") {
+      raw = args.command;
+    } else if (
+      // ShellCommand / shell_command: `command` is a plain string
+      (toolName === "ShellCommand" || toolName === "shell_command") &&
+      typeof args.command === "string"
+    ) {
+      raw = args.command;
+    } else if (
+      // Shell / shell / RunShellCommand / run_shell_command: `command` is string[]
+      (toolName === "Shell" ||
+        toolName === "shell" ||
+        toolName === "RunShellCommand" ||
+        toolName === "run_shell_command") &&
+      Array.isArray(args.command)
+    ) {
+      raw = (args.command as string[]).join(" ");
+    } else if (
+      (toolName === "Read" || toolName === "Write" || toolName === "Edit") &&
+      typeof args.file_path === "string"
+    ) {
+      raw = args.file_path;
+    } else if (toolName === "Glob" && typeof args.pattern === "string") {
+      raw = args.pattern;
+    } else if (toolName === "Grep" && typeof args.pattern === "string") {
+      raw = args.pattern;
+    } else {
+      // Fallback: stringify whatever's there, single-line.
+      raw = JSON.stringify(args).replace(/\s+/g, " ");
+    }
+    const oneLine = raw.replace(/\s+/g, " ").trim();
+    const redacted = redactSecrets(oneLine);
+    return redacted.length > 80 ? `${redacted.slice(0, 79)}…` : redacted;
+  }
+
+  /** Build the running-tool block HTML (or null if nothing to render). */
+  function buildToolStatusHtml(chatId: string): string | null {
+    const running = runningToolByChatId.get(chatId);
+    if (running) {
+      const elapsed = formatElapsed(Date.now() - running.startedAt);
+      const deadline = running.timeoutMs
+        ? ` / ${formatElapsed(running.timeoutMs)}`
+        : "";
+      const args = escapeHtml(running.argsPreview);
+      return `<b>Running <code>${escapeHtml(running.toolName)}</code> · ${elapsed}${deadline}</b><br><blockquote><code>${args}</code></blockquote>`;
+    }
+    const completed = lastCompletedToolByChatId.get(chatId);
+    if (completed) {
+      const took = formatElapsed(completed.durationMs);
+      const verb = completed.outcome === "error" ? "errored after" : "took";
+      const args = escapeHtml(completed.argsPreview);
+      return `<i><code>${escapeHtml(completed.toolName)}</code> ${verb} ${took}</i><br><blockquote><code>${args}</code></blockquote>`;
+    }
+    return null;
+  }
+
+  /** Sliding-window cap on the reasoning buffer when rendered to Matrix.
+   *  The Matrix homeserver limit is 65 536 bytes per event after JSON
+   *  encoding. Each finalize sends the buffer ~3× in the event payload
+   *  (top-level body, m.new_content.body, HTML-escaped formatted_body),
+   *  so we keep the raw character cap well below 65 536/3 to leave
+   *  headroom for HTML escaping, the wrapper markup, the tool-status
+   *  block, and the m.relates_to / m.new_content overhead. */
+  const MATRIX_REASONING_MAX_CHARS = 12_000;
+  const MATRIX_REASONING_TRUNCATION_NOTICE =
+    "[…earlier reasoning truncated to fit Matrix size limit…]";
+
+  /** Returns the tail of `buffer` that fits inside the Matrix size budget,
+   *  prefixed with a notice when truncation actually happened. We keep the
+   *  *end* of the buffer because the most recent thinking is the most
+   *  useful for the user watching live — earlier thoughts are usually
+   *  already implied by what's on screen, the tool calls that ran, and
+   *  the eventual answer message. */
+  function clipReasoningForMatrix(buffer: string): string {
+    if (buffer.length <= MATRIX_REASONING_MAX_CHARS) return buffer;
+    const noticeWithSeparator = `${MATRIX_REASONING_TRUNCATION_NOTICE}\n\n`;
+    const tail = buffer.slice(
+      -(MATRIX_REASONING_MAX_CHARS - noticeWithSeparator.length),
+    );
+    return noticeWithSeparator + tail;
+  }
+
+  /** Build the full thinking-placeholder HTML: reasoning buffer plus the
+   *  current tool-status block (running or just-completed) when present.
+   *  Returns `null` when there's nothing meaningful to flush — the
+   *  placeholder was already created with the bare "Thinking..." HTML, so
+   *  emitting that again would be a wasted edit. */
+  function buildPlaceholderHtml(chatId: string): string | null {
+    const rawBuffer = reasoningBufferByChatId.get(chatId) ?? "";
+    const buffer = clipReasoningForMatrix(rawBuffer);
+    const reasoningHtml = buffer
+      ? `<b>Thinking...</b><br><blockquote>${escapeHtml(buffer)
+          .replace(/\n--\n/g, "<hr>")
+          .replace(/\n/g, "<br>")}</blockquote>`
+      : "";
+    const toolHtml = buildToolStatusHtml(chatId);
+    if (reasoningHtml && toolHtml) return `${reasoningHtml}${toolHtml}`;
+    if (toolHtml) return toolHtml;
+    if (reasoningHtml) return reasoningHtml;
+    return null;
+  }
+
+  /** Edit the existing thinking-placeholder message with fresh HTML.
+   *  No-op when there's no active placeholder or matrix client. */
+  async function editPlaceholder(chatId: string, html: string): Promise<void> {
+    if (!matrixClient) return;
+    const messageId = reasoningMessageIdByChatId.get(chatId);
+    if (!messageId || messageId === "__pending__") return;
+    await matrixClient
+      .sendMessage(chatId, {
+        msgtype: "m.text",
+        body: "* Thinking...",
+        format: "org.matrix.custom.html",
+        "m.new_content": {
+          msgtype: "m.text",
+          body: "* Thinking...",
+          format: "org.matrix.custom.html",
+          formatted_body: html,
+        },
+        "m.relates_to": { rel_type: "m.replace", event_id: messageId },
+      })
+      .catch((error) => {
+        console.warn(
+          "[Matrix] Failed to edit placeholder:",
+          error instanceof Error ? error.message : error,
         );
-        if (state.pendingTimer) clearTimeout(state.pendingTimer);
-        state.pendingTimer = setTimeout(() => {
-          state.pendingTimer = null;
-          void editStreamMessage(roomId, state.lastText);
-        }, state.currentInterval);
+      });
+  }
+
+  function startReasoningFlush(chatId: string): void {
+    if (reasoningFlushIntervalByChatId.has(chatId)) return;
+    let lastFlushed: string | null = null;
+    let flushInProgress = false;
+    const interval = setInterval(async () => {
+      if (flushInProgress) return;
+      const messageId = reasoningMessageIdByChatId.get(chatId);
+      if (!messageId || messageId === "__pending__" || !matrixClient) return;
+      const html = buildPlaceholderHtml(chatId);
+      if (html === null) return; // nothing meaningful yet — leave bare "Thinking..."
+      // Dedupe identical edits — avoids a tight stream of no-op `m.replace`
+      // events when neither reasoning nor tool state has changed.
+      if (html === lastFlushed) return;
+      lastFlushed = html;
+      flushInProgress = true;
+      await editPlaceholder(chatId, html).finally(() => {
+        flushInProgress = false;
+      });
+    }, 150);
+    reasoningFlushIntervalByChatId.set(chatId, interval);
+  }
+
+  /** Ensure a thinking-placeholder message exists for this chat, creating one
+   *  if it doesn't. Used at tool_started for tools that fire before any
+   *  reasoning content has arrived (e.g. immediate tool calls). */
+  async function ensureThinkingPlaceholder(chatId: string): Promise<void> {
+    if (!matrixClient) return;
+    if (reasoningMessageIdByChatId.has(chatId)) return; // already exists or pending
+    reasoningMessageIdByChatId.set(chatId, "__pending__");
+    try {
+      const eventId = await matrixClient.sendMessage(chatId, {
+        msgtype: "m.text",
+        body: "Thinking...",
+        format: "org.matrix.custom.html",
+        formatted_body: "<b>Thinking...</b>",
+      });
+      reasoningMessageIdByChatId.set(chatId, String(eventId));
+      startReasoningFlush(chatId);
+    } catch (error) {
+      reasoningMessageIdByChatId.delete(chatId);
+      console.warn(
+        "[Matrix] Failed to create placeholder for tool progress:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  /** Start the per-chat ticker that bumps the running-tool elapsed timer
+   *  every 5 s. Idempotent. */
+  function startToolProgressTicker(chatId: string): void {
+    if (toolProgressTickerByChatId.has(chatId)) return;
+    const ticker = setInterval(async () => {
+      if (!runningToolByChatId.has(chatId)) {
+        stopToolProgressTicker(chatId);
+        return;
       }
-      // other errors: silently drop (streaming edit failures are non-fatal)
+      const html = buildPlaceholderHtml(chatId);
+      if (html === null) return;
+      await editPlaceholder(chatId, html);
+    }, 5_000);
+    toolProgressTickerByChatId.set(chatId, ticker);
+  }
+
+  function stopToolProgressTicker(chatId: string): void {
+    const ticker = toolProgressTickerByChatId.get(chatId);
+    if (ticker !== undefined) {
+      clearInterval(ticker);
+      toolProgressTickerByChatId.delete(chatId);
+    }
+  }
+
+  function stopReasoningFlush(chatId: string): void {
+    const interval = reasoningFlushIntervalByChatId.get(chatId);
+    if (interval !== undefined) {
+      clearInterval(interval);
+      reasoningFlushIntervalByChatId.delete(chatId);
+    }
+  }
+
+  function clearReasoningState(chatId: string): void {
+    stopReasoningFlush(chatId);
+    stopToolProgressTicker(chatId);
+    const graceTimer = toolProgressGraceTimerByChatId.get(chatId);
+    if (graceTimer !== undefined) {
+      clearTimeout(graceTimer);
+      toolProgressGraceTimerByChatId.delete(chatId);
+    }
+    reasoningMessageIdByChatId.delete(chatId);
+    reasoningBufferByChatId.delete(chatId);
+    reasoningNeedsSeparatorByChatId.delete(chatId);
+    runningToolByChatId.delete(chatId);
+    lastCompletedToolByChatId.delete(chatId);
+    lastResponseByChatId.delete(chatId);
+    turnStartedAtByChatId.delete(chatId);
+    pendingResponseTextByChatId.delete(chatId);
+  }
+
+  async function finalizeReasoningMessage(
+    chatId: string,
+    footer?: { html: string; text: string },
+  ): Promise<void> {
+    const messageId = reasoningMessageIdByChatId.get(chatId);
+    if (!messageId || messageId === "__pending__" || !matrixClient) return;
+    const rawBuffer = reasoningBufferByChatId.get(chatId) ?? "";
+    // Skip if nothing to show and no footer to append.
+    if (!rawBuffer && !footer) return;
+    // Clip to Matrix's 64 KiB-per-event limit; keep the most recent thinking
+    // (sliding window) since the early portion is usually already implied
+    // by tool calls + the final answer.
+    const buffer = clipReasoningForMatrix(rawBuffer);
+    const innerHtml =
+      (buffer
+        ? escapeHtml(buffer)
+            .replace(/\n--\n/g, "<hr>")
+            .replace(/\n/g, "<br>")
+        : "") + (footer ? `<hr>${footer.html}` : "");
+    const html = `<b>Thinking</b><br><blockquote>${innerHtml}</blockquote>`;
+    const plainText = `Thinking\n${buffer}${footer ? `\n${footer.text}` : ""}`;
+    await matrixClient
+      .sendMessage(chatId, {
+        msgtype: "m.text",
+        body: `* ${plainText}`,
+        format: "org.matrix.custom.html",
+        "m.new_content": {
+          msgtype: "m.text",
+          body: plainText,
+          format: "org.matrix.custom.html",
+          formatted_body: html,
+        },
+        "m.relates_to": { rel_type: "m.replace", event_id: messageId },
+      })
+      .catch((error: unknown) => {
+        console.warn(
+          "[Matrix] Failed to finalize reasoning message:",
+          error instanceof Error ? error.message : error,
+        );
+      });
+  }
+
+  async function waitForPendingPlaceholder(chatId: string): Promise<void> {
+    if (reasoningMessageIdByChatId.get(chatId) !== "__pending__") return;
+    const deadline = Date.now() + 2000;
+    while (
+      reasoningMessageIdByChatId.get(chatId) === "__pending__" &&
+      Date.now() < deadline
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
   }
 
   // ── Tool block helper ─────────────────────────────────────────────
 
-  function scheduleToolBlockUpdate(chatId: string, toolName: string, description?: string): void {
-    const previous = toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
+  function scheduleToolBlockUpdate(
+    chatId: string,
+    toolName: string,
+    description?: string,
+  ): void {
+    const previous =
+      toolBlockOperationByChatId.get(chatId) ?? Promise.resolve();
     const operation = previous
       .catch(() => {})
       .then(async () => {
         if (!matrixClient) return;
+
+        // Send thinking placeholder before tool block to guarantee ordering
+        if (
+          account.showReasoning !== false &&
+          !reasoningMessageIdByChatId.has(chatId)
+        ) {
+          reasoningMessageIdByChatId.set(chatId, "__pending__");
+          try {
+            const eventId = await matrixClient.sendMessage(chatId, {
+              msgtype: "m.text",
+              body: "Thinking...",
+              format: "org.matrix.custom.html",
+              formatted_body: "<b>Thinking...</b>",
+            });
+            reasoningMessageIdByChatId.set(chatId, String(eventId));
+            startReasoningFlush(chatId);
+          } catch (error) {
+            reasoningMessageIdByChatId.delete(chatId);
+            console.warn(
+              "[Matrix] Failed to send thinking placeholder:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
+
         const state = toolBlockStateByChatId.get(chatId);
-        const newGroups = upsertToolCallGroup(state?.groups ?? [], toolName, description);
+        const newGroups = upsertToolCallGroup(
+          state?.groups ?? [],
+          toolName,
+          description,
+        );
         const text = renderToolBlock(newGroups);
 
         if (!state) {
@@ -367,7 +751,10 @@ export function createMatrixAdapter(
             msgtype: "m.text",
             body: text,
           });
-          toolBlockStateByChatId.set(chatId, { messageId: String(eventId), groups: newGroups });
+          toolBlockStateByChatId.set(chatId, {
+            messageId: String(eventId),
+            groups: newGroups,
+          });
         } else {
           // Edit via m.relates_to / m.replace
           await matrixClient.sendMessage(chatId, {
@@ -379,7 +766,10 @@ export function createMatrixAdapter(
               event_id: state.messageId,
             },
           });
-          toolBlockStateByChatId.set(chatId, { messageId: state.messageId, groups: newGroups });
+          toolBlockStateByChatId.set(chatId, {
+            messageId: state.messageId,
+            groups: newGroups,
+          });
         }
       })
       .catch((error) => {
@@ -652,17 +1042,30 @@ export function createMatrixAdapter(
       for (const [chatId, timer] of typingIntervalByChatId) {
         clearInterval(timer);
         if (matrixClient) {
-          await matrixClient.sendTyping(chatId, false).catch(() => {});
+          await matrixClient.setTyping(chatId, false).catch(() => {});
         }
       }
       typingIntervalByChatId.clear();
-      for (const state of streamStates.values()) {
-        if (state.pendingTimer) clearTimeout(state.pendingTimer);
-        if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
-      }
-      streamStates.clear();
       toolBlockStateByChatId.clear();
       toolBlockOperationByChatId.clear();
+      for (const [, timer] of reasoningFlushIntervalByChatId) {
+        clearInterval(timer);
+      }
+      reasoningFlushIntervalByChatId.clear();
+      reasoningMessageIdByChatId.clear();
+      reasoningBufferByChatId.clear();
+      reasoningNeedsSeparatorByChatId.clear();
+      for (const [, timer] of toolProgressTickerByChatId) {
+        clearInterval(timer);
+      }
+      toolProgressTickerByChatId.clear();
+      for (const [, timer] of toolProgressGraceTimerByChatId) {
+        clearTimeout(timer);
+      }
+      toolProgressGraceTimerByChatId.clear();
+      runningToolByChatId.clear();
+      lastCompletedToolByChatId.clear();
+      convListCache.clear();
 
       await matrixClient?.stop();
       running = false;
@@ -747,7 +1150,7 @@ export function createMatrixAdapter(
 
       // Drain all pending tool block operations to ensure tool block messages are above the response.
       while (toolBlockOperationByChatId.has(msg.chatId)) {
-        await toolBlockOperationByChatId.get(msg.chatId)!.catch(() => {});
+        await toolBlockOperationByChatId.get(msg.chatId)?.catch(() => {});
       }
 
       // If handleStreamReasoning is currently sending the thinking placeholder (__pending__),
@@ -773,23 +1176,6 @@ export function createMatrixAdapter(
         content["m.relates_to"] = {
           "m.in_reply_to": { event_id: msg.replyToMessageId },
         };
-      }
-
-      const streamState = streamStates.get(msg.chatId);
-      if (streamState) {
-        if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
-        if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
-        streamStates.delete(msg.chatId);
-        // replyToMessageId cannot be applied to an edit; the initial stream post serves as the reply anchor
-        await client.sendEvent(msg.chatId, "m.room.message", {
-          "m.new_content": content,
-          "m.relates_to": {
-            rel_type: "m.replace",
-            event_id: streamState.messageId,
-          },
-          body: msg.text,
-        });
-        return { messageId: streamState.messageId };
       }
 
       const eventId = await client.sendMessage(msg.chatId, content);
@@ -893,60 +1279,9 @@ export function createMatrixAdapter(
       });
     },
 
-    async handleStreamText(
-      accumulatedText: string,
-      sources: ChannelTurnSource[],
+    async handleTurnLifecycleEvent(
+      event: ChannelTurnLifecycleEvent,
     ): Promise<void> {
-      if (!running || !matrixClient) return;
-
-      for (const source of sources) {
-        const roomId = source.chatId;
-        const existing = streamStates.get(roomId);
-
-        if (!existing) {
-          await stopTypingInterval(roomId);
-          try {
-            const eventId = await matrixClient.sendMessage(roomId, {
-              msgtype: "m.text",
-              body: accumulatedText,
-            });
-            streamStates.set(roomId, {
-              messageId: String(eventId),
-              lastText: accumulatedText,
-              lastEditAt: Date.now(),
-              pendingTimer: null,
-              currentInterval: MATRIX_STREAM_INTERVAL_MS,
-              cleanupTimeout: null,
-            });
-          } catch (error) {
-            console.error(
-              "[Matrix] Initial stream post failed:",
-              error instanceof Error ? error.message : error,
-            );
-          }
-          continue;
-        }
-
-        existing.lastText = accumulatedText;
-        const elapsed = Date.now() - existing.lastEditAt;
-
-        if (elapsed >= existing.currentInterval) {
-          if (existing.pendingTimer) {
-            clearTimeout(existing.pendingTimer);
-            existing.pendingTimer = null;
-          }
-          void editStreamMessage(roomId, accumulatedText);
-        } else {
-          if (existing.pendingTimer) clearTimeout(existing.pendingTimer);
-          existing.pendingTimer = setTimeout(() => {
-            existing.pendingTimer = null;
-            void editStreamMessage(roomId, existing.lastText);
-          }, existing.currentInterval - elapsed);
-        }
-      }
-    },
-
-    async handleTurnLifecycleEvent(event: ChannelTurnLifecycleEvent): Promise<void> {
       if (!running) return;
 
       if (event.type === "queued") {
@@ -957,39 +1292,323 @@ export function createMatrixAdapter(
       if (event.type === "processing") {
         for (const source of event.sources) {
           startTypingInterval(source.chatId);
+          turnStartedAtByChatId.set(source.chatId, Date.now());
+        }
+        return;
+      }
+
+      if (event.type === "tool_started") {
+        // ChannelAction and NotifyUser are outbound channel tools, not user-visible
+        // work. Skip live progress for them.
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
+        const argsPreview = buildArgsPreview(event.toolName, event.args);
+        for (const source of event.sources) {
+          const { chatId } = source;
+          runningToolByChatId.set(chatId, {
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            argsPreview,
+            timeoutMs: event.timeoutMs,
+            startedAt: Date.now(),
+          });
+          // Defer rendering by toolProgressGraceMs. If tool_ended arrives
+          // first, the grace timer is cancelled and nothing is ever shown
+          // for this tool — fast tools (Read, Glob, etc.) stay invisible.
+          const graceTimer = setTimeout(() => {
+            toolProgressGraceTimerByChatId.delete(chatId);
+            // A new tool starting clears the "took m:ss" annotation from the
+            // previous one. We do this *here* (when we commit to showing
+            // the running block) rather than in tool_started, so a fast
+            // tool that gets suppressed doesn't disrupt a stale annotation
+            // that's still useful context.
+            lastCompletedToolByChatId.delete(chatId);
+            void (async () => {
+              await ensureThinkingPlaceholder(chatId);
+              const html = buildPlaceholderHtml(chatId);
+              if (html !== null) await editPlaceholder(chatId, html);
+            })();
+            startToolProgressTicker(chatId);
+          }, toolProgressGraceMs);
+          toolProgressGraceTimerByChatId.set(chatId, graceTimer);
+        }
+        return;
+      }
+
+      if (event.type === "tool_ended") {
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
+        for (const source of event.sources) {
+          const { chatId } = source;
+          const running = runningToolByChatId.get(chatId);
+          // Only act on the matching tool call — guards against late arrivals
+          // when a follow-up tool already replaced the running state.
+          if (!running || running.toolCallId !== event.toolCallId) continue;
+          runningToolByChatId.delete(chatId);
+          // If the grace timer is still pending, the running block was never
+          // rendered. Cancel it and exit silently — no annotation either.
+          const graceTimer = toolProgressGraceTimerByChatId.get(chatId);
+          if (graceTimer !== undefined) {
+            clearTimeout(graceTimer);
+            toolProgressGraceTimerByChatId.delete(chatId);
+            continue;
+          }
+          stopToolProgressTicker(chatId);
+          lastCompletedToolByChatId.set(chatId, {
+            toolName: event.toolName,
+            argsPreview: running.argsPreview,
+            durationMs: event.durationMs,
+            outcome: event.outcome,
+          });
+          // Push the "took m:ss" annotation immediately. Subsequent reasoning
+          // flushes (if the agent keeps thinking) keep the annotation visible
+          // until the next tool_started clears it.
+          const html = buildPlaceholderHtml(chatId);
+          if (html !== null) void editPlaceholder(chatId, html);
         }
         return;
       }
 
       if (event.type === "tool_call") {
-        if (event.toolName === "MessageChannel") return;
+        // Any tool call interrupts the reasoning stream.
+        // Mark that the next reasoning chunk should prepend a separator.
         for (const source of event.sources) {
-          scheduleToolBlockUpdate(source.chatId, event.toolName, event.description);
+          if (reasoningMessageIdByChatId.has(source.chatId)) {
+            reasoningNeedsSeparatorByChatId.add(source.chatId);
+          }
+        }
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
+        for (const source of event.sources) {
+          scheduleToolBlockUpdate(
+            source.chatId,
+            event.toolName,
+            event.description,
+          );
         }
         return;
       }
 
       // "finished"
       for (const source of event.sources) {
-        await stopTypingInterval(source.chatId);
+        const { chatId } = source;
+        await stopTypingInterval(chatId);
 
-        const streamState = streamStates.get(source.chatId);
-        if (streamState) {
-          if (streamState.pendingTimer) {
-            clearTimeout(streamState.pendingTimer);
-            streamState.pendingTimer = null;
+        const pending = toolBlockOperationByChatId.get(chatId);
+        if (pending) await pending.catch(() => {});
+        toolBlockStateByChatId.delete(chatId);
+        toolBlockOperationByChatId.delete(chatId);
+
+        await waitForPendingPlaceholder(chatId);
+        stopReasoningFlush(chatId);
+
+        // Capture turn state before clearReasoningState() deletes both Maps.
+        const startedAt = turnStartedAtByChatId.get(chatId);
+        const durationMs = startedAt !== undefined ? Date.now() - startedAt : 0;
+        const durationStr = formatElapsed(durationMs);
+        const lastResponse = lastResponseByChatId.get(chatId);
+        const reasoningMsgId = reasoningMessageIdByChatId.get(chatId);
+        const hasThinkingBlock =
+          !!reasoningMsgId && reasoningMsgId !== "__pending__";
+
+        if (event.outcome === "completed") {
+          const pendingText = pendingResponseTextByChatId.get(chatId);
+          pendingResponseTextByChatId.delete(chatId);
+
+          // Finalize thinking block first, then send response below it.
+          await finalizeReasoningMessage(chatId);
+          clearReasoningState(chatId);
+
+          if (pendingText && matrixClient) {
+            const html = markdownToMatrixHtml(pendingText);
+            const sentEventId = await matrixClient
+              .sendMessage(chatId, {
+                msgtype: "m.text",
+                body: pendingText,
+                format: "org.matrix.custom.html",
+                formatted_body: html,
+              })
+              .catch((err: unknown) => {
+                console.warn(
+                  "[Matrix] handleAutoForward send failed:",
+                  err instanceof Error ? err.message : err,
+                );
+                return null;
+              });
+
+            if (sentEventId) {
+              const messageId = String(sentEventId);
+              // Track for ChannelAction edits
+              const source = event.sources.find((s) => s.chatId === chatId);
+              if (source) {
+                lastSentMessageIdByConversationId.set(
+                  source.conversationId,
+                  messageId,
+                );
+              }
+              // Append completion footer to the sent message
+              const footerHtml =
+                `<hr><span data-mx-color="#3fb950">✓</span> ` +
+                `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;
+              const footerText = `\n✓ completed in ${durationStr}`;
+              await matrixClient
+                .sendMessage(chatId, {
+                  msgtype: "m.text",
+                  body: `* ${pendingText}${footerText}`,
+                  format: "org.matrix.custom.html",
+                  formatted_body: `* ${html}${footerHtml}`,
+                  "m.new_content": {
+                    msgtype: "m.text",
+                    body: pendingText + footerText,
+                    format: "org.matrix.custom.html",
+                    formatted_body: html + footerHtml,
+                  },
+                  "m.relates_to": {
+                    rel_type: "m.replace",
+                    event_id: messageId,
+                  },
+                })
+                .catch((err: unknown) => {
+                  console.warn(
+                    "[Matrix] Failed to append completion footer:",
+                    err instanceof Error ? err.message : err,
+                  );
+                });
+            }
+          } else if (lastResponse && matrixClient) {
+            // Fallback: no pending text from auto-forward (e.g. silent turn)
+            const footerHtml =
+              `<hr><span data-mx-color="#3fb950">✓</span> ` +
+              `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;
+            const footerText = `\n✓ completed in ${durationStr}`;
+            await matrixClient
+              .sendMessage(chatId, {
+                msgtype: "m.text",
+                body: `* ${lastResponse.text}${footerText}`,
+                format: "org.matrix.custom.html",
+                formatted_body: `* ${lastResponse.html}${footerHtml}`,
+                "m.new_content": {
+                  msgtype: "m.text",
+                  body: lastResponse.text + footerText,
+                  format: "org.matrix.custom.html",
+                  formatted_body: lastResponse.html + footerHtml,
+                },
+                "m.relates_to": {
+                  rel_type: "m.replace",
+                  event_id: lastResponse.eventId,
+                },
+              })
+              .catch((err: unknown) => {
+                console.warn(
+                  "[Matrix] Failed to append completion footer:",
+                  err instanceof Error ? err.message : err,
+                );
+              });
           }
-          void editStreamMessage(source.chatId, streamState.lastText);
-          streamState.cleanupTimeout = setTimeout(() => {
-            streamStates.delete(source.chatId);
-          }, 10_000);
-          streamState.currentInterval = MATRIX_STREAM_INTERVAL_MS;
+        } else if (event.outcome === "error") {
+          pendingResponseTextByChatId.delete(chatId);
+          const errorDetail = event.error ? `: ${event.error}` : "";
+          const footerHtml =
+            `<span data-mx-color="#f85149">⚠ Turn failed</span>` +
+            `<span data-mx-color="#8b949e"> · tool error${escapeHtml(errorDetail)}</span>`;
+          const footerText = `⚠ Turn failed · tool error${errorDetail}`;
+
+          if (hasThinkingBlock) {
+            await finalizeReasoningMessage(chatId, {
+              html: footerHtml,
+              text: footerText,
+            });
+            clearReasoningState(chatId);
+          } else {
+            clearReasoningState(chatId);
+            const fallbackDetail = event.error
+              ? `: ${event.error}`
+              : " — the turn didn't complete.";
+            await matrixClient
+              ?.sendMessage(chatId, {
+                msgtype: "m.text",
+                body: `⚠ Turn failed${fallbackDetail}`,
+                format: "org.matrix.custom.html",
+                formatted_body:
+                  `<span data-mx-color="#f85149">⚠ Turn failed</span>` +
+                  `<span data-mx-color="#8b949e">${escapeHtml(fallbackDetail)}</span>`,
+              })
+              .catch(() => {});
+          }
+        } else {
+          // "cancelled"
+          pendingResponseTextByChatId.delete(chatId);
+          if (hasThinkingBlock) {
+            const footerHtml = `<span data-mx-color="#e3b341">· Cancelled</span>`;
+            const footerText = "· Cancelled";
+            await finalizeReasoningMessage(chatId, {
+              html: footerHtml,
+              text: footerText,
+            });
+          } else {
+            await finalizeReasoningMessage(chatId);
+          }
+          clearReasoningState(chatId);
+        }
+      }
+    },
+
+    async handleStreamReasoning(
+      chunk: string,
+      sources: ChannelTurnSource[],
+    ): Promise<void> {
+      if (account.showReasoning === false) return;
+      const client = await ensureClient();
+
+      for (const source of sources) {
+        const { chatId } = source;
+
+        // A tool call interrupted reasoning since last chunk — prepend separator
+        if (reasoningNeedsSeparatorByChatId.has(chatId)) {
+          reasoningNeedsSeparatorByChatId.delete(chatId);
+          const existing = reasoningBufferByChatId.get(chatId) ?? "";
+          if (existing)
+            reasoningBufferByChatId.set(chatId, `${existing}\n--\n`);
         }
 
-        const pending = toolBlockOperationByChatId.get(source.chatId);
-        if (pending) await pending.catch(() => {});
-        toolBlockStateByChatId.delete(source.chatId);
-        toolBlockOperationByChatId.delete(source.chatId);
+        const _existing = reasoningBufferByChatId.get(chatId) ?? "";
+        // Insert a space between chunks when the buffer ends with a sentence
+        // terminator and the new chunk starts with a non-whitespace character
+        // (kimi-k2.6 streams reasoning without inter-sentence spaces).
+        const _spacer =
+          _existing.length > 0 && /[.!?]$/.test(_existing) && /^\S/.test(chunk)
+            ? " "
+            : "";
+        reasoningBufferByChatId.set(chatId, _existing + _spacer + chunk);
+
+        if (!reasoningMessageIdByChatId.has(chatId)) {
+          reasoningMessageIdByChatId.set(chatId, "__pending__"); // claim the slot immediately
+          try {
+            const eventId = await client.sendMessage(chatId, {
+              msgtype: "m.text",
+              body: "Thinking...",
+              format: "org.matrix.custom.html",
+              formatted_body: "<b>Thinking...</b>",
+            });
+            reasoningMessageIdByChatId.set(chatId, String(eventId));
+            startReasoningFlush(chatId);
+          } catch (error) {
+            reasoningMessageIdByChatId.delete(chatId); // allow retry on error
+            console.warn(
+              "[Matrix] Failed to send initial reasoning message:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
       }
     },
 
@@ -1227,7 +1846,7 @@ function buildMatrixControlRequestPrompt(event: ChannelControlRequestEvent): {
     case "generic_tool_approval": {
       const inputStr = JSON.stringify(event.input, null, 2);
       const truncated =
-        inputStr.length > 1200 ? inputStr.slice(0, 1197) + "..." : inputStr;
+        inputStr.length > 1200 ? `${inputStr.slice(0, 1197)}...` : inputStr;
       const lines = [`The agent wants approval to run \`${event.toolName}\`.`];
       if (truncated && truncated !== "{}")
         lines.push("", "Tool input:", truncated);
@@ -1249,7 +1868,7 @@ function buildMatrixControlRequestPrompt(event: ChannelControlRequestEvent): {
       if (event.planContent?.trim()) {
         const preview =
           event.planContent.length > 1800
-            ? event.planContent.slice(0, 1797) + "..."
+            ? `${event.planContent.slice(0, 1797)}...`
             : event.planContent;
         lines.push("", "Proposed plan:", preview);
         if (event.planFilePath?.trim())

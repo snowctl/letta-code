@@ -44,7 +44,10 @@ describe("ChannelRegistry.dispatchStreamText", () => {
     await registry.dispatchStreamText("hello world", sources);
 
     expect(adapter.handleStreamText).toHaveBeenCalledTimes(1);
-    expect(adapter.handleStreamText).toHaveBeenCalledWith("hello world", sources);
+    expect(adapter.handleStreamText).toHaveBeenCalledWith(
+      "hello world",
+      sources,
+    );
   });
 
   test("skips adapters without handleStreamText", async () => {
@@ -54,7 +57,7 @@ describe("ChannelRegistry.dispatchStreamText", () => {
     registry.registerAdapter(adapter);
 
     await expect(
-      registry.dispatchStreamText("hello", [makeSource("chat-1")])
+      registry.dispatchStreamText("hello", [makeSource("chat-1")]),
     ).resolves.toBeUndefined();
   });
 
