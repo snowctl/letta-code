@@ -202,6 +202,7 @@ export function createConversationRuntime(
         listener.contextTrackerByConversation.set(runtimeKey, tracker);
         return tracker;
       })(),
+    contextWindowMax: undefined,
   };
   listener.conversationRuntimes.set(
     conversationRuntime.key,

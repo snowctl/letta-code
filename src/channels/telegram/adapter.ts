@@ -257,6 +257,28 @@ export function createTelegramAdapter(
   const reasoningByKey = new Map<string, string>();
   const lastSentMessageIdByConversationId = new Map<string, string>();
 
+  interface LastResponseInfo {
+    messageId: number;
+    text: string;
+  }
+  // Last sent response message ID and original text per chat (for editing footers on turn completion).
+  const lastResponseByChatId = new Map<string, LastResponseInfo>();
+  // Turn start timestamp (ms) per chat, set on "processing" event.
+  const turnStartByChatId = new Map<string, number>();
+
+  function formatElapsed(ms: number): string {
+    const totalSec = Math.max(0, Math.floor(ms / 1000));
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  }
+
+  function formatCompact(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${Math.round(n / 1000)}K`;
+    return String(n);
+  }
+
   function startTypingInterval(chatId: string): void {
     if (typingIntervalByChatId.has(chatId) || !bot) return;
     const fire = () => {
@@ -867,6 +889,8 @@ export function createTelegramAdapter(
       awaitingFeedback.clear();
       pendingReasoningByChatId.clear();
       reasoningByKey.clear();
+      lastResponseByChatId.clear();
+      turnStartByChatId.clear();
 
       if (!running || !bot) return;
       await bot.stop();
@@ -904,6 +928,7 @@ export function createTelegramAdapter(
       if (event.type === "processing") {
         for (const source of event.sources) {
           startTypingInterval(source.chatId);
+          turnStartByChatId.set(source.chatId, Date.now());
         }
         return;
       }
@@ -936,6 +961,41 @@ export function createTelegramAdapter(
         toolBlockOperationByChatId.delete(source.chatId);
         toolBlockPendingGroupsByChatId.delete(source.chatId);
         pendingReasoningByChatId.delete(source.chatId);
+
+        // Append completion footer to the last response message
+        const lastResponse = lastResponseByChatId.get(source.chatId);
+        if (lastResponse && bot && event.outcome === "completed") {
+          const turnStart = turnStartByChatId.get(source.chatId);
+          const durationMs = turnStart ? Date.now() - turnStart : 0;
+          const durationStr = durationMs > 0 ? formatElapsed(durationMs) : "";
+
+          const eventUsage = event.type === "finished" ? event.usage : undefined;
+          const showUsage =
+            eventUsage &&
+            eventUsage.contextTokens > 0 &&
+            eventUsage.contextWindowMax > 0;
+
+          const usageText = showUsage
+            ? ` · ${formatCompact(eventUsage.contextTokens)} / ${formatCompact(eventUsage.contextWindowMax)} tokens`
+            : "";
+
+          const footerText = `\n✓ completed in ${durationStr}${usageText}`;
+
+          await bot.api
+            .editMessageText(
+              source.chatId,
+              lastResponse.messageId,
+              lastResponse.text + footerText,
+            )
+            .catch((error) => {
+              console.warn(
+                "[Telegram] Failed to append completion footer:",
+                error instanceof Error ? error.message : error,
+              );
+            });
+        }
+        lastResponseByChatId.delete(source.chatId);
+        turnStartByChatId.delete(source.chatId);
       }
     },
 
@@ -1058,6 +1118,7 @@ export function createTelegramAdapter(
         msg.text,
         opts,
       );
+      lastResponseByChatId.set(msg.chatId, { messageId: result.message_id, text: msg.text });
       return { messageId: String(result.message_id) };
     },
 
