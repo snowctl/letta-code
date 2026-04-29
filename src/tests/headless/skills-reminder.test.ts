@@ -106,7 +106,9 @@ describe("headless shared reminder content helpers", () => {
 
   test("does not absorb a non-system-reminder first content part", () => {
     const result = prependReminderPartsToContent(
-      [{ type: "text", text: "plain user message" }] as MessageCreate["content"],
+      [
+        { type: "text", text: "plain user message" },
+      ] as MessageCreate["content"],
       [{ type: "text", text: sr("session context") }],
     );
     expect(Array.isArray(result)).toBe(true);

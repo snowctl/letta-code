@@ -432,9 +432,7 @@ export function prependReminderPartsToContent(
     const startIdx = text.indexOf(SYSTEM_REMINDER_OPEN);
     const endIdx = text.lastIndexOf(SYSTEM_REMINDER_CLOSE);
     if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) return null;
-    return text
-      .slice(startIdx + SYSTEM_REMINDER_OPEN.length, endIdx)
-      .trim();
+    return text.slice(startIdx + SYSTEM_REMINDER_OPEN.length, endIdx).trim();
   }
 
   // Split reminder parts: system-reminder-wrapped → merge into one block;
@@ -465,9 +463,9 @@ export function prependReminderPartsToContent(
   // If the first text content part is also a system-reminder, absorb it into
   // the merged block so the agent receives one cohesive <system-reminder>.
   if (mergedInnerSections.length > 0) {
-    const firstTextIdx = contentArray.findIndex((p) => p["type"] === "text");
+    const firstTextIdx = contentArray.findIndex((p) => p.type === "text");
     if (firstTextIdx !== -1) {
-      const firstText = contentArray[firstTextIdx]?.["text"];
+      const firstText = contentArray[firstTextIdx]?.text;
       if (typeof firstText === "string") {
         const inner = extractSystemReminderInner(firstText);
         if (inner !== null) {
