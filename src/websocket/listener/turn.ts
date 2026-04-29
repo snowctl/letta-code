@@ -846,6 +846,12 @@ export async function handleIncomingMessage(
           conversation_id: conversationId,
         });
 
+        // Re-kick the queue pump now that isProcessing is false. Subagent
+        // completion notifications enqueued mid-turn may have hit the
+        // blockedReason early-return in drainQueuedMessages and would
+        // otherwise sit in the queue until the next user input.
+        runtime.listener.queuePumpKicker?.(runtime);
+
         break;
       }
 
