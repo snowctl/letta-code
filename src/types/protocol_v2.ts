@@ -186,6 +186,18 @@ export type ChannelConfigSnapshot =
       allowed_users: string[];
       allowed_channels: string[];
       has_token: boolean;
+    }
+  | {
+      channel_id: "matrix";
+      account_id: string;
+      display_name?: string;
+      enabled: boolean;
+      dm_policy: DmPolicy;
+      allowed_users: string[];
+      has_homeserver_url: boolean;
+      has_access_token: boolean;
+      user_id: string;
+      e2ee: boolean;
     };
 
 export type ChannelAccountSnapshot =
@@ -235,6 +247,23 @@ export type ChannelAccountSnapshot =
       allowed_channels: string[];
       has_token: boolean;
       agent_id: string | null;
+      created_at: string;
+      updated_at: string;
+    }
+  | {
+      channel_id: "matrix";
+      account_id: string;
+      display_name?: string;
+      enabled: boolean;
+      configured: boolean;
+      running: boolean;
+      dm_policy: DmPolicy;
+      allowed_users: string[];
+      has_homeserver_url: boolean;
+      has_access_token: boolean;
+      user_id: string;
+      e2ee: boolean;
+      transcribe_voice?: boolean;
       created_at: string;
       updated_at: string;
     };

@@ -969,7 +969,8 @@ export function createTelegramAdapter(
           const durationMs = turnStart ? Date.now() - turnStart : 0;
           const durationStr = durationMs > 0 ? formatElapsed(durationMs) : "";
 
-          const eventUsage = event.type === "finished" ? event.usage : undefined;
+          const eventUsage =
+            event.type === "finished" ? event.usage : undefined;
           const showUsage =
             eventUsage &&
             eventUsage.contextTokens > 0 &&
@@ -1118,7 +1119,10 @@ export function createTelegramAdapter(
         msg.text,
         opts,
       );
-      lastResponseByChatId.set(msg.chatId, { messageId: result.message_id, text: msg.text });
+      lastResponseByChatId.set(msg.chatId, {
+        messageId: result.message_id,
+        text: msg.text,
+      });
       return { messageId: String(result.message_id) };
     },
 

@@ -282,7 +282,7 @@ function buildQueuedTurnMessage(
 
     // Determine scope from the batch items (they all share the same scope)
     const scopeItem = batch.items[0];
-    const isCronBatch = batch.items.some(i => i.kind === "cron_prompt");
+    const isCronBatch = batch.items.some((i) => i.kind === "cron_prompt");
     return {
       type: "message",
       agentId: scopeItem?.agentId ?? runtime.agentId ?? undefined,
@@ -332,7 +332,9 @@ function buildQueuedTurnMessage(
   return {
     ...template,
     ...(channelTurnSources ? { channelTurnSources } : {}),
-    source: batch.items.some(i => i.kind === "cron_prompt") ? "cron" : undefined,
+    source: batch.items.some((i) => i.kind === "cron_prompt")
+      ? "cron"
+      : undefined,
     messages,
   };
 }

@@ -34,9 +34,7 @@ export function upsertToolCallGroup(
   const key = makeToolCallKey(toolName, description);
   const idx = groups.findIndex((g) => g.key === key);
   if (idx !== -1) {
-    return groups.map((g, i) =>
-      i === idx ? { ...g, count: g.count + 1 } : g,
-    );
+    return groups.map((g, i) => (i === idx ? { ...g, count: g.count + 1 } : g));
   }
   return [
     ...groups,
