@@ -4,7 +4,6 @@ import type {
   ApprovalCreate,
   LettaStreamingResponse,
 } from "@letta-ai/letta-client/resources/agents/messages";
-import type WebSocket from "ws";
 import type { ApprovalResult } from "../../agent/approval-execution";
 import { fetchRunErrorInfo } from "../../agent/approval-recovery";
 import { getResumeData } from "../../agent/check-approval";
@@ -25,6 +24,7 @@ import {
   isEmptyResponseRetryable,
   rebuildInputWithFreshDenials,
 } from "../../agent/turn-recovery-policy";
+import { getChannelRegistry } from "../../channels/registry";
 import { createBuffers, toLines } from "../../cli/helpers/accumulator";
 import { getRetryStatusMessage } from "../../cli/helpers/errorFormatter";
 import {
@@ -91,6 +91,7 @@ import {
   isRetriablePostStopError,
   shouldAttemptPostStopApprovalRecovery,
 } from "./recovery";
+import { persistLastActiveConversationMap } from "./remote-settings";
 import {
   clearActiveRunState,
   clearRecoveredApprovalStateForScope,
@@ -104,6 +105,7 @@ import {
   sendMessageStreamWithRetry,
 } from "./send";
 import { injectQueuedSkillContent } from "./skill-injection";
+import type { ListenerTransport } from "./transport";
 import { handleApprovalStop } from "./turn-approval";
 import type {
   ConversationRuntime,
@@ -112,6 +114,29 @@ import type {
 } from "./types";
 
 const AUTO_REFLECTION_DESCRIPTION = "Reflect on recent conversations";
+
+export function extractAssistantText(
+  chunk: Record<string, unknown>,
+): string | null {
+  if (chunk.message_type !== "assistant_message") return null;
+  const content = chunk.content;
+  if (typeof content === "string") return content || null;
+  if (!Array.isArray(content)) return null;
+  const text = (content as Array<Record<string, unknown>>)
+    .filter((c) => c.type === "text" && typeof c.text === "string")
+    .map((c) => c.text as string)
+    .join("");
+  return text || null;
+}
+
+export function extractReasoningText(
+  chunk: Record<string, unknown>,
+): string | null {
+  if (chunk.message_type !== "reasoning_message") return null;
+  const reasoning = chunk.reasoning;
+  if (typeof reasoning === "string") return reasoning || null;
+  return null;
+}
 
 function trackListenerUserInput(
   messages: InboundMessagePayload[],
@@ -165,7 +190,7 @@ function escapeTaskNotificationSummary(summary: string): string {
 
 function buildMaybeLaunchReflectionSubagent(params: {
   runtime: ConversationRuntime;
-  socket: WebSocket;
+  socket: ListenerTransport;
   agentId: string;
   conversationId: string;
   workingDirectory: string;
@@ -311,7 +336,7 @@ function buildMaybeLaunchReflectionSubagent(params: {
 }
 
 function finalizeInterruptedTurn(
-  socket: WebSocket,
+  socket: ListenerTransport,
   runtime: ConversationRuntime,
   params: {
     runId?: string | null;
@@ -347,7 +372,7 @@ function finalizeInterruptedTurn(
 
 export async function handleIncomingMessage(
   msg: IncomingMessage,
-  socket: WebSocket,
+  socket: ListenerTransport,
   runtime: ConversationRuntime,
   onStatusChange?: (
     status: "idle" | "receiving" | "processing",
@@ -360,6 +385,19 @@ export async function handleIncomingMessage(
   const requestedConversationId = msg.conversationId || undefined;
   const conversationId = requestedConversationId ?? "default";
   const normalizedAgentId = normalizeCwdAgentId(agentId);
+
+  // Track most recently used conversation so heartbeats/fallback routing can
+  // find the active conversation instead of always falling back to "default".
+  // Persisted so the mapping survives server restarts.
+  if (normalizedAgentId && conversationId && conversationId !== "default") {
+    runtime.listener.lastActiveConversationByAgentId.set(
+      normalizedAgentId,
+      conversationId,
+    );
+    persistLastActiveConversationMap(
+      runtime.listener.lastActiveConversationByAgentId,
+    );
+  }
   const turnWorkingDirectory = getConversationWorkingDirectory(
     runtime.listener,
     normalizedAgentId,
@@ -442,7 +480,14 @@ export async function handleIncomingMessage(
     }
 
     const { normalizeInboundMessages } = await import("./queue");
-    const normalizedMessages = await normalizeInboundMessages(msg.messages);
+    const normalizedMessages = await normalizeInboundMessages(
+      msg.messages,
+      undefined,
+      {
+        imageFailureMode:
+          (msg.channelTurnSources?.length ?? 0) > 0 ? "drop" : "strict",
+      },
+    );
     trackListenerUserInput(normalizedMessages, "unknown");
     const messagesToSend: Array<MessageCreate | ApprovalCreate> = [];
     let turnToolContextId: string | null = null;
@@ -630,9 +675,20 @@ export async function handleIncomingMessage(
     let runIdSent = false;
     let runId: string | undefined;
     const buffers = createBuffers(agentId);
+    const channelSources = runtime.activeChannelTurnSources;
+    let accumulatedChannelText = "";
+    let lastAssistantMsgId: string | null = null;
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      if (accumulatedChannelText !== "") {
+        // This is a retry — clear adapter stream states so the next segment posts fresh
+        if (channelSources && channelSources.length > 0) {
+          void getChannelRegistry()?.dispatchStreamReset(channelSources);
+        }
+      }
+      accumulatedChannelText = "";
+      lastAssistantMsgId = null;
       runIdSent = false;
       let latestErrorText: string | null = null;
       const result = await drainStreamWithResume(
@@ -693,6 +749,42 @@ export async function handleIncomingMessage(
                   conversation_id: conversationId,
                 },
               );
+
+              // normalizeToolReturnWireMessage is a pass-through for assistant_message chunks
+              const textChunk = extractAssistantText(normalizedChunk);
+              if (textChunk) {
+                const chunkMsgId =
+                  typeof normalizedChunk.id === "string"
+                    ? normalizedChunk.id
+                    : null;
+                if (
+                  accumulatedChannelText !== "" &&
+                  chunkMsgId !== null &&
+                  chunkMsgId !== lastAssistantMsgId
+                ) {
+                  accumulatedChannelText += "\n";
+                }
+                lastAssistantMsgId = chunkMsgId;
+                accumulatedChannelText += textChunk;
+                if (channelSources && channelSources.length > 0) {
+                  void getChannelRegistry()?.dispatchStreamText(
+                    accumulatedChannelText,
+                    channelSources,
+                  );
+                }
+              }
+
+              const reasoningChunk = extractReasoningText(normalizedChunk);
+              if (
+                reasoningChunk &&
+                channelSources &&
+                channelSources.length > 0
+              ) {
+                void getChannelRegistry()?.dispatchStreamReasoning(
+                  reasoningChunk,
+                  channelSources,
+                );
+              }
             }
           }
 
@@ -734,6 +826,7 @@ export async function handleIncomingMessage(
             }`,
           );
         }
+        runtime.finalAssistantText = accumulatedChannelText || null;
         runtime.lastStopReason = "end_turn";
         runtime.isProcessing = false;
         clearActiveRunState(runtime);
@@ -1062,6 +1155,7 @@ export async function handleIncomingMessage(
         pendingNormalizationInterruptedToolCallIds,
         turnToolContextId,
         buildSendOptions,
+        source: msg.source,
       });
       if (approvalResult.terminated || !approvalResult.stream) {
         return;

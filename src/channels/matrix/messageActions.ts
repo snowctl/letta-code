@@ -3,7 +3,7 @@ import type { ChannelMessageActionAdapter } from "../pluginTypes";
 
 export const matrixMessageActions: ChannelMessageActionAdapter = {
   describeMessageTool() {
-    return { actions: ["send", "react", "upload-file"] };
+    return { actions: ["send", "react", "upload-file", "edit"] };
   },
 
   async handleAction(ctx) {
@@ -12,7 +12,8 @@ export const matrixMessageActions: ChannelMessageActionAdapter = {
     if (
       request.action !== "send" &&
       request.action !== "react" &&
-      request.action !== "upload-file"
+      request.action !== "upload-file" &&
+      request.action !== "edit"
     ) {
       return `Error: Action "${request.action}" is not supported on matrix.`;
     }
@@ -36,6 +37,25 @@ export const matrixMessageActions: ChannelMessageActionAdapter = {
       return request.remove
         ? `Reaction removed on matrix (message_id: ${result.messageId})`
         : `Reaction added on matrix (message_id: ${result.messageId})`;
+    }
+
+    if (request.action === "edit") {
+      if (!request.messageId?.trim()) {
+        return "Error: Matrix edit requires messageId (the message you sent earlier).";
+      }
+      if (!request.message?.trim()) {
+        return "Error: Matrix edit requires message (the new body).";
+      }
+      const formatted = formatText(request.message);
+      const result = await adapter.sendMessage({
+        channel: "matrix",
+        accountId: route.accountId,
+        chatId: request.chatId,
+        text: formatted.text,
+        editTargetMessageId: request.messageId,
+        parseMode: formatted.parseMode,
+      });
+      return `Message edited on matrix (message_id: ${result.messageId})`;
     }
 
     if (!request.message?.trim() && !request.mediaPath?.trim()) {

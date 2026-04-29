@@ -92,6 +92,39 @@ export type ChannelTurnLifecycleEvent =
       sources: ChannelTurnSource[];
     }
   | {
+      type: "tool_call";
+      batchId: string;
+      toolName: string;
+      description?: string;
+      sources: ChannelTurnSource[];
+    }
+  | {
+      /** Fires immediately before a tool's `executeTool` call, after approval.
+       *  Carries the resolved args (caller-set or defaulted) so adapters can
+       *  render live progress (running tool name, args preview, deadline). */
+      type: "tool_started";
+      batchId: string;
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+      /** Resolved tool deadline in ms — agent-set or known default.
+       *  `undefined` for tools with no time limit (e.g. local file ops). */
+      timeoutMs?: number;
+      sources: ChannelTurnSource[];
+    }
+  | {
+      /** Fires immediately after a tool's `executeTool` returns or throws.
+       *  Pairs with a previous `tool_started` by `toolCallId`. */
+      type: "tool_ended";
+      batchId: string;
+      toolCallId: string;
+      toolName: string;
+      durationMs: number;
+      outcome: "success" | "error";
+      error?: string;
+      sources: ChannelTurnSource[];
+    }
+  | {
       type: "finished";
       batchId: string;
       sources: ChannelTurnSource[];
@@ -238,6 +271,11 @@ export interface OutboundChannelMessage {
   removeReaction?: boolean;
   /** Optional: target message id for reactions. */
   targetMessageId?: string;
+  /** Optional: target message id for edits. When set, the adapter rewrites
+   *  the body of the existing message (using the platform's native edit
+   *  primitive — `m.replace` on Matrix) instead of sending a new message.
+   *  Mutually exclusive with reaction/removeReaction/mediaPath. */
+  editTargetMessageId?: string;
 }
 
 // ── Routing ───────────────────────────────────────────────────────
@@ -281,6 +319,8 @@ interface ChannelAccountBase {
   allowedUsers: string[];
   createdAt: string;
   updatedAt: string;
+  /** When false, reasoning display is disabled. Defaults to true. */
+  showReasoning?: boolean;
 }
 
 export interface TelegramChannelConfig {
@@ -309,6 +349,13 @@ export interface DiscordChannelConfig {
   token: string;
   dmPolicy: DmPolicy;
   allowedUsers: string[];
+  /**
+   * Optional allowlist of guild channel IDs. When non-empty, only messages
+   * whose channel ID (or parent channel ID for thread messages) appears in
+   * this list are processed. Empty/undefined preserves the default behavior
+   * of listening in every guild channel the bot can see.
+   */
+  allowedChannels?: string[];
 }
 
 export type ChannelConfig =
@@ -320,6 +367,7 @@ export interface TelegramChannelAccount extends ChannelAccountBase {
   channel: "telegram";
   token: string;
   binding: ChannelAccountBinding;
+  defaultPermissionMode?: SlackDefaultPermissionMode;
   /** When true and OPENAI_API_KEY is set, voice memos are auto-transcribed. */
   transcribeVoice?: boolean;
 }
@@ -331,13 +379,28 @@ export interface SlackChannelAccount extends ChannelAccountBase {
   appToken: string;
   agentId: string | null;
   defaultPermissionMode: SlackDefaultPermissionMode;
+  /**
+   * Optional debounce window (ms) for inbound messages. When greater than
+   * `0`, short back-to-back messages from the same sender in the same
+   * chat/thread stack into a single combined dispatch (trailing edge).
+   * Default `0` (disabled). Messages with attachments bypass the debounce.
+   * The env var `LETTA_SLACK_INBOUND_DEBOUNCE_MS` takes precedence if set.
+   */
+  inboundDebounceMs?: number;
 }
 
 export interface DiscordChannelAccount extends ChannelAccountBase {
   channel: "discord";
   token: string;
-  /** Agent ID used for guild auto-routing (like Slack's agentId). */
+  /** Agent ID used for account-bound DM and guild auto-routing. */
   agentId: string | null;
+  /**
+   * Optional allowlist of guild channel IDs. When non-empty, only messages
+   * whose channel ID (or parent channel ID for thread messages) appears in
+   * this list are processed. Empty/undefined preserves the default behavior
+   * of listening in every guild channel the bot can see. DMs are unaffected.
+   */
+  allowedChannels?: string[];
 }
 
 export interface MatrixChannelAccount extends ChannelAccountBase {
@@ -348,6 +411,7 @@ export interface MatrixChannelAccount extends ChannelAccountBase {
   e2ee: boolean;
   transcribeVoice?: boolean;
   maxMediaDownloadBytes?: number;
+  defaultPermissionMode?: SlackDefaultPermissionMode;
 }
 
 export type ChannelAccount =

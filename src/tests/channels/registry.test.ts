@@ -24,6 +24,7 @@ import {
   addRoute,
   clearAllRoutes,
   getRoute,
+  getRouteRaw,
 } from "../../channels/routing";
 import type {
   ChannelAdapter,
@@ -645,5 +646,105 @@ describe("pending channel control requests", () => {
         },
       },
     });
+  });
+});
+
+describe("ChannelRegistry.cancelActiveRun", () => {
+  afterEach(async () => {
+    const registry = getChannelRegistry();
+    if (registry) {
+      await registry.stopAll();
+    }
+  });
+
+  test("returns false when no handler registered", () => {
+    const reg = new ChannelRegistry();
+    expect(reg.cancelActiveRun("agent-1", "default")).toBe(false);
+  });
+
+  test("calls the registered handler and returns its value", () => {
+    const reg = new ChannelRegistry();
+    let called = false;
+    reg.setCancelHandler((agentId, convId) => {
+      called = true;
+      expect(agentId).toBe("agent-1");
+      expect(convId).toBe("conv-abc");
+      return true;
+    });
+    expect(reg.cancelActiveRun("agent-1", "conv-abc")).toBe(true);
+    expect(called).toBe(true);
+  });
+
+  test("clearing handler with null causes cancelActiveRun to return false", () => {
+    const reg = new ChannelRegistry();
+    reg.setCancelHandler(() => true);
+    reg.setCancelHandler(null);
+    expect(reg.cancelActiveRun("agent-1", "default")).toBe(false);
+  });
+});
+
+describe("ChannelRegistry.updateRouteConversation", () => {
+  beforeEach(() => {
+    __testOverrideLoadRoutes(null);
+    __testOverrideSaveRoutes(() => {});
+    clearAllRoutes();
+    addRoute("telegram", {
+      chatId: "chat-1",
+      accountId: "acct-1",
+      threadId: null,
+      chatType: "direct",
+      agentId: "agent-1",
+      conversationId: "conv-old",
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  });
+
+  afterEach(async () => {
+    const registry = getChannelRegistry();
+    if (registry) {
+      await registry.stopAll();
+    }
+    clearAllRoutes();
+    __testOverrideLoadRoutes(null);
+    __testOverrideSaveRoutes(null);
+  });
+
+  test("updates the route conversationId in the routing store", () => {
+    const reg = new ChannelRegistry();
+    reg.updateRouteConversation("telegram", "chat-1", "acct-1", "conv-new");
+    const route = getRoute("telegram", "chat-1", "acct-1");
+    expect(route?.conversationId).toBe("conv-new");
+  });
+
+  test("is a no-op when route does not exist", () => {
+    const reg = new ChannelRegistry();
+    expect(() =>
+      reg.updateRouteConversation("telegram", "no-chat", "acct-1", "conv-new"),
+    ).not.toThrow();
+  });
+
+  test("updates disabled routes", () => {
+    addRoute("telegram", {
+      chatId: "chat-disabled",
+      accountId: "acct-1",
+      threadId: null,
+      chatType: "direct",
+      agentId: "agent-1",
+      conversationId: "conv-old",
+      enabled: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const reg = new ChannelRegistry();
+    reg.updateRouteConversation(
+      "telegram",
+      "chat-disabled",
+      "acct-1",
+      "conv-new",
+    );
+    const raw = getRouteRaw("telegram", "chat-disabled", "acct-1");
+    expect(raw?.conversationId).toBe("conv-new");
   });
 });

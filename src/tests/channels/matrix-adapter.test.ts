@@ -29,6 +29,9 @@ class FakeMatrixClient {
   sendMessage = mock(
     async (_roomId: string, _content: unknown) => "$fake-event-id",
   );
+  setTyping = mock(
+    async (_roomId: string, _isTyping: boolean, _timeout?: number) => {},
+  );
   sendEvent = mock(
     async (_roomId: string, _type: string, _content: unknown) =>
       "$fake-reaction-id",
@@ -123,8 +126,26 @@ beforeEach(() => {
       SimpleFsStorageProvider: FakeSimpleFsStorageProvider,
       RustSdkCryptoStorageProvider: FakeRustSdkCryptoStorageProvider,
       RustSdkCryptoStoreType: { Sled: "sled" },
+      // setRequestFn: no-op in tests — production code installs an undici-
+      // backed fetch shim here, but FakeMatrixClient never makes real HTTP
+      // calls.
+      setRequestFn: () => {},
+    }),
+    loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
+    // Stub the undici loader so adapter.ts's getUndiciDispatcher() resolves
+    // without touching the channel-runtime install.
+    loadUndiciModule: async () => ({
+      Agent: class {
+        async destroy() {}
+      },
+      fetch: async () => ({
+        status: 200,
+        headers: { forEach: () => {} },
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }),
     }),
     ensureMatrixRuntimeInstalled: async () => true,
+    ensureMatrixCryptoUpToDate: async () => false,
   }));
 
   // Include all config.ts exports so transitive imports (accounts.ts etc.)
@@ -145,6 +166,19 @@ beforeEach(() => {
     getPendingChannelControlRequestsPath: () =>
       join(channelRoot, "pending-control-requests.json"),
     readChannelConfig: () => null,
+  }));
+
+  // Default stubs for operator-command deps — tests override per-test as needed
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({}),
+  }));
+
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => null,
+  }));
+
+  mock.module("../../agent/modify", () => ({
+    recompileAgentSystemPrompt: async () => "ok",
   }));
 });
 
@@ -182,12 +216,12 @@ function getFakeClient(): FakeMatrixClient {
 
 // ── messageActions tests ───────────────────────────────────────────────────────
 
-test("matrixMessageActions.describeMessageTool returns send, react, upload-file", async () => {
+test("matrixMessageActions.describeMessageTool returns send, react, upload-file, edit", async () => {
   const { matrixMessageActions } = await import(
     "../../channels/matrix/messageActions"
   );
   const desc = matrixMessageActions.describeMessageTool({ accountId: "acc1" });
-  expect(desc.actions).toEqual(["send", "react", "upload-file"]);
+  expect(desc.actions).toEqual(["send", "react", "upload-file", "edit"]);
 });
 
 test("matrixMessageActions.handleAction send calls adapter.sendMessage", async () => {
@@ -216,6 +250,104 @@ test("matrixMessageActions.handleAction send calls adapter.sendMessage", async (
 
   expect(result).toContain("Message sent");
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
+});
+
+test("matrixMessageActions.handleAction edit sends m.replace with new content", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$edit-event");
+
+  const { matrixMessageActions } = await import(
+    "../../channels/matrix/messageActions"
+  );
+
+  const result = await matrixMessageActions.handleAction({
+    request: {
+      action: "edit",
+      chatId: "!room:example.com",
+      messageId: "$original-msg",
+      message: "updated body",
+    },
+    route: {
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      agentId: "a1",
+      conversationId: "c1",
+      enabled: true,
+      createdAt: "",
+    },
+    adapter,
+    formatText: (t: string) => ({ text: t }),
+  } as any);
+
+  expect(result).toContain("Message edited");
+  expect(result).toContain("$edit-event");
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const callArgs = client.sendMessage.mock.calls[0]![1] as Record<
+    string,
+    unknown
+  >;
+  expect(callArgs["m.relates_to"]).toEqual({
+    rel_type: "m.replace",
+    event_id: "$original-msg",
+  });
+  expect(callArgs["m.new_content"]).toBeDefined();
+  const newContent = callArgs["m.new_content"] as Record<string, unknown>;
+  expect(newContent.body).toBe("updated body");
+  expect((callArgs.body as string).startsWith("* ")).toBe(true);
+});
+
+test("matrixMessageActions.handleAction edit returns error when messageId missing", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const { matrixMessageActions } = await import(
+    "../../channels/matrix/messageActions"
+  );
+  const result = await matrixMessageActions.handleAction({
+    request: {
+      action: "edit",
+      chatId: "!room:example.com",
+      message: "x",
+    },
+    route: {
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      agentId: "a1",
+      conversationId: "c1",
+      enabled: true,
+      createdAt: "",
+    },
+    adapter,
+    formatText: (t: string) => ({ text: t }),
+  } as any);
+  expect(result).toMatch(/edit requires messageId/);
+});
+
+test("matrixMessageActions.handleAction edit returns error when message body missing", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const { matrixMessageActions } = await import(
+    "../../channels/matrix/messageActions"
+  );
+  const result = await matrixMessageActions.handleAction({
+    request: {
+      action: "edit",
+      chatId: "!room:example.com",
+      messageId: "$x",
+    },
+    route: {
+      accountId: "acc1",
+      chatId: "!room:example.com",
+      agentId: "a1",
+      conversationId: "c1",
+      enabled: true,
+      createdAt: "",
+    },
+    adapter,
+    formatText: (t: string) => ({ text: t }),
+  } as any);
+  expect(result).toMatch(/edit requires message/);
 });
 
 test("matrixMessageActions.handleAction react calls adapter.sendMessage with reaction", async () => {
@@ -938,8 +1070,21 @@ test("adapter starts without E2EE when crypto addon throws", async () => {
         }
       },
       RustSdkCryptoStoreType: { Sled: "sled" },
+      setRequestFn: () => {},
+    }),
+    loadMatrixCryptoModule: async () => ({ StoreType: { Sqlite: 0 } }),
+    loadUndiciModule: async () => ({
+      Agent: class {
+        async destroy() {}
+      },
+      fetch: async () => ({
+        status: 200,
+        headers: { forEach: () => {} },
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }),
     }),
     ensureMatrixRuntimeInstalled: async () => true,
+    ensureMatrixCryptoUpToDate: async () => false,
   }));
 
   const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
@@ -952,4 +1097,1903 @@ test("adapter starts without E2EE when crypto addon throws", async () => {
   // Client created, but without a crypto provider (graceful fallback)
   expect(FakeMatrixClient.instances).toHaveLength(1);
   expect(getFakeClient().cryptoProviderArg).toBeUndefined();
+});
+
+// ── Lifecycle event tests ─────────────────────────────────────────────────────
+
+const MATRIX_LIFECYCLE_ACCOUNT = {
+  channel: "matrix" as const,
+  accountId: "matrix-lifecycle-account",
+  homeserverUrl: "https://matrix.example.org",
+  accessToken: "lifecycle-token",
+  userId: "@bot:matrix.example.org",
+  enabled: true,
+  dmPolicy: "open" as const,
+  allowedUsers: [],
+  createdAt: "2026-04-23T00:00:00.000Z",
+  updatedAt: "2026-04-23T00:00:00.000Z",
+  e2ee: false,
+};
+
+const MATRIX_LIFECYCLE_SOURCE = {
+  channel: "matrix" as const,
+  accountId: "matrix-lifecycle-account",
+  chatId: "!room-abc:matrix.example.org",
+  agentId: "agent-1",
+  conversationId: "conv-1",
+};
+
+async function makeLifecycleAdapter() {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  return createMatrixAdapter(MATRIX_LIFECYCLE_ACCOUNT);
+}
+
+function getLifecycleFakeClient(): FakeMatrixClient {
+  // The lifecycle adapter is created after other adapters in setup; get the last instance
+  const client =
+    FakeMatrixClient.instances[FakeMatrixClient.instances.length - 1];
+  if (!client) throw new Error("No FakeMatrixClient created");
+  return client;
+}
+
+test("Matrix typing indicator: setTyping(true) called on queued event", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: MATRIX_LIFECYCLE_SOURCE,
+  });
+
+  expect(client.setTyping).toHaveBeenCalledWith(
+    MATRIX_LIFECYCLE_SOURCE.chatId,
+    true,
+    8000,
+  );
+});
+
+test("Matrix typing indicator: setTyping(false) called on finished event", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: MATRIX_LIFECYCLE_SOURCE,
+  });
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  expect(client.setTyping).toHaveBeenCalledWith(
+    MATRIX_LIFECYCLE_SOURCE.chatId,
+    false,
+  );
+});
+
+test("Matrix turn state: finished(completed) edits last response with completion footer", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  // processing stamps turn start; sendMessage captures last response event ID
+  client.sendMessage.mockResolvedValueOnce("$response-1"); // plain text response
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "processing",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: MATRIX_LIFECYCLE_SOURCE.accountId,
+    chatId: MATRIX_LIFECYCLE_SOURCE.chatId,
+    text: "Here are the results.",
+  });
+
+  client.sendMessage.mockResolvedValueOnce("$footer-edit-1"); // completion footer edit
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  // Two sendMessage calls: response + footer edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  const [footerRoom, footerContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(footerRoom).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+
+  // Must be an m.replace edit on the response event ID
+  expect(footerContent["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$response-1",
+  });
+
+  // formatted_body must contain the green check and "completed in"
+  const newContent = footerContent["m.new_content"] as Record<string, unknown>;
+  const html = newContent.formatted_body as string;
+  expect(html).toContain('data-mx-color="#3fb950"');
+  expect(html).toContain("✓");
+  expect(html).toContain("completed in");
+
+  // plain body must also contain the footer
+  const body = newContent.body as string;
+  expect(body).toContain("✓ completed in");
+});
+
+test("Matrix tool block: first tool_call sends thinking placeholder then tool block", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$tool-block-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    description: "run ls",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  // First call: thinking placeholder (no m.relates_to = new message)
+  const [room0, content0] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(room0).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+  expect(
+    (content0 as Record<string, unknown>).formatted_body as string,
+  ).toContain("<b>Thinking...</b>");
+  expect((content0 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+
+  // Second call: tool block (no m.relates_to = new message)
+  const [room1, content1] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(room1).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+  expect((content1 as Record<string, unknown>).body).toContain("bash");
+  expect((content1 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+});
+
+test("Matrix tool block: second tool_call edits tool block via m.replace", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$tool-block-1")
+    .mockResolvedValueOnce("$tool-block-edit-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 3 calls: thinking placeholder + tool block create + tool block edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(3);
+
+  const thirdCall = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const thirdContent = thirdCall[1];
+  const relatesTo = thirdContent["m.relates_to"] as
+    | Record<string, unknown>
+    | undefined;
+  expect(relatesTo?.rel_type).toBe("m.replace");
+  expect(relatesTo?.event_id).toBe("$tool-block-1");
+
+  const newContent = thirdContent["m.new_content"] as
+    | Record<string, unknown>
+    | undefined;
+  expect(newContent?.body).toContain("bash");
+  expect(newContent?.body).toContain("read_file");
+});
+
+test("Matrix tool block: no size guard — block grows indefinitely", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$tool-block-main");
+
+  for (let i = 0; i < 150; i++) {
+    await adapter.handleTurnLifecycleEvent!({
+      type: "tool_call",
+      batchId: "batch-1",
+      toolName: `tool_${i}`,
+      description: `desc ${i}`,
+      sources: [MATRIX_LIFECYCLE_SOURCE],
+    });
+  }
+
+  await new Promise((r) => setTimeout(r, 200));
+
+  const calls = client.sendMessage.mock.calls as Array<
+    [string, Record<string, unknown>]
+  >;
+  // calls[0]: thinking placeholder (no m.relates_to)
+  expect(calls[0]![1]["m.relates_to"]).toBeUndefined();
+  expect(
+    (calls[0]![1] as Record<string, unknown>).formatted_body as string,
+  ).toContain("Thinking...");
+  // calls[1]: tool block create (no m.relates_to)
+  expect(calls[1]![1]["m.relates_to"]).toBeUndefined();
+  // calls[2..150]: tool block edits
+  for (let i = 2; i < calls.length; i++) {
+    const relatesTo = calls[i]![1]["m.relates_to"] as
+      | Record<string, unknown>
+      | undefined;
+    expect(relatesTo?.rel_type).toBe("m.replace");
+  }
+  // 1 thinking placeholder + 1 tool block create + 149 edits = 151
+  expect(calls).toHaveLength(151);
+});
+
+test("Matrix tool block: cleared on finished, no redaction (thinking stays)", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-first")
+    .mockResolvedValueOnce("$block-first")
+    .mockResolvedValueOnce("$thinking-second")
+    .mockResolvedValueOnce("$block-second");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Finish with no response — thinking stays (buffer empty, no final edit, no redact)
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  // NOT redacted — no redactEvent call
+  expect(client.redactEvent).not.toHaveBeenCalled();
+
+  // Second tool_call in a new turn
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-2",
+    toolName: "read_file",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Second turn's thinking placeholder is a new message (no m.relates_to)
+  const secondThinking = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(secondThinking[1]["m.relates_to"]).toBeUndefined();
+  expect(
+    (secondThinking[1] as Record<string, unknown>).formatted_body as string,
+  ).toContain("Thinking...");
+  const secondTool = client.sendMessage.mock.calls[3] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(secondTool[1]["m.relates_to"]).toBeUndefined();
+});
+
+test("Matrix tool block: no thinking placeholder when showReasoning is false", async () => {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  const adapter = createMatrixAdapter({
+    ...MATRIX_LIFECYCLE_ACCOUNT,
+    showReasoning: false,
+  });
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValueOnce("$tool-block-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Only 1 message (tool block only, no thinking placeholder)
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect((content as Record<string, unknown>).body).toContain("bash");
+  expect((content as Record<string, unknown>).formatted_body).toBeUndefined();
+
+  await adapter.stop();
+});
+
+// ── Reasoning display tests ───────────────────────────────────────────────────
+
+test("matrix adapter: reasoning + response finalizes thinking at finished (not at sendMessage)", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1") // initial thinking message
+    .mockResolvedValueOnce("$answer-1") // plain answer (sendMessage)
+    .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
+    .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("I need to search for this.", [source]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  await adapter.handleStreamReasoning!(" Found 3 results.", [source]);
+
+  const result = await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Here are the results.",
+    parseMode: "HTML",
+  });
+
+  // sendMessage only sends the answer — thinking NOT finalized yet
+  expect(client.redactEvent).not.toHaveBeenCalled();
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  expect(result.messageId).toBe("$answer-1");
+
+  // Second call: plain answer (no m.relates_to)
+  const [, answerContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(
+    (answerContent as Record<string, unknown>)["m.relates_to"],
+  ).toBeUndefined();
+
+  // Thinking is finalized only when the turn ends
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  // 4 calls total: thinking placeholder + answer + thinking finalize + completion footer edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(4);
+
+  // Third call: final edit of thinking message
+  const [, editContent] = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const ec = editContent as Record<string, unknown>;
+  expect(ec["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
+  const newContent = ec["m.new_content"] as Record<string, unknown>;
+  const editHtml = newContent.formatted_body as string;
+  expect(editHtml).toContain("<b>Thinking</b>");
+  expect(editHtml).toContain("<blockquote>");
+  expect(editHtml).not.toContain("Thinking...");
+  expect(editHtml).toContain("I need to search for this.");
+  expect(editHtml).toContain("Found 3 results.");
+
+  // Fourth call: completion footer edit on the answer message
+  const [, footerEditContent] = client.sendMessage.mock.calls[3] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const fe = footerEditContent as Record<string, unknown>;
+  expect(fe["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$answer-1",
+  });
+
+  await adapter.stop();
+});
+
+test("matrix adapter sends message normally when no reasoning was received", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Hello.",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+  expect(client.redactEvent).not.toHaveBeenCalled();
+
+  await adapter.stop();
+});
+
+test("matrix adapter skips reasoning drawer when showReasoning is false", async () => {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  const adapter = createMatrixAdapter({
+    ...TEST_ACCOUNT,
+    showReasoning: false,
+  });
+  await adapter.start();
+  const client = getFakeClient();
+
+  await adapter.handleStreamReasoning!("thinking...", [
+    {
+      channel: "matrix" as const,
+      accountId: "acc1",
+      chatId: "!room1:example.com",
+      agentId: "agent1",
+      conversationId: "conv1",
+    },
+  ]);
+
+  // No "Thinking..." message sent
+  expect(client.sendMessage).not.toHaveBeenCalled();
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Hello.",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect((content as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
+  expect(client.redactEvent).not.toHaveBeenCalled();
+
+  await adapter.stop();
+});
+
+test("matrix adapter: thinking placeholder (no reasoning content) stays, plain answer sent", async () => {
+  const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
+  const adapter = createMatrixAdapter(TEST_ACCOUNT);
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-placeholder") // from tool call path
+    .mockResolvedValueOnce("$tool-block-1")
+    .mockResolvedValueOnce("$plain-response"); // plain answer (buffer empty, no final edit)
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // Tool call sends thinking placeholder then tool block
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "b1",
+    toolName: "bash",
+    sources: [source],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Response arrives — buffer is empty, so NO final edit of thinking message
+  const result = await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Done.",
+  });
+
+  // Thinking placeholder is NOT redacted
+  expect(client.redactEvent).not.toHaveBeenCalled();
+
+  // 3 total sendMessage calls: thinking placeholder + tool block + plain answer
+  // (no final edit because buffer was empty)
+  expect(client.sendMessage).toHaveBeenCalledTimes(3);
+
+  const [, responseContent] = client.sendMessage.mock.calls[2] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect((responseContent as Record<string, unknown>).body).toBe("Done.");
+  expect(
+    (responseContent as Record<string, unknown>)["m.relates_to"],
+  ).toBeUndefined();
+  expect(result.messageId).toBe("$plain-response");
+
+  await adapter.stop();
+});
+
+test("matrix adapter: thinking finalized when turn ends without response", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1") // initial thinking message
+    .mockResolvedValueOnce("$thinking-final"); // final edit
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("Reasoning about this...", [source]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  // Turn ends without response
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  // NOT redacted — stays in room
+  expect(client.redactEvent).not.toHaveBeenCalled();
+
+  // Final edit sent (summary changes from "Thinking..." to "Thinking")
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const ec = editContent as Record<string, unknown>;
+  expect(ec["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
+  const newContent = ec["m.new_content"] as Record<string, unknown>;
+  expect(newContent.formatted_body as string).toContain("<b>Thinking</b>");
+  expect(newContent.formatted_body as string).toContain("<blockquote>");
+  expect(newContent.formatted_body as string).not.toContain("Thinking...");
+
+  await adapter.stop();
+});
+
+test("matrix adapter: very long reasoning is sliding-window truncated to fit Matrix size cap", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1") // initial thinking placeholder
+    .mockResolvedValueOnce("$thinking-final"); // final edit at "finished"
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // 30k of plain ASCII reasoning — well over the 12k MATRIX_REASONING_MAX_CHARS cap.
+  // Use distinct head/tail markers so we can prove which side was kept.
+  const headMarker = "AAAAAAAAAA-very-early-thoughts-AAAAAAAAAA";
+  const tailMarker = "ZZZZZZZZZZ-most-recent-conclusion-ZZZZZZZZZZ";
+  const filler = "x".repeat(30_000);
+  const longReasoning = `${headMarker}${filler}${tailMarker}`;
+
+  await adapter.handleStreamReasoning!(longReasoning, [source]);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const ec = editContent as Record<string, unknown>;
+  const newContent = ec["m.new_content"] as Record<string, unknown>;
+  const editHtml = newContent.formatted_body as string;
+  const editBody = newContent.body as string;
+
+  // Sliding window: the *tail* is preserved, the *head* is dropped.
+  expect(editBody).toContain(tailMarker);
+  expect(editBody).not.toContain(headMarker);
+  expect(editHtml).toContain(tailMarker);
+  expect(editHtml).not.toContain(headMarker);
+
+  // A truncation notice is prepended so the user knows content was clipped.
+  expect(editBody).toContain("truncated");
+  expect(editHtml).toContain("truncated");
+
+  // The total formatted_body must comfortably fit under Matrix's 64 KiB
+  // event-size limit even with HTML escaping and wrapper markup.
+  expect(editHtml.length).toBeLessThan(60_000);
+
+  await adapter.stop();
+});
+
+test("matrix adapter: short reasoning is NOT truncated (no notice)", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$thinking-final");
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // Short reasoning — well under the cap, must pass through unchanged.
+  await adapter.handleStreamReasoning!("Just a brief thought.", [source]);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const newContent = (editContent as Record<string, unknown>)[
+    "m.new_content"
+  ] as Record<string, unknown>;
+  const editBody = newContent.body as string;
+
+  expect(editBody).toContain("Just a brief thought.");
+  expect(editBody).not.toContain("truncated");
+
+  await adapter.stop();
+});
+
+test("matrix adapter: multi-run thinking within one turn is appended with separator", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1") // initial thinking message
+    .mockResolvedValueOnce("$tool-block-1") // tool block
+    .mockResolvedValueOnce("$answer-1") // response
+    .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
+    .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
+
+  const source = {
+    channel: "matrix" as const,
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  // First reasoning segment
+  await adapter.handleStreamReasoning!("First thought.", [source]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  // Tool call interrupts — marks separator needed
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "b1",
+    toolName: "bash",
+    sources: [source],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Second reasoning segment (after tool)
+  await adapter.handleStreamReasoning!("Second thought.", [source]);
+
+  // ChannelAction tool call (response send) — skipped by adapter, no tool block
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "b1",
+    toolName: "ChannelAction",
+    sources: [source],
+  });
+
+  await adapter.sendMessage({
+    channel: "matrix",
+    accountId: "acc1",
+    chatId: "!room1:example.com",
+    text: "Here is the answer.",
+  });
+
+  // Only one thinking message — NOT a second placeholder
+  expect(client.sendMessage).toHaveBeenCalledTimes(3); // thinking + tool block + answer
+
+  // Finalize at "finished"
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "b1",
+    sources: [source],
+    outcome: "completed",
+  });
+
+  // 5 calls: thinking + tool block + answer + thinking finalize + completion footer edit
+  expect(client.sendMessage).toHaveBeenCalledTimes(5);
+
+  // 4th call: final edit of thinking message
+  const [, editContent] = client.sendMessage.mock.calls[3] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const ec = editContent as Record<string, unknown>;
+  expect(ec["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
+  const newContent = ec["m.new_content"] as Record<string, unknown>;
+  const editHtml = newContent.formatted_body as string;
+  expect(editHtml).toContain("First thought.");
+  expect(editHtml).toContain("Second thought.");
+  expect(editHtml).toContain("<hr>"); // separator between segments
+
+  // 5th call: completion footer edit on the answer message
+  const [, footerEditContent] = client.sendMessage.mock.calls[4] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const fe = footerEditContent as Record<string, unknown>;
+  expect(fe["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$answer-1",
+  });
+
+  await adapter.stop();
+});
+
+// ── Operator command tests ────────────────────────────────────────────────────
+
+test("matrix adapter !cancel replies Cancelled. when run is active", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-1",
+      }),
+      cancelActiveRun: () => true,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1", agent_id: "agent-1" }),
+        fork: async () => ({ id: "cf", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$cancel1",
+    content: { msgtype: "m.text", body: "!cancel" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Cancelled.",
+  );
+  expect(call).toBeDefined();
+  expect(call?.[0]).toBe("!room:example.com");
+});
+
+test("matrix adapter !cancel replies No active run. when no run", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-1",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$cancel2",
+    content: { msgtype: "m.text", body: "!cancel" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "No active run.",
+  );
+  expect(call).toBeDefined();
+});
+
+test("matrix adapter !conv list replies with Conversations: list", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv1",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.startsWith(
+      "Conversations:",
+    ),
+  );
+  expect(call).toBeDefined();
+  const body = (call?.[1] as Record<string, unknown>).body as string;
+  expect(body).toContain("1. default (current)");
+});
+
+test("matrix adapter !compact replies Compaction triggered.", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$compact1",
+    content: { msgtype: "m.text", body: "!compact" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Compaction triggered.",
+  );
+  expect(call).toBeDefined();
+});
+
+test("matrix adapter !recompile replies System prompt recompiled.", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: {
+        messages: { compact: async () => ({}) },
+        recompile: async () => "ok",
+      },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$recompile1",
+    content: { msgtype: "m.text", body: "!recompile" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) =>
+      (c[1] as Record<string, unknown>).body === "System prompt recompiled.",
+  );
+  expect(call).toBeDefined();
+  expect(call?.[0]).toBe("!room:example.com");
+});
+
+test("matrix adapter !conv new replies New conversation started and calls updateRouteConversation", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "new-conv-id", agent_id: "agent-1" }),
+        fork: async () => ({ id: "cf", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-new1",
+    content: { msgtype: "m.text", body: "!conv new" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.startsWith(
+      "New conversation started",
+    ),
+  );
+  expect(call).toBeDefined();
+  const body = (call?.[1] as Record<string, unknown>).body as string;
+  expect(body).toContain("new-conv-id");
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv fork replies Conversation forked when not on default", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-existing",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1", agent_id: "agent-1" }),
+        fork: async () => ({ id: "forked-conv-id", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-fork1",
+    content: { msgtype: "m.text", body: "!conv fork" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.startsWith(
+      "Conversation forked",
+    ),
+  );
+  expect(call).toBeDefined();
+  const body = (call?.[1] as Record<string, unknown>).body as string;
+  expect(body).toContain("forked-conv-id");
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv fork refuses default conversation", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-fork-default",
+    content: { msgtype: "m.text", body: "!conv fork" },
+  });
+
+  const call = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.includes(
+      "Cannot fork the default",
+    ),
+  );
+  expect(call).toBeDefined();
+});
+
+test("matrix adapter !conv switch 1 always works without cache", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "conv-some",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // No !conv list first — switch 1 (default) always works
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-1",
+    content: { msgtype: "m.text", body: "!conv switch 1" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Switched to: default.",
+  );
+  expect(call).toBeDefined();
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv switch 2 uses cached list", async () => {
+  const updateRouteConversation = mock(() => {});
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation,
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [
+          {
+            id: "named-conv-1",
+            agent_id: "agent-1",
+            summary: "My Conv",
+          } as unknown as Record<string, unknown>,
+        ],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Populate cache first via !conv list
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-list-for-switch",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  // Now switch to position 2 (the named conv)
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-2",
+    content: { msgtype: "m.text", body: "!conv switch 2" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Switched to: My Conv.",
+  );
+  expect(call).toBeDefined();
+  expect(updateRouteConversation).toHaveBeenCalled();
+});
+
+test("matrix adapter !conv delete 2 deletes named conv and replies Deleted.", async () => {
+  const deleteMock = mock(async () => ({}));
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [
+          {
+            id: "named-conv-del",
+            agent_id: "agent-1",
+            summary: "To Delete",
+          } as unknown as Record<string, unknown>,
+        ],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: deleteMock,
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Populate cache first via !conv list
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-list-for-delete",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  // Delete position 2 (the named conv)
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-delete-2",
+    content: { msgtype: "m.text", body: "!conv delete 2" },
+  });
+
+  const call = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Deleted.",
+  );
+  expect(call).toBeDefined();
+  expect(deleteMock).toHaveBeenCalled();
+});
+
+test("matrix adapter stop() clears convListCache", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({
+        agentId: "agent-1",
+        conversationId: "default",
+      }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [
+          {
+            id: "conv-cached",
+            agent_id: "agent-1",
+            summary: "Cached",
+          } as unknown as Record<string, unknown>,
+        ],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Populate the cache via !conv list
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-list-cache",
+    content: { msgtype: "m.text", body: "!conv list" },
+  });
+
+  // Verify cache is populated: switch 2 should work (returns label not "Run conv list first")
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-before-stop",
+    content: { msgtype: "m.text", body: "!conv switch 2" },
+  });
+  const switchBeforeStop = client.sendMessage.mock.calls.find(
+    (c) => (c[1] as Record<string, unknown>).body === "Switched to: Cached.",
+  );
+  expect(switchBeforeStop).toBeDefined();
+
+  // Stop the adapter — this clears convListCache
+  await adapter.stop();
+
+  // Restart so we can emit messages again
+  await adapter.start();
+  // getFakeClient() returns instances[0] (the first client), but stop+start
+  // creates a new FakeMatrixClient at instances[1]. Grab the newest one.
+  const client2 =
+    FakeMatrixClient.instances[FakeMatrixClient.instances.length - 1]!;
+
+  // After stop+restart, cache is cleared: switch 2 without a prior list should fail
+  await client2.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$conv-switch-after-stop",
+    content: { msgtype: "m.text", body: "!conv switch 2" },
+  });
+  const switchAfterStop = client2.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.includes(
+      "Run conv list first",
+    ),
+  );
+  expect(switchAfterStop).toBeDefined();
+});
+
+test("matrix adapter !help replies with all command names", async () => {
+  const adapter = await makeAdapter();
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$help1",
+    content: { msgtype: "m.text", body: "!help" },
+  });
+
+  const helpCall = client.sendMessage.mock.calls.find((c) =>
+    ((c[1] as Record<string, unknown>).body as string)?.includes("!cancel"),
+  );
+  expect(helpCall).toBeDefined();
+  const body = (helpCall![1] as Record<string, unknown>).body as string;
+  expect(body).toContain("!compact");
+  expect(body).toContain("!conv list");
+  expect(body).toContain("!help");
+});
+
+// ── Live tool-progress UI ─────────────────────────────────────────────────────
+//
+// All these tests bypass the production grace window (1 s before the running
+// block becomes visible) by forcing it to 0 ms — see __testSetToolProgressGraceMs
+// usage below. The suppression behavior under non-zero grace gets its own test.
+
+async function setupToolProgressTestAdapter(graceMs = 0) {
+  const adapterMod = await import("../../channels/matrix/adapter");
+  adapterMod.__testSetToolProgressGraceMs(graceMs);
+  const adapter = adapterMod.createMatrixAdapter(MATRIX_LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  return adapter;
+}
+
+function getEditedFormattedBodies(client: FakeMatrixClient): string[] {
+  const edits: string[] = [];
+  for (const call of client.sendMessage.mock.calls as Array<
+    [string, Record<string, unknown>]
+  >) {
+    const relatesTo = call[1]["m.relates_to"] as
+      | Record<string, unknown>
+      | undefined;
+    if (relatesTo?.rel_type !== "m.replace") continue;
+    const newContent = call[1]["m.new_content"] as
+      | Record<string, unknown>
+      | undefined;
+    const html =
+      (newContent?.formatted_body as string | undefined) ??
+      (call[1].formatted_body as string | undefined) ??
+      "";
+    edits.push(html);
+  }
+  return edits;
+}
+
+test("Matrix tool progress: tool_started edits placeholder with running tool block", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-1",
+    toolName: "Bash",
+    args: { command: "start-camofox.sh --headless" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+
+  // Allow the placeholder-create + initial edit to settle.
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  expect(edits.length).toBeGreaterThanOrEqual(1);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Running");
+  expect(lastEdit).toContain("Bash");
+  expect(lastEdit).toContain("start-camofox.sh --headless");
+  // Default Bash timeout (120s) renders as 2:00 in the m:ss format.
+  expect(lastEdit).toMatch(/0:00\s*\/\s*2:00/);
+});
+
+test("Matrix tool progress: timeoutMs shown in m:ss when agent set custom timeout", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-2",
+    toolName: "Bash",
+    args: { command: "npm install", timeout: 600_000 },
+    timeoutMs: 600_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toMatch(/0:00\s*\/\s*10:00/);
+});
+
+test("Matrix tool progress: no `/ max` shown when tool has no timeout", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-read-1",
+    toolName: "Read",
+    args: { file_path: "/etc/passwd" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    // no timeoutMs
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Running");
+  expect(lastEdit).toContain("Read");
+  expect(lastEdit).toContain("/etc/passwd");
+  // No "X / Y" deadline format; just elapsed.
+  expect(lastEdit).not.toMatch(/\d:\d{2}\s*\/\s*\d:\d{2}/);
+});
+
+test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotation", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-3",
+    toolName: "Bash",
+    args: { command: "git status" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-1",
+    toolCallId: "call-bash-3",
+    toolName: "Bash",
+    durationMs: 107_000, // 1:47
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Bash");
+  expect(lastEdit).toMatch(/took\s*1:47/);
+  expect(lastEdit).not.toContain("Running");
+});
+
+test("Matrix tool progress: error outcome shows `errored after m:ss`", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-bash-err",
+    toolName: "Bash",
+    args: { command: "false" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-1",
+    toolCallId: "call-bash-err",
+    toolName: "Bash",
+    durationMs: 4_500,
+    outcome: "error",
+    error: "exit 1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toMatch(/errored after\s*0:04/);
+});
+
+test("Matrix tool progress: a new tool_started clears the previous `took` annotation", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  // First tool runs and ends.
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-1",
+    toolName: "Bash",
+    args: { command: "echo first" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-1",
+    toolCallId: "call-1",
+    toolName: "Bash",
+    durationMs: 1_000,
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  // Second tool starts. The "took" annotation should be replaced with a fresh
+  // running block — not stacked alongside it.
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-2",
+    toolName: "Read",
+    args: { file_path: "/tmp/x" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("Running");
+  expect(lastEdit).toContain("Read");
+  expect(lastEdit).not.toContain("took");
+});
+
+test("Matrix tool progress: secret-shaped substrings in args are redacted in the preview", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-curl",
+    toolName: "Bash",
+    args: {
+      command:
+        "curl -H 'Authorization: Bearer sk-supersecret' --api-key=abcdef https://api.example.com",
+    },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).not.toContain("sk-supersecret");
+  expect(lastEdit).not.toContain("abcdef");
+  expect(lastEdit).toContain("&lt;redacted&gt;");
+});
+
+test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  const longCommand =
+    "echo this is a very long command that should definitely exceed the eighty character preview limit imposed by buildArgsPreview";
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-long",
+    toolName: "Bash",
+    args: { command: longCommand },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  const lastEdit = edits[edits.length - 1]!;
+  expect(lastEdit).toContain("…");
+  expect(lastEdit).not.toContain("buildArgsPreview");
+});
+
+test("Matrix tool progress: ChannelAction and NotifyUser do not trigger tool-progress UI", async () => {
+  const adapter = await setupToolProgressTestAdapter();
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-1",
+    toolCallId: "call-ca",
+    toolName: "ChannelAction",
+    args: { action: "react", emoji: "👍" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  const edits = getEditedFormattedBodies(client);
+  // No placeholder edits — ChannelAction is the bot's outbound channel path,
+  // not work we're surfacing as "running".
+  expect(edits.length).toBe(0);
+});
+
+test("Matrix tool progress: tool that completes inside grace window is invisible (no running, no annotation)", async () => {
+  const adapter = await setupToolProgressTestAdapter(120); // 120 ms grace
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-fast",
+    toolCallId: "call-instant",
+    toolName: "Read",
+    args: { file_path: "/tmp/instant" },
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  // Tool ends well inside the 120 ms grace window.
+  await new Promise((r) => setTimeout(r, 30));
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-fast",
+    toolCallId: "call-instant",
+    toolName: "Read",
+    durationMs: 50,
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  // Wait past the grace window to confirm nothing fires after the fact.
+  await new Promise((r) => setTimeout(r, 200));
+
+  const edits = getEditedFormattedBodies(client);
+  // No placeholder edits at all — neither running block nor took-annotation.
+  expect(edits.length).toBe(0);
+  // And no thinking placeholder was created either (since tool was suppressed
+  // and there was no reasoning content).
+  const placeholderCreates = (
+    client.sendMessage.mock.calls as Array<[string, Record<string, unknown>]>
+  ).filter((c) => c[1]["m.relates_to"] === undefined);
+  expect(placeholderCreates.length).toBe(0);
+});
+
+test("Matrix tool progress: tool that survives the grace window renders normally and leaves a took-annotation", async () => {
+  const adapter = await setupToolProgressTestAdapter(50); // 50 ms grace
+  const client = getLifecycleFakeClient();
+  client.sendMessage.mockResolvedValue("$placeholder");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_started",
+    batchId: "batch-slow",
+    toolCallId: "call-slow",
+    toolName: "Bash",
+    args: { command: "long-running-script" },
+    timeoutMs: 120_000,
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  // Wait past the grace window — the running block should now be visible.
+  await new Promise((r) => setTimeout(r, 100));
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_ended",
+    batchId: "batch-slow",
+    toolCallId: "call-slow",
+    toolName: "Bash",
+    durationMs: 3_000,
+    outcome: "success",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  const edits = getEditedFormattedBodies(client);
+  expect(edits.length).toBeGreaterThanOrEqual(2);
+  // The first edit should be the running block, the last the took-annotation.
+  expect(edits[0]!).toContain("Running");
+  expect(edits[edits.length - 1]!).toMatch(/took\s*0:03/);
+});
+
+test("Matrix turn state: finished(error) with thinking block appends error footer in blockquote", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1") // initial thinking placeholder
+    .mockResolvedValueOnce("$finalize-1"); // final edit at finished
+
+  await adapter.handleStreamReasoning!("Checking email…", [
+    MATRIX_LIFECYCLE_SOURCE,
+  ]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "error",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(editContent["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
+
+  const newContent = editContent["m.new_content"] as Record<string, unknown>;
+  const html = newContent.formatted_body as string;
+  expect(html).toContain("Checking email");
+  expect(html).toContain('data-mx-color="#f85149"');
+  expect(html).toContain("⚠ Turn failed");
+  expect(html).not.toContain("✓");
+});
+
+test("Matrix turn state: finished(error) with no thinking block sends fallback error message", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  client.sendMessage.mockResolvedValueOnce("$fallback-error-1");
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "error",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  const [room, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(room).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
+  expect(content["m.relates_to"]).toBeUndefined();
+
+  const html = content.formatted_body as string;
+  expect(html).toContain('data-mx-color="#f85149"');
+  expect(html).toContain("⚠ Turn failed");
+  expect(html).toContain("didn't complete");
+});
+
+test("Matrix turn state: finished(cancelled) with thinking block appends cancelled footer", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  client.sendMessage
+    .mockResolvedValueOnce("$thinking-1")
+    .mockResolvedValueOnce("$finalize-1");
+
+  await adapter.handleStreamReasoning!("Drafting essay…", [
+    MATRIX_LIFECYCLE_SOURCE,
+  ]);
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "cancelled",
+  });
+
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+
+  const [, editContent] = client.sendMessage.mock.calls[1] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect(editContent["m.relates_to"]).toMatchObject({
+    rel_type: "m.replace",
+    event_id: "$thinking-1",
+  });
+
+  const newContent = editContent["m.new_content"] as Record<string, unknown>;
+  const html = newContent.formatted_body as string;
+  expect(html).toContain("Drafting essay");
+  expect(html).toContain('data-mx-color="#e3b341"');
+  expect(html).toContain("· Cancelled");
+});
+
+test("Matrix turn state: finished(cancelled) with no thinking block sends no extra message", async () => {
+  const adapter = await makeLifecycleAdapter();
+  await adapter.start();
+  const client = getLifecycleFakeClient();
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [MATRIX_LIFECYCLE_SOURCE],
+    outcome: "cancelled",
+  });
+
+  expect(client.sendMessage).not.toHaveBeenCalled();
 });

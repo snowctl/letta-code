@@ -94,6 +94,7 @@ export type ChannelConfigSnapshot =
       enabled: boolean;
       dmPolicy: DmPolicy;
       allowedUsers: string[];
+      allowedChannels: string[];
       hasToken: boolean;
     }
   | {
@@ -144,7 +145,7 @@ export interface ChannelTargetSnapshot {
   lastMessageId?: string;
 }
 
-async function refreshLoadedMessageChannelTool(): Promise<void> {
+async function refreshChannelToolRegistry(): Promise<void> {
   await refreshDynamicChannelToolsInLoadedRegistry();
 }
 
@@ -193,6 +194,7 @@ export type ChannelAccountSnapshot =
       running: boolean;
       dmPolicy: DmPolicy;
       allowedUsers: string[];
+      allowedChannels: string[];
       hasToken: boolean;
       agentId: string | null;
       createdAt: string;
@@ -228,6 +230,8 @@ export interface ChannelConfigPatch {
   e2ee?: boolean;
   dmPolicy?: DmPolicy;
   allowedUsers?: string[];
+  /** Discord-only: allowlist of guild channel IDs (parent channel for threads). */
+  allowedChannels?: string[];
 }
 
 export interface ChannelAccountPatch {
@@ -245,6 +249,8 @@ export interface ChannelAccountPatch {
   defaultPermissionMode?: SlackDefaultPermissionMode;
   dmPolicy?: DmPolicy;
   allowedUsers?: string[];
+  /** Discord-only: allowlist of guild channel IDs (parent channel for threads). */
+  allowedChannels?: string[];
   transcribeVoice?: boolean;
   maxMediaDownloadBytes?: number;
 }
@@ -515,6 +521,7 @@ function toAccountSnapshot(account: ChannelAccount): ChannelAccountSnapshot {
       running,
       dmPolicy: account.dmPolicy,
       allowedUsers: [...account.allowedUsers],
+      allowedChannels: [...(account.allowedChannels ?? [])],
       hasToken: account.token.trim().length > 0,
       agentId: account.agentId,
       createdAt: account.createdAt,
@@ -596,6 +603,7 @@ function createAccountFromPatch(
       agentId: patch.agentId ?? null,
       dmPolicy: patch.dmPolicy ?? "pairing",
       allowedUsers: patch.allowedUsers ?? [],
+      allowedChannels: patch.allowedChannels ?? [],
       createdAt: now,
       updatedAt: now,
     };
@@ -652,6 +660,7 @@ function mergeAccountPatch(
       agentId: patch.agentId ?? existing.agentId,
       dmPolicy: patch.dmPolicy ?? existing.dmPolicy,
       allowedUsers: patch.allowedUsers ?? existing.allowedUsers,
+      allowedChannels: patch.allowedChannels ?? existing.allowedChannels,
       updatedAt: nextUpdatedAt,
     };
   }
@@ -770,6 +779,7 @@ export function getChannelConfigSnapshot(
       enabled: account.enabled,
       dmPolicy: account.dmPolicy,
       allowedUsers: [...account.allowedUsers],
+      allowedChannels: [...(account.allowedChannels ?? [])],
       hasToken: account.token.trim().length > 0,
     };
   }
@@ -824,6 +834,7 @@ export async function setChannelConfigLive(
       e2ee: patch.e2ee,
       dmPolicy: patch.dmPolicy,
       allowedUsers: patch.allowedUsers,
+      allowedChannels: patch.allowedChannels,
       displayName: existing.displayName,
     });
     shouldRefreshDisplayName =
@@ -849,6 +860,7 @@ export async function setChannelConfigLive(
         e2ee: patch.e2ee,
         dmPolicy: patch.dmPolicy,
         allowedUsers: patch.allowedUsers,
+        allowedChannels: patch.allowedChannels,
       },
       accountId ? { accountId } : undefined,
     );
@@ -883,7 +895,7 @@ export async function setChannelConfigLive(
   if (!snapshot) {
     throw new Error(`Failed to write ${channelId} channel config`);
   }
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return snapshot;
 }
 
@@ -937,7 +949,7 @@ export async function startChannelLive(
   if (!summary) {
     throw new Error(`Channel "${channelId}" summary not found after start`);
   }
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return summary;
 }
 
@@ -968,7 +980,7 @@ export async function stopChannelLive(
   if (!summary) {
     throw new Error(`Channel "${channelId}" summary not found after stop`);
   }
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return summary;
 }
 
@@ -1179,7 +1191,7 @@ export async function startChannelAccountLive(
       force: channelId === "slack" || channelId === "discord",
     },
   );
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return snapshot;
 }
 
@@ -1204,7 +1216,7 @@ export async function stopChannelAccountLive(
     : existing;
 
   await getChannelRegistry()?.stopChannelAccount(channelId, accountId);
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return toAccountSnapshot(next);
 }
 
@@ -1226,7 +1238,7 @@ export async function removeChannelAccountLive(
   removeChannelTargetsForAccount(channelId, accountId);
   removePairingStateForAccount(channelId, accountId);
   const removed = removeChannelAccount(channelId, accountId);
-  await refreshLoadedMessageChannelTool();
+  await refreshChannelToolRegistry();
   return removed;
 }
 

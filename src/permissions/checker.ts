@@ -718,8 +718,6 @@ function matchesPattern(
  * mutations are constrained by dedicated permission-mode enforcement.
  */
 const SAFE_AUTO_APPROVE_SUBAGENT_TYPES = new Set([
-  "explore", // Codebase exploration - Glob, Grep, Read, LS, TaskOutput
-  "Explore",
   "recall", // Conversation history search - Skill, Bash, Read, TaskOutput
   "Recall",
   "reflection", // Memory reflection - writes constrained by memory mode
@@ -774,7 +772,8 @@ function getDefaultDecision(
     "memory",
     "memory_apply_patch",
     // Channel sends are scoped by routing + parentScope checks in the tool.
-    "MessageChannel",
+    "ChannelAction",
+    "NotifyUser",
   ];
 
   if (autoAllowTools.includes(toolName)) {
@@ -782,7 +781,7 @@ function getDefaultDecision(
   }
 
   // Task tool: auto-approve safe subagent types
-  if (toolName === "Task" || toolName === "task") {
+  if (canonicalToolName(toolName) === "Task") {
     const subagentType =
       typeof toolArgs?.subagent_type === "string" ? toolArgs.subagent_type : "";
     if (SAFE_AUTO_APPROVE_SUBAGENT_TYPES.has(subagentType)) {

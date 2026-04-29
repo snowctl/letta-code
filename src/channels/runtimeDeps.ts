@@ -138,11 +138,22 @@ async function writeChannelRuntimeManifest(
   const runtimeDir = getChannelRuntimeDir(channelId);
   await mkdir(runtimeDir, { recursive: true });
 
-  const manifest = {
+  const spec = getChannelPluginMetadata(channelId);
+  const manifest: Record<string, unknown> = {
     name: `letta-channel-runtime-${channelId}`,
     private: true,
     description: `Runtime dependencies for Letta Code ${channelId} channel support`,
   };
+  if (
+    spec.runtimeTrustedDependencies &&
+    spec.runtimeTrustedDependencies.length > 0
+  ) {
+    manifest.trustedDependencies = [...spec.runtimeTrustedDependencies];
+  }
+  if (spec.runtimeOverrides && Object.keys(spec.runtimeOverrides).length > 0) {
+    manifest.overrides = { ...spec.runtimeOverrides };
+    manifest.resolutions = { ...spec.runtimeOverrides };
+  }
 
   await writeFile(
     getChannelRuntimePackagePath(channelId),
@@ -264,7 +275,20 @@ export async function loadChannelRuntimeModule<T>(
     throw buildMissingChannelRuntimeError(channelId);
   }
 
-  return (await import(pathToFileURL(resolvedPath).href)) as T;
+  // Bun treats some packages (e.g. `undici`) as built-in runtime modules and
+  // returns the bare specifier from `createRequire().resolve(...)` instead of
+  // a real file path. `pathToFileURL("undici")` would then resolve against
+  // the cwd and fail with "Cannot find module '<cwd>/undici'". Detect that
+  // case (no path separator, no scheme) and import the bare specifier
+  // directly — the module loader knows how to find built-ins.
+  const looksLikePath =
+    resolvedPath.includes("/") ||
+    resolvedPath.includes("\\") ||
+    resolvedPath.includes(":");
+  const importTarget = looksLikePath
+    ? pathToFileURL(resolvedPath).href
+    : resolvedPath;
+  return (await import(importTarget)) as T;
 }
 
 export function __testOverrideChannelRuntimeDeps(

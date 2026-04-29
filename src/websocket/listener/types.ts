@@ -24,6 +24,7 @@ import type {
   RuntimeScope,
   WsProtocolCommand,
 } from "../../types/protocol_v2";
+import type { ListenerTransport } from "./transport";
 
 export interface StartListenerOptions {
   connectionId: string;
@@ -56,6 +57,8 @@ export interface IncomingMessage {
   agentId?: string;
   conversationId?: string;
   channelTurnSources?: ChannelTurnSource[];
+  /** Distinguishes user messages from cron/heartbeat prompts. */
+  source?: "user" | "cron";
   messages: Array<
     (MessageCreate & { client_message_id?: string }) | ApprovalCreate
   >;
@@ -113,12 +116,15 @@ export type ConversationRuntime = {
   agentId: string | null;
   conversationId: string;
   activeChannelTurnSources: ChannelTurnSource[] | null;
+  finalAssistantText?: string | null;
   messageQueue: Promise<void>;
   pendingApprovalResolvers: Map<string, PendingApprovalResolver>;
   recoveredApprovalState: RecoveredApprovalState | null;
   lastStopReason: string | null;
   isProcessing: boolean;
   activeWorkingDirectory: string | null;
+  expectedWorktreePath: string | null;
+  expectedWorktreeExpiresAt: number | null;
   activeRunId: string | null;
   activeRunStartedAt: string | null;
   activeAbortController: AbortController | null;
@@ -151,6 +157,7 @@ export type ConversationRuntime = {
 
 export type ListenerRuntime = {
   socket: WebSocket | null;
+  transport?: ListenerTransport | null;
   heartbeatInterval: NodeJS.Timeout | null;
   reconnectTimeout: NodeJS.Timeout | null;
   intentionallyClosed: boolean;
@@ -193,6 +200,9 @@ export type ListenerRuntime = {
   /** Agent IDs whose memfs repo has been cloned/pulled this session. Concurrent callers coalesce on the same promise. */
   memfsSyncedAgents: Map<string, Promise<void>>;
   lastEmittedStatus: "idle" | "receiving" | "processing" | null;
+  /** Most recently active (non-default) conversation ID per agent. Used to route
+   *  heartbeat/fallback messages to the active conversation instead of "default". */
+  lastActiveConversationByAgentId: Map<string, string>;
   /** Unsubscribe from subagent state store (set on socket open, cleared on close). */
   _unsubscribeSubagentState?: (() => void) | undefined;
   /** Unsubscribe from subagent stream events (set on socket open, cleared on close). */

@@ -7,6 +7,7 @@ import {
 import type {
   ChannelAccount,
   DiscordChannelAccount,
+  MatrixChannelAccount,
   SlackChannelAccount,
   SlackDefaultPermissionMode,
   SupportedChannelId,
@@ -38,6 +39,12 @@ function cloneAccount<T extends ChannelAccount>(account: T): T {
     (cloned as TelegramChannelAccount).binding = { ...account.binding };
   }
 
+  if (account.channel === "discord" && account.allowedChannels) {
+    (cloned as DiscordChannelAccount).allowedChannels = [
+      ...account.allowedChannels,
+    ];
+  }
+
   return cloned;
 }
 
@@ -60,6 +67,16 @@ function normalizeLoadedAccount<T extends ChannelAccount>(account: T): T {
     (next as SlackChannelAccount).defaultPermissionMode = ((
       next as SlackChannelAccount
     ).defaultPermissionMode ?? "default") as SlackDefaultPermissionMode;
+  }
+  if (next.channel === "telegram") {
+    (next as TelegramChannelAccount).defaultPermissionMode =
+      ((next as TelegramChannelAccount).defaultPermissionMode ??
+        "default") as SlackDefaultPermissionMode;
+  }
+  if (next.channel === "matrix") {
+    (next as MatrixChannelAccount).defaultPermissionMode =
+      ((next as MatrixChannelAccount).defaultPermissionMode ??
+        "default") as SlackDefaultPermissionMode;
   }
   return next;
 }
@@ -100,6 +117,9 @@ function makeDefaultLegacyAccount(
       token: config.token,
       dmPolicy: config.dmPolicy,
       allowedUsers: [...config.allowedUsers],
+      allowedChannels: config.allowedChannels
+        ? [...config.allowedChannels]
+        : undefined,
       agentId: null,
       createdAt: now,
       updatedAt: now,

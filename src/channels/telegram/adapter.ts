@@ -5,11 +5,27 @@
  */
 
 import type { ReactionType, ReactionTypeEmoji } from "@grammyjs/types";
+import type { Letta } from "@letta-ai/letta-client";
+import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import type { Bot as GrammYBot, Context as GrammYContext } from "grammy";
+import { getClient } from "../../agent/client";
+import { markdownToTelegramHtml } from "../format";
 import { formatChannelControlRequestPrompt } from "../interactive";
+import {
+  handleOperatorCommand,
+  type OperatorCommandContext,
+} from "../operator-commands";
+import { getChannelRegistry } from "../registry";
+import {
+  renderToolBlock,
+  type ToolCallGroup,
+  upsertToolCallGroup,
+} from "../tool-block";
 import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
+  ChannelTurnLifecycleEvent,
+  ChannelTurnSource,
   InboundChannelMessage,
   OutboundChannelMessage,
   TelegramChannelAccount,
@@ -213,6 +229,20 @@ export function createTelegramAdapter(
   let bot: TelegramBot | null = null;
   let botModule: GrammYModule | null = null;
   let running = false;
+  const typingIntervalByChatId = new Map<
+    string,
+    ReturnType<typeof setInterval>
+  >();
+  const convListCache = new Map<string, Conversation[]>();
+
+  interface ToolBlockState {
+    messageId: number;
+    groups: ToolCallGroup[];
+  }
+  const toolBlockStateByChatId = new Map<string, ToolBlockState>();
+  const toolBlockOperationByChatId = new Map<string, Promise<void>>();
+  const toolBlockPendingGroupsByChatId = new Map<string, ToolCallGroup[]>();
+
   const bufferedMediaGroups = new Map<string, BufferedMediaGroup>();
   let callbackKeyCounter = 0;
   const buttonMessages = new Map<
@@ -223,12 +253,151 @@ export function createTelegramAdapter(
     string,
     { requestId: string; action: "deny_reason" | "freeform"; buttonKey: string }
   >();
+  const pendingReasoningByChatId = new Map<string, string>();
+  const reasoningByKey = new Map<string, string>();
+  const lastSentMessageIdByConversationId = new Map<string, string>();
+
+  function startTypingInterval(chatId: string): void {
+    if (typingIntervalByChatId.has(chatId) || !bot) return;
+    const fire = () => {
+      if (!bot) return;
+      void bot.api.sendChatAction(chatId, "typing").catch(() => {});
+    };
+    fire();
+    typingIntervalByChatId.set(chatId, setInterval(fire, 4000));
+  }
+
+  function stopTypingInterval(chatId: string): void {
+    const timer = typingIntervalByChatId.get(chatId);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      typingIntervalByChatId.delete(chatId);
+    }
+  }
+
+  function scheduleToolBlockUpdate(
+    chatId: string,
+    toolName: string,
+    description?: string,
+  ): void {
+    // Accumulate into pending groups immediately (no waiting for API)
+    const base =
+      toolBlockPendingGroupsByChatId.get(chatId) ??
+      toolBlockStateByChatId.get(chatId)?.groups ??
+      [];
+    toolBlockPendingGroupsByChatId.set(
+      chatId,
+      upsertToolCallGroup(base, toolName, description),
+    );
+
+    // If a flush is already running it will pick up the latest pending state
+    if (toolBlockOperationByChatId.has(chatId)) return;
+
+    // Start a flush loop: drains pending groups, looping if more arrive during an API call
+    const operation = (async () => {
+      while (toolBlockPendingGroupsByChatId.has(chatId)) {
+        const groups = toolBlockPendingGroupsByChatId.get(chatId)!;
+        toolBlockPendingGroupsByChatId.delete(chatId);
+
+        if (!bot) break;
+        const state = toolBlockStateByChatId.get(chatId);
+        const text = renderToolBlock(groups);
+
+        try {
+          if (!state) {
+            const result = await bot.api.sendMessage(chatId, text);
+            toolBlockStateByChatId.set(chatId, {
+              messageId: result.message_id,
+              groups,
+            });
+          } else if (text.length > 3800) {
+            const freshGroups = upsertToolCallGroup([], toolName, description);
+            const freshText = renderToolBlock(freshGroups);
+            const result = await bot.api.sendMessage(chatId, freshText);
+            toolBlockStateByChatId.set(chatId, {
+              messageId: result.message_id,
+              groups: freshGroups,
+            });
+          } else {
+            await bot.api
+              .editMessageText(chatId, state.messageId, text)
+              .catch(() => {});
+            toolBlockStateByChatId.set(chatId, { ...state, groups });
+          }
+        } catch (error) {
+          console.warn(
+            `[Telegram] Failed to update tool block for ${chatId}:`,
+            error instanceof Error ? error.message : error,
+          );
+        }
+      }
+    })().finally(() => {
+      toolBlockOperationByChatId.delete(chatId);
+    });
+    toolBlockOperationByChatId.set(chatId, operation);
+  }
 
   async function ensureModule(): Promise<GrammYModule> {
     if (!botModule) {
       botModule = await loadGrammyModule();
     }
     return botModule;
+  }
+
+  async function dispatchOperatorCommand(
+    command: string,
+    args: string[],
+    chatId: string,
+  ): Promise<string> {
+    if (command === "help") {
+      return handleOperatorCommand("help", [], {
+        commandPrefix: "/",
+        agentId: "",
+        chatId,
+        client: {} as Letta,
+        getCurrentConvId: () => "default",
+        setCurrentConvId: async () => {},
+        requestCancel: () => false,
+        getConvListCache: () => null,
+        setConvListCache: () => {},
+      });
+    }
+    const registry = getChannelRegistry();
+    const route = registry?.getRoute("telegram", chatId, config.accountId);
+    if (!route) return "This chat is not connected to an agent.";
+    const client = await getClient();
+    const opCtx: OperatorCommandContext = {
+      agentId: route.agentId,
+      chatId,
+      commandPrefix: "/",
+      client,
+      getCurrentConvId: () =>
+        getChannelRegistry()?.getRoute("telegram", chatId, config.accountId)
+          ?.conversationId ?? "default",
+      setCurrentConvId: async (id) => {
+        getChannelRegistry()?.updateRouteConversation(
+          "telegram",
+          chatId,
+          config.accountId,
+          id,
+        );
+      },
+      requestCancel: () => {
+        const liveConvId =
+          getChannelRegistry()?.getRoute("telegram", chatId, config.accountId)
+            ?.conversationId ?? "default";
+        return registry?.cancelActiveRun(route.agentId, liveConvId) ?? false;
+      },
+      getConvListCache: () => convListCache.get(chatId) ?? null,
+      setConvListCache: (list) => {
+        if (list === null) {
+          convListCache.delete(chatId);
+        } else {
+          convListCache.set(chatId, list);
+        }
+      },
+    };
+    return handleOperatorCommand(command, args, opCtx);
   }
 
   async function emitInboundMessages(
@@ -477,7 +646,8 @@ export function createTelegramAdapter(
       type CallbackPayload =
         | { k: string; a: "approve" | "deny" }
         | { k: string; a: "option"; i: number }
-        | { k: string; a: "deny_reason" | "freeform" };
+        | { k: string; a: "deny_reason" | "freeform" }
+        | { k: string; a: "show_reasoning" };
 
       let payload: CallbackPayload;
       try {
@@ -488,6 +658,28 @@ export function createTelegramAdapter(
       }
 
       const { k, a: action } = payload;
+
+      if (action === "show_reasoning") {
+        const reasoning = reasoningByKey.get(k);
+        if (!reasoning) return;
+        reasoningByKey.delete(k);
+        const chatId = String(query.message?.chat.id ?? "");
+        const messageId = query.message?.message_id;
+        await instance.api
+          .sendMessage(chatId, reasoning, {
+            ...(messageId
+              ? { reply_parameters: { message_id: messageId } }
+              : {}),
+          })
+          .catch((error) => {
+            console.error(
+              "[Telegram] Failed to send reasoning reply:",
+              error instanceof Error ? error.message : error,
+            );
+          });
+        return;
+      }
+
       const buttonEntry = buttonMessages.get(k);
       if (!buttonEntry) return;
 
@@ -577,6 +769,38 @@ export function createTelegramAdapter(
       );
     });
 
+    instance.command("cancel", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("cancel", [], chatId));
+    });
+
+    instance.command("compact", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("compact", [], chatId));
+    });
+
+    instance.command("recompile", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("recompile", [], chatId));
+    });
+
+    instance.command("conv", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const args = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
+      await ctx.reply(await dispatchOperatorCommand("conv", args, chatId));
+    });
+
+    instance.command("reset", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const args = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
+      await ctx.reply(await dispatchOperatorCommand("reset", args, chatId));
+    });
+
+    instance.command("help", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      await ctx.reply(await dispatchOperatorCommand("help", [], chatId));
+    });
+
     bot = instance;
     return instance;
   }
@@ -626,12 +850,23 @@ export function createTelegramAdapter(
     },
 
     async stop(): Promise<void> {
+      for (const timer of typingIntervalByChatId.values()) {
+        clearInterval(timer);
+      }
+      typingIntervalByChatId.clear();
+      toolBlockStateByChatId.clear();
+      toolBlockOperationByChatId.clear();
+      toolBlockPendingGroupsByChatId.clear();
+      convListCache.clear();
+
       for (const entry of bufferedMediaGroups.values()) {
         clearTimeout(entry.timer);
       }
       bufferedMediaGroups.clear();
       buttonMessages.clear();
       awaitingFeedback.clear();
+      pendingReasoningByChatId.clear();
+      reasoningByKey.clear();
 
       if (!running || !bot) return;
       await bot.stop();
@@ -641,6 +876,67 @@ export function createTelegramAdapter(
 
     isRunning(): boolean {
       return running;
+    },
+
+    async handleStreamReasoning(
+      chunk: string,
+      sources: ChannelTurnSource[],
+    ): Promise<void> {
+      if (config.showReasoning === false) return;
+      for (const source of sources) {
+        pendingReasoningByChatId.set(
+          source.chatId,
+          (pendingReasoningByChatId.get(source.chatId) ?? "") + chunk,
+        );
+      }
+    },
+
+    async handleTurnLifecycleEvent(
+      event: ChannelTurnLifecycleEvent,
+    ): Promise<void> {
+      if (!running) return;
+
+      if (event.type === "queued") {
+        startTypingInterval(event.source.chatId);
+        return;
+      }
+
+      if (event.type === "processing") {
+        for (const source of event.sources) {
+          startTypingInterval(source.chatId);
+        }
+        return;
+      }
+
+      if (event.type === "tool_call") {
+        if (
+          event.toolName === "ChannelAction" ||
+          event.toolName === "NotifyUser"
+        )
+          return;
+        for (const source of event.sources) {
+          scheduleToolBlockUpdate(
+            source.chatId,
+            event.toolName,
+            event.description,
+          );
+        }
+        return;
+      }
+
+      if (event.type === "tool_started" || event.type === "tool_ended") return;
+
+      // "finished"
+      for (const source of event.sources) {
+        stopTypingInterval(source.chatId);
+
+        const pending = toolBlockOperationByChatId.get(source.chatId);
+        if (pending) await pending.catch(() => {});
+        toolBlockStateByChatId.delete(source.chatId);
+        toolBlockOperationByChatId.delete(source.chatId);
+        toolBlockPendingGroupsByChatId.delete(source.chatId);
+        pendingReasoningByChatId.delete(source.chatId);
+      }
     },
 
     async sendMessage(
@@ -741,6 +1037,22 @@ export function createTelegramAdapter(
         opts.parse_mode = msg.parseMode;
       }
 
+      const pendingReasoning = pendingReasoningByChatId.get(msg.chatId);
+      if (pendingReasoning) {
+        const key = (callbackKeyCounter++).toString(36);
+        reasoningByKey.set(key, pendingReasoning);
+        opts.reply_markup = {
+          inline_keyboard: [
+            [
+              {
+                text: "🧠 Show reasoning",
+                callback_data: JSON.stringify({ k: key, a: "show_reasoning" }),
+              },
+            ],
+          ],
+        };
+      }
+
       const result = await telegramBot.api.sendMessage(
         msg.chatId,
         msg.text,
@@ -765,6 +1077,27 @@ export function createTelegramAdapter(
         text,
         reply_parameters ? { reply_parameters } : {},
       );
+    },
+
+    async handleAutoForward(
+      text: string,
+      sources: ChannelTurnSource[],
+    ): Promise<string | undefined> {
+      const source = sources[0];
+      if (!source) return undefined;
+      const telegramBot = await ensureBot();
+      const result = await telegramBot.api.sendMessage(
+        source.chatId,
+        markdownToTelegramHtml(text),
+        { parse_mode: "HTML" },
+      );
+      const messageId = String(result.message_id);
+      lastSentMessageIdByConversationId.set(source.conversationId, messageId);
+      return messageId;
+    },
+
+    getLastSentMessageId(conversationId: string): string | null {
+      return lastSentMessageIdByConversationId.get(conversationId) ?? null;
     },
 
     async handleControlRequestEvent(

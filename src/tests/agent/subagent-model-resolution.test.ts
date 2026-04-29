@@ -2,6 +2,10 @@ import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import type { SubagentConfig } from "../../agent/subagents";
 import {
+  estimateStartupContextTokens,
+  REFLECTION_STARTUP_CONTEXT_TOKEN_LIMIT,
+} from "../../agent/subagents/contextBudget";
+import {
   buildSubagentArgs,
   resolveSubagentLauncher,
   resolveSubagentModel,
@@ -233,6 +237,42 @@ describe("buildSubagentArgs", () => {
     expect(args).toContain("--permission-mode");
     expect(args).toContain("memory");
   });
+
+  test("caps reflection system prompt plus initial message to startup budget", () => {
+    const systemPrompt = "system ".repeat(1_000);
+    const memoryPreview = `<parent_memory>\n<memory_filesystem>\n/memory/\n└── system/\n</memory_filesystem>\n${"memory ".repeat(40_000)}\n</parent_memory>`;
+    const userPrompt = `Review transcript at /tmp/payload.json\n\n${memoryPreview}`;
+
+    const args = buildSubagentArgs(
+      "reflection",
+      { ...baseConfig, name: "reflection", systemPrompt },
+      null,
+      userPrompt,
+    );
+    const promptArg = args[args.indexOf("-p") + 1] ?? "";
+
+    expect(
+      estimateStartupContextTokens(`${systemPrompt}\n${promptArg}`),
+    ).toBeLessThanOrEqual(REFLECTION_STARTUP_CONTEXT_TOKEN_LIMIT);
+    expect(promptArg).toContain("Review transcript at /tmp/payload.json");
+    expect(promptArg).toContain("<parent_memory>");
+    expect(promptArg).toContain("<memory_filesystem>");
+    expect(promptArg).toContain("Reflection startup context truncated");
+    expect(promptArg.length).toBeLessThan(userPrompt.length);
+  });
+
+  test("does not cap non-reflection initial messages", () => {
+    const longPrompt = "prompt ".repeat(40_000);
+    const args = buildSubagentArgs(
+      "general-purpose",
+      baseConfig,
+      null,
+      longPrompt,
+    );
+    const promptArg = args[args.indexOf("-p") + 1] ?? "";
+
+    expect(promptArg).toBe(longPrompt);
+  });
 });
 
 describe("resolveSubagentModel", () => {
@@ -311,14 +351,17 @@ describe("resolveSubagentModel", () => {
     expect(result).toBe("lc-anthropic/test-model");
   });
 
-  test("uses recommended model when parent is not BYOK and model is available", async () => {
+  test("inherits parent model when parent is not BYOK, regardless of recommended model", async () => {
     const result = await resolveSubagentModel({
       recommendedModel: "anthropic/test-model",
       parentModelHandle: "anthropic/parent-model",
-      availableHandles: new Set(["anthropic/test-model"]),
+      availableHandles: new Set([
+        "anthropic/test-model",
+        "anthropic/parent-model",
+      ]),
     });
 
-    expect(result).toBe("anthropic/test-model");
+    expect(result).toBe("anthropic/parent-model");
   });
 
   test("explicit user model overrides all other resolution", async () => {
@@ -446,5 +489,24 @@ describe("resolveSubagentModel", () => {
     );
 
     expect(result).toBe("anthropic/test-model");
+  });
+
+  test("reflection falls back to parentModelHandle when letta/auto-memory is unavailable", async () => {
+    const result = await resolveSubagentModel({
+      subagentType: "reflection",
+      parentModelHandle: "anthropic/claude-sonnet-4-6",
+      availableHandles: new Set(["anthropic/claude-sonnet-4-6"]), // no letta/auto-memory
+    });
+
+    expect(result).toBe("anthropic/claude-sonnet-4-6");
+  });
+
+  test("reflection falls back to null when letta/auto-memory and parentModelHandle are both unavailable", async () => {
+    const result = await resolveSubagentModel({
+      subagentType: "reflection",
+      availableHandles: new Set(["anthropic/claude-sonnet-4-6"]), // no letta/auto-memory, no parent
+    });
+
+    expect(result).toBeNull();
   });
 });

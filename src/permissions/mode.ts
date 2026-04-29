@@ -3,6 +3,7 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
+import { canonicalToolName } from "./canonical";
 import { extractApplyPatchPaths } from "./crossAgentGuard";
 import {
   isPathWithinRoots,
@@ -403,14 +404,12 @@ class PermissionModeManager {
         // Allow Task tool with read-only subagent types
         // These subagents only have access to read-only tools (Glob, Grep, Read, LS, TaskOutput)
         const readOnlySubagentTypes = new Set([
-          "explore",
-          "Explore",
           "plan",
           "Plan",
           "recall",
           "Recall",
         ]);
-        if (toolName === "Task" || toolName === "task") {
+        if (canonicalToolName(toolName) === "Task") {
           const subagentType = toolArgs?.subagent_type as string | undefined;
           if (subagentType && readOnlySubagentTypes.has(subagentType)) {
             return "allow";

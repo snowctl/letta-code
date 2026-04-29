@@ -35,7 +35,11 @@ import {
   removePendingControlRequest as removePersistedPendingControlRequest,
   upsertPendingControlRequest as upsertPersistedPendingControlRequest,
 } from "./pendingControlRequests";
-import { loadChannelPlugin } from "./pluginRegistry";
+import {
+  getChannelDisplayName,
+  isSupportedChannelId,
+  loadChannelPlugin,
+} from "./pluginRegistry";
 import {
   addRoute,
   getRoute as getRouteFromStore,
@@ -43,6 +47,7 @@ import {
   getRoutesForChannel,
   loadRoutes,
   removeRouteInMemory,
+  saveRoutes,
   setRouteInMemory,
 } from "./routing";
 import { loadTargetStore, upsertChannelTarget } from "./targets";
@@ -60,9 +65,9 @@ import type {
 import { formatChannelNotification } from "./xml";
 
 function channelDisplayName(channelId: string): string {
-  if (channelId === "slack") return "Slack";
-  if (channelId === "discord") return "Discord";
-  return "Telegram";
+  return isSupportedChannelId(channelId)
+    ? getChannelDisplayName(channelId)
+    : channelId;
 }
 
 function buildPairingInstructions(channelId: string, code: string): string {
@@ -126,6 +131,27 @@ export function buildSlackConversationSummary(
   }
 
   return `[Slack] Thread${channelLabel || ` ${msg.chatId}`}`;
+}
+
+function buildDiscordConversationSummary(
+  msg: Pick<
+    InboundChannelMessage,
+    "chatId" | "chatLabel" | "chatType" | "senderId" | "senderName" | "text"
+  >,
+): string {
+  if (msg.chatType === "direct") {
+    return `[Discord] DM with ${msg.senderName?.trim() || msg.senderId}`;
+  }
+
+  const preview = truncateChannelSummaryPreview(msg.text);
+  const channelLabel =
+    msg.chatLabel && msg.chatLabel !== msg.chatId ? ` in ${msg.chatLabel}` : "";
+
+  if (preview) {
+    return `[Discord] Thread${channelLabel}: ${preview}`;
+  }
+
+  return `[Discord] Thread${channelLabel || ` ${msg.chatId}`}`;
 }
 
 function buildChannelTurnSource(
@@ -194,6 +220,10 @@ export type ChannelApprovalResponseHandler = (params: {
   };
   response: ApprovalResponseBody;
 }) => Promise<boolean>;
+export type ChannelCancelHandler = (
+  agentId: string,
+  conversationId: string,
+) => boolean;
 
 type PendingChannelControlRequest = {
   event: ChannelControlRequestEvent;
@@ -216,6 +246,14 @@ export type ChannelRegistryEvent =
       agentId: string;
       conversationId: string;
       defaultPermissionMode: SlackDefaultPermissionMode;
+    }
+  | {
+      type: "channel_permission_mode_set";
+      channelId: string;
+      accountId: string;
+      agentId: string;
+      conversationId: string;
+      defaultPermissionMode: SlackDefaultPermissionMode;
     };
 
 // ── Registry ──────────────────────────────────────────────────────
@@ -232,6 +270,11 @@ export class ChannelRegistry {
     PendingChannelControlRequest
   >();
   private readonly pendingControlRequestIdByScope = new Map<string, string>();
+  private readonly activeTurnContextByConversationId = new Map<
+    string,
+    ChannelTurnSource
+  >();
+  private cancelHandler: ChannelCancelHandler | null = null;
 
   constructor() {
     if (instance) {
@@ -275,6 +318,30 @@ export class ChannelRegistry {
     return Array.from(this.adapters.values())
       .filter((adapter) => adapter.isRunning())
       .map((adapter) => adapter.channelId ?? adapter.id);
+  }
+
+  setActiveTurnContext(
+    conversationId: string,
+    source: ChannelTurnSource,
+  ): void {
+    this.activeTurnContextByConversationId.set(conversationId, source);
+  }
+
+  clearActiveTurnContext(conversationId: string): void {
+    this.activeTurnContextByConversationId.delete(conversationId);
+  }
+
+  getActiveTurnContext(conversationId: string): ChannelTurnSource | null {
+    return this.activeTurnContextByConversationId.get(conversationId) ?? null;
+  }
+
+  getLastSentMessageId(
+    channel: string,
+    accountId: string | undefined,
+    conversationId: string,
+  ): string | null {
+    const adapter = this.getAdapter(channel, accountId);
+    return adapter?.getLastSentMessageId?.(conversationId) ?? null;
   }
 
   async dispatchTurnLifecycleEvent(
@@ -342,6 +409,175 @@ export class ChannelRegistry {
     }
   }
 
+  async dispatchStreamText(
+    text: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void> {
+    const groups = new Map<
+      string,
+      { adapter: ChannelAdapter; sources: ChannelTurnSource[] }
+    >();
+
+    for (const source of sources) {
+      const adapter = this.getAdapter(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      if (!adapter?.handleStreamText) {
+        continue;
+      }
+      const groupKey = this.getAdapterKey(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      const existing = groups.get(groupKey);
+      if (existing) {
+        existing.sources.push(source);
+        continue;
+      }
+      groups.set(groupKey, { adapter, sources: [source] });
+    }
+
+    for (const { adapter, sources: groupedSources } of groups.values()) {
+      const { handleStreamText } = adapter;
+      if (!handleStreamText) continue;
+      try {
+        await handleStreamText(text, groupedSources);
+      } catch (error) {
+        console.error(
+          `[Channels] Failed to dispatch stream text for ${adapter.channelId ?? adapter.id}/${adapter.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
+  async dispatchStreamReset(sources: ChannelTurnSource[]): Promise<void> {
+    const groups = new Map<
+      string,
+      { adapter: ChannelAdapter; sources: ChannelTurnSource[] }
+    >();
+
+    for (const source of sources) {
+      const adapter = this.getAdapter(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      if (!adapter?.handleStreamReset) {
+        continue;
+      }
+      const groupKey = this.getAdapterKey(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      const existing = groups.get(groupKey);
+      if (existing) {
+        existing.sources.push(source);
+        continue;
+      }
+      groups.set(groupKey, { adapter, sources: [source] });
+    }
+
+    for (const { adapter, sources: groupedSources } of groups.values()) {
+      const { handleStreamReset } = adapter;
+      if (!handleStreamReset) continue;
+      try {
+        await handleStreamReset(groupedSources);
+      } catch (error) {
+        console.error(
+          `[Channels] Failed to dispatch stream reset for ${adapter.channelId ?? adapter.id}/${adapter.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
+  async dispatchStreamReasoning(
+    chunk: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void> {
+    const groups = new Map<
+      string,
+      { adapter: ChannelAdapter; sources: ChannelTurnSource[] }
+    >();
+
+    for (const source of sources) {
+      const adapter = this.getAdapter(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      if (!adapter?.handleStreamReasoning) {
+        continue;
+      }
+      const groupKey = this.getAdapterKey(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      const existing = groups.get(groupKey);
+      if (existing) {
+        existing.sources.push(source);
+        continue;
+      }
+      groups.set(groupKey, { adapter, sources: [source] });
+    }
+
+    for (const { adapter, sources: groupedSources } of groups.values()) {
+      const { handleStreamReasoning } = adapter;
+      if (!handleStreamReasoning) continue;
+      try {
+        await handleStreamReasoning(chunk, groupedSources);
+      } catch (error) {
+        console.error(
+          `[Channels] Failed to dispatch reasoning for ${adapter.channelId ?? adapter.id}/${adapter.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
+  async dispatchAutoForward(
+    text: string,
+    sources: ChannelTurnSource[],
+  ): Promise<void> {
+    const groups = new Map<
+      string,
+      { adapter: ChannelAdapter; sources: ChannelTurnSource[] }
+    >();
+
+    for (const source of sources) {
+      const adapter = this.getAdapter(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      if (!adapter?.handleAutoForward) {
+        continue;
+      }
+      const groupKey = this.getAdapterKey(
+        source.channel,
+        source.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID,
+      );
+      const existing = groups.get(groupKey);
+      if (existing) {
+        existing.sources.push(source);
+        continue;
+      }
+      groups.set(groupKey, { adapter, sources: [source] });
+    }
+
+    for (const { adapter, sources: groupedSources } of groups.values()) {
+      const { handleAutoForward } = adapter;
+      if (!handleAutoForward) continue;
+      try {
+        await handleAutoForward(text, groupedSources);
+      } catch (error) {
+        console.error(
+          `[Channels] dispatchAutoForward failed for ${adapter.channelId ?? adapter.id}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
   // ── Readiness / ingress handler ───────────────────────────────
 
   /**
@@ -356,6 +592,30 @@ export class ChannelRegistry {
     handler: ChannelApprovalResponseHandler | null,
   ): void {
     this.approvalResponseHandler = handler;
+  }
+
+  setCancelHandler(fn: ChannelCancelHandler | null): void {
+    this.cancelHandler = fn;
+  }
+
+  cancelActiveRun(agentId: string, conversationId: string): boolean {
+    return this.cancelHandler?.(agentId, conversationId) ?? false;
+  }
+
+  updateRouteConversation(
+    channel: string,
+    chatId: string,
+    accountId: string,
+    conversationId: string,
+  ): void {
+    const route = getRouteRaw(channel, chatId, accountId);
+    if (!route) return;
+    setRouteInMemory(channel, {
+      ...route,
+      conversationId,
+      updatedAt: new Date().toISOString(),
+    });
+    saveRoutes(channel);
   }
 
   setEventHandler(
@@ -643,6 +903,7 @@ export class ChannelRegistry {
     this.messageHandler = null;
     this.eventHandler = null;
     this.approvalResponseHandler = null;
+    this.cancelHandler = null;
   }
 
   /**
@@ -659,6 +920,7 @@ export class ChannelRegistry {
     this.messageHandler = null;
     this.eventHandler = null;
     this.approvalResponseHandler = null;
+    this.cancelHandler = null;
     this.pendingControlRequestsById.clear();
     this.pendingControlRequestIdByScope.clear();
     instance = null;
@@ -761,12 +1023,13 @@ export class ChannelRegistry {
       return;
     }
 
-    // Discord guild messages use auto-routing (like Slack).
-    // DMs fall through to the standard pairing flow below.
+    // Discord guild messages and account-bound DMs use auto-routing (like
+    // Slack). DMs configured with explicit pairing fall through to the
+    // standard pairing flow below.
     if (
       msg.channel === "discord" &&
       config.channel === "discord" &&
-      msg.chatType === "channel"
+      (msg.chatType === "channel" || config.dmPolicy !== "pairing")
     ) {
       const discordResult = await this.ensureDiscordRoute(adapter, msg, config);
       if (!discordResult) {
@@ -853,10 +1116,25 @@ export class ChannelRegistry {
       return;
     }
 
-    // 3. Format as XML
+    // 3. Apply account-level default permission mode if configured.
+    const mode = (
+      config as { defaultPermissionMode?: SlackDefaultPermissionMode }
+    ).defaultPermissionMode;
+    if (mode && mode !== "default") {
+      this.eventHandler?.({
+        type: "channel_permission_mode_set",
+        channelId: msg.channel,
+        accountId,
+        agentId: route.agentId,
+        conversationId: route.conversationId,
+        defaultPermissionMode: mode,
+      });
+    }
+
+    // 4. Format as XML
     const content = formatChannelNotification(msg);
 
-    // 4. Deliver or buffer
+    // 5. Deliver or buffer
     this.deliverOrBuffer({
       route,
       content,
@@ -1016,7 +1294,7 @@ export class ChannelRegistry {
 
     const conversationId = await this.createConversationForAgent(
       config.agentId,
-      `[Discord] Thread ${msg.chatLabel ?? msg.chatId}`,
+      buildDiscordConversationSummary(msg),
     );
     const now = new Date().toISOString();
     const route: ChannelRoute = {
@@ -1052,6 +1330,18 @@ export class ChannelRegistry {
       return null;
     }
 
+    if (
+      msg.chatType === "direct" &&
+      config.dmPolicy === "allowlist" &&
+      !config.allowedUsers.includes(msg.senderId)
+    ) {
+      await adapter.sendDirectReply(
+        msg.chatId,
+        "You are not on the allowed users list for this Discord bot.",
+      );
+      return null;
+    }
+
     const accountId = msg.accountId ?? LEGACY_CHANNEL_ACCOUNT_ID;
     const routeThreadId = msg.threadId ?? null;
     let route = getRouteFromStore(
@@ -1074,9 +1364,9 @@ export class ChannelRegistry {
       return { route, isFirstRouteTurn: false };
     }
 
-    // Only create routes from explicit mentions.
+    // In guild channels, only create routes from explicit mentions.
     // Existing routed threads continue above via the route lookup path.
-    if (!msg.isMention) {
+    if (msg.chatType === "channel" && !msg.isMention) {
       return null;
     }
 

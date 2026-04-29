@@ -1,15 +1,21 @@
 /**
- * XML formatting for channel notifications.
+ * Envelope formatting for inbound channel messages.
  *
- * Produces structured XML that the agent receives as message content.
- * Follows the same escaping patterns used in taskNotifications.ts.
+ * Produces a system-reminder block (sectioned markdown: metadata + chat
+ * context + response directives) followed by the user's bare message text.
+ * The structure is modeled on Lettabot's pattern: instructions and metadata
+ * live inside the system-reminder; the user's actual words live outside it
+ * as plain text — same shape as a normal user turn. This keeps the model
+ * from having to parse two layers of XML to find what was said, and gives
+ * it a clear `Stay silent` affordance to avoid replaying old messages on
+ * autonomous re-triggers.
  */
 
 import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
-import { getLocalTime } from "../cli/helpers/sessionContext";
 import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "../constants";
 import type {
   ChannelMessageAttachment,
+  ChannelThreadContext,
   ChannelThreadContextEntry,
   InboundChannelMessage,
 } from "./types";
@@ -32,137 +38,157 @@ function escapeXmlAttribute(text: string): string {
   return escapeXmlText(text).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
+// ── system-reminder builders ─────────────────────────────────────────────────
+
+function formatReceivedAt(timestamp: number): string {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
+  const d = new Date(timestamp);
+  const iso = d.toISOString();
+  const local = d.toLocaleString(undefined, {
+    weekday: "short",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+  return `${iso} (${local})`;
+}
+
+function buildMetadataLines(msg: InboundChannelMessage): string[] {
+  const lines: string[] = [];
+  lines.push(`- **Channel**: ${msg.channel}`);
+  lines.push(`- **Chat ID**: ${msg.chatId}`);
+  if (msg.accountId) lines.push(`- **Account ID**: ${msg.accountId}`);
+  const sender = msg.senderName
+    ? `${msg.senderName} (${msg.senderId})`
+    : msg.senderId;
+  lines.push(`- **Sender**: ${sender}`);
+  if (msg.messageId) lines.push(`- **Message ID**: ${msg.messageId}`);
+  if (msg.threadId) lines.push(`- **Thread ID**: ${msg.threadId}`);
+  const received = formatReceivedAt(msg.timestamp);
+  if (received) lines.push(`- **Received at**: ${received}`);
+  return lines;
+}
+
+function buildChatContextLines(msg: InboundChannelMessage): string[] {
+  const lines: string[] = [];
+  const chatType = msg.chatType ?? "direct";
+  if (chatType === "channel") {
+    lines.push(`- **Type**: Group/channel`);
+    if (msg.chatLabel) lines.push(`- **Label**: ${msg.chatLabel}`);
+    if (msg.isMention) lines.push(`- **Mentioned**: yes`);
+  } else {
+    lines.push(`- **Type**: Direct message`);
+  }
+
+  if (msg.reaction) {
+    const senderName = msg.senderName ?? msg.senderId;
+    lines.push(
+      `- **Reaction event**: ${senderName} ${msg.reaction.action} \`${msg.reaction.emoji}\` on message \`${msg.reaction.targetMessageId}\``,
+    );
+  }
+
+  if (msg.attachments?.length) {
+    for (const att of msg.attachments) {
+      const parts: string[] = [
+        `kind=${att.kind}`,
+        `local_path=${att.localPath}`,
+      ];
+      if (att.mimeType) parts.push(`mime_type=${att.mimeType}`);
+      if (typeof att.sizeBytes === "number")
+        parts.push(`size=${att.sizeBytes}`);
+      if (att.name) parts.push(`name=${att.name}`);
+      lines.push(`- **Attachment**: ${parts.join(", ")}`);
+      if (att.transcription) {
+        lines.push(`  - Transcription: ${JSON.stringify(att.transcription)}`);
+      }
+    }
+  }
+
+  // Slack: replies in a threaded channel stay in-thread automatically.
+  const threadKey = msg.threadId ?? msg.messageId;
+  if (msg.channel === "slack" && chatType === "channel" && threadKey?.trim()) {
+    lines.push(
+      "- **Slack threading**: your reply will stay in this thread automatically",
+    );
+  }
+
+  return lines;
+}
+
+function emojiHintForChannel(channel: string): string {
+  if (channel === "slack") {
+    return "a reaction name like `thumbsup` or `eyes`";
+  }
+  if (channel === "discord") {
+    return "a unicode emoji or custom emoji syntax like `<:name:id>`";
+  }
+  return "a unicode emoji";
+}
+
+function buildResponseDirectives(msg: InboundChannelMessage): string[] {
+  const emojiHint = emojiHintForChannel(msg.channel);
+  const lines = [
+    "**Responding:**",
+    "- Your response text is delivered automatically to the user — just write your reply.",
+    "- To stay silent (e.g. the message wasn't for you, or no reply is needed), produce no response text.",
+    `- Use \`ChannelAction\` with \`action="react"\` for acknowledgments instead of a short text reply — set \`emoji\` to ${emojiHint}.`,
+    `- Use \`ChannelAction\` with \`action="thread-reply"\` to reply into a specific thread rather than the main chat.`,
+    `- Use \`ChannelAction\` with \`action="edit"\` to edit your most recently sent message.`,
+  ];
+  if (msg.attachments?.length) {
+    lines.push(
+      "- Use local file/image tools (e.g. `Read`, `ViewImage`) to inspect attachments listed in the chat context above.",
+    );
+  }
+  return lines;
+}
+
 /**
- * Format the reminder text that explains channel reply semantics to the agent.
+ * Build the system-reminder block: sectioned markdown with metadata, chat
+ * context, and response directives. The user's actual message text is *not*
+ * included here — it lives outside the reminder, emitted by
+ * `buildChannelMessageBody`.
  */
 export function buildChannelReminderText(msg: InboundChannelMessage): string {
-  const localTime = escapeXmlText(getLocalTime());
-  const escapedChannel = escapeXmlText(msg.channel);
-  const escapedChatId = escapeXmlText(msg.chatId);
-  const threadLine =
-    msg.channel === "slack" &&
-    msg.chatType === "channel" &&
-    (msg.threadId ?? msg.messageId)?.trim()
-      ? "Replies sent with MessageChannel will stay in the same Slack thread automatically."
-      : null;
-
-  const lines = [
+  const sections: string[] = [];
+  sections.push(`## Message Metadata\n${buildMetadataLines(msg).join("\n")}`);
+  const ctx = buildChatContextLines(msg);
+  if (ctx.length > 0) sections.push(`## Chat Context\n${ctx.join("\n")}`);
+  sections.push(
+    `## Response Directives\n${buildResponseDirectives(msg).join("\n")}`,
+  );
+  return [
     SYSTEM_REMINDER_OPEN,
-    `This message originated from an external ${escapedChannel} channel.`,
-    `If you want to ensure the user on ${escapedChannel} will see your reply, you must call the MessageChannel tool to send a message back on the same channel.`,
-    `Use action="send", channel="${escapedChannel}", and chat_id="${escapedChatId}" when calling MessageChannel, and put your reply text in message.`,
-    "Only pass replyTo if you intentionally want the platform's quote/reply UI.",
-    `Current local time on this device: ${localTime}`,
+    sections.join("\n\n"),
     SYSTEM_REMINDER_CLOSE,
-  ];
-
-  if (threadLine) {
-    lines.splice(lines.length - 2, 0, threadLine);
-  }
-  if (msg.channel === "slack") {
-    lines.splice(
-      lines.length - 2,
-      0,
-      'On Slack, MessageChannel also supports action="react" with emoji + messageId, and action="upload-file" with media.',
-    );
-  }
-  if (msg.channel === "telegram") {
-    lines.splice(
-      lines.length - 2,
-      0,
-      'On Telegram, MessageChannel also supports action="react" with emoji + messageId, and action="upload-file" with media.',
-    );
-  }
-  if (msg.channel === "discord") {
-    lines.splice(
-      lines.length - 2,
-      0,
-      'On Discord, MessageChannel also supports action="react" with emoji + messageId, and action="upload-file" with media. Discord reactions accept native Unicode emoji and custom emoji syntax like <:name:id>.',
-    );
-  }
-  if (msg.attachments?.length) {
-    lines.splice(
-      lines.length - 2,
-      0,
-      "If this notification includes attachment local_path values, you can inspect those files with the Read tool.",
-    );
-  }
-
-  return lines.join("\n");
+  ].join("\n");
 }
 
-function buildAttachmentXml(attachment: ChannelMessageAttachment): string {
-  const attrs = [
-    `kind="${escapeXmlAttribute(attachment.kind)}"`,
-    `local_path="${escapeXmlAttribute(attachment.localPath)}"`,
-  ];
-
-  if (attachment.id) {
-    attrs.push(`attachment_id="${escapeXmlAttribute(attachment.id)}"`);
-  }
-  if (attachment.name) {
-    attrs.push(`name="${escapeXmlAttribute(attachment.name)}"`);
-  }
-  if (attachment.mimeType) {
-    attrs.push(`mime_type="${escapeXmlAttribute(attachment.mimeType)}"`);
-  }
-  if (typeof attachment.sizeBytes === "number") {
-    attrs.push(`size_bytes="${attachment.sizeBytes}"`);
-  }
-
-  if (attachment.transcription) {
-    const escapedTranscription = escapeXmlText(attachment.transcription);
-    return `<attachment ${attrs.join(" ")}>\n  <attempted_transcription>${escapedTranscription}</attempted_transcription>\n</attachment>`;
-  }
-
-  return `<attachment ${attrs.join(" ")} />`;
-}
-
-function buildReactionXml(msg: InboundChannelMessage): string | null {
-  if (!msg.reaction) {
-    return null;
-  }
-
-  const attrs = [
-    `action="${escapeXmlAttribute(msg.reaction.action)}"`,
-    `emoji="${escapeXmlAttribute(msg.reaction.emoji)}"`,
-    `target_message_id="${escapeXmlAttribute(msg.reaction.targetMessageId)}"`,
-  ];
-
-  if (msg.reaction.targetSenderId) {
-    attrs.push(
-      `target_sender_id="${escapeXmlAttribute(msg.reaction.targetSenderId)}"`,
-    );
-  }
-
-  return `<reaction ${attrs.join(" ")} />`;
-}
+// ── message-body builders ────────────────────────────────────────────────────
 
 function buildThreadContextEntryXml(
   tagName: string,
   entry: ChannelThreadContextEntry,
 ): string {
   const attrs: string[] = [];
-  if (entry.senderId) {
+  if (entry.senderId)
     attrs.push(`sender_id="${escapeXmlAttribute(entry.senderId)}"`);
-  }
   if (entry.senderName) {
     attrs.push(`sender_name="${escapeXmlAttribute(entry.senderName)}"`);
   }
   if (entry.messageId) {
     attrs.push(`message_id="${escapeXmlAttribute(entry.messageId)}"`);
   }
-
   const attrString = attrs.length > 0 ? ` ${attrs.join(" ")}` : "";
   return `<${tagName}${attrString}>\n${escapeXmlText(entry.text)}\n</${tagName}>`;
 }
 
-function buildThreadContextXml(msg: InboundChannelMessage): string | null {
-  const threadContext = msg.threadContext;
-  if (!threadContext) {
-    return null;
-  }
-
+function buildThreadContextXml(
+  threadContext: ChannelThreadContext,
+): string | null {
   const parts: string[] = [];
   if (threadContext.starter) {
     parts.push(
@@ -181,11 +207,7 @@ function buildThreadContextXml(msg: InboundChannelMessage): string | null {
       ].join("\n"),
     );
   }
-
-  if (parts.length === 0) {
-    return null;
-  }
-
+  if (parts.length === 0) return null;
   const attrs = threadContext.label
     ? ` label="${escapeXmlAttribute(threadContext.label)}"`
     : "";
@@ -193,82 +215,73 @@ function buildThreadContextXml(msg: InboundChannelMessage): string | null {
 }
 
 /**
- * Format an inbound channel message as XML for the agent.
- *
- * Example output:
- * ```xml
- * <channel-notification source="telegram" chat_id="12345" sender_id="67890" sender_name="John">
- * Hello from Telegram!
- * </channel-notification>
- * ```
+ * Build the message-body part: thread context (if any) followed by the
+ * user's bare message text. Returns an empty string when the message has no
+ * text and no thread context (e.g. a reaction-only event — its details are
+ * already in the system-reminder's Chat Context section).
  */
-export function buildChannelNotificationXml(
-  msg: InboundChannelMessage,
-): string {
-  const attrs: string[] = [
-    `source="${escapeXmlAttribute(msg.channel)}"`,
-    `chat_id="${escapeXmlAttribute(msg.chatId)}"`,
-    `sender_id="${escapeXmlAttribute(msg.senderId)}"`,
-  ];
-
-  if (msg.senderName) {
-    attrs.push(`sender_name="${escapeXmlAttribute(msg.senderName)}"`);
+export function buildChannelMessageBody(msg: InboundChannelMessage): string {
+  const parts: string[] = [];
+  if (msg.threadContext) {
+    const threadXml = buildThreadContextXml(msg.threadContext);
+    if (threadXml) parts.push(threadXml);
   }
+  const text = msg.text?.trim();
+  if (text) parts.push(text);
+  return parts.join("\n\n");
+}
 
-  if (msg.messageId) {
-    attrs.push(`message_id="${escapeXmlAttribute(msg.messageId)}"`);
-  }
+// ── top-level formatter ──────────────────────────────────────────────────────
 
-  if (msg.threadId) {
-    attrs.push(`thread_id="${escapeXmlAttribute(msg.threadId)}"`);
-  }
-
-  const attrString = attrs.join(" ");
-  const escapedText = msg.text ? escapeXmlText(msg.text) : "";
-  const reactionXml = buildReactionXml(msg);
-  const threadContextXml = buildThreadContextXml(msg);
-  const attachmentXml = (msg.attachments ?? []).map(buildAttachmentXml);
-  const body = [threadContextXml, reactionXml, ...attachmentXml, escapedText]
-    .filter(Boolean)
-    .join("\n");
-
-  return `<channel-notification ${attrString}>\n${body}\n</channel-notification>`;
+function imageContentParts(
+  attachments: ChannelMessageAttachment[] | undefined,
+) {
+  if (!attachments?.length) return [];
+  return attachments.flatMap((attachment) => {
+    if (
+      attachment.kind !== "image" ||
+      typeof attachment.imageDataBase64 !== "string" ||
+      attachment.imageDataBase64.length === 0 ||
+      typeof attachment.mimeType !== "string" ||
+      !attachment.mimeType.startsWith("image/")
+    ) {
+      return [];
+    }
+    return [
+      {
+        type: "image" as const,
+        source: {
+          type: "base64" as const,
+          media_type: attachment.mimeType,
+          data: attachment.imageDataBase64,
+        },
+      },
+    ];
+  });
 }
 
 /**
  * Format an inbound channel message as structured content parts.
  *
- * The reminder and the notification XML are emitted as separate text parts so
- * UIs that already know how to hide pure system-reminder parts can do so
- * without needing to parse concatenated XML blobs.
+ * Output layout:
+ *   1. Reminder text — system-reminder with sectioned-markdown metadata,
+ *      chat context, and response directives.
+ *   2. Message body  — thread-context XML (if any) + the user's bare text.
+ *      Skipped entirely when the body would be empty (e.g. reaction-only
+ *      events have no body — the reaction is described in chat context).
+ *   3. Image content parts — one per inline-decodable image attachment.
  */
 export function formatChannelNotification(
   msg: InboundChannelMessage,
 ): MessageCreate["content"] {
+  const reminderText = buildChannelReminderText(msg);
+  const bodyText = buildChannelMessageBody(msg);
+  const textParts: Array<{ type: "text"; text: string }> = [
+    { type: "text", text: reminderText },
+  ];
+  if (bodyText) textParts.push({ type: "text", text: bodyText });
   return [
-    { type: "text", text: buildChannelReminderText(msg) },
-    { type: "text", text: buildChannelNotificationXml(msg) },
-    ...(msg.attachments ?? []).flatMap((attachment) => {
-      if (
-        attachment.kind !== "image" ||
-        typeof attachment.imageDataBase64 !== "string" ||
-        attachment.imageDataBase64.length === 0 ||
-        typeof attachment.mimeType !== "string" ||
-        !attachment.mimeType.startsWith("image/")
-      ) {
-        return [];
-      }
-
-      return [
-        {
-          type: "image" as const,
-          source: {
-            type: "base64" as const,
-            media_type: attachment.mimeType,
-            data: attachment.imageDataBase64,
-          },
-        },
-      ];
-    }),
+    ...textParts,
+    ...imageContentParts(msg.attachments),
   ] as MessageCreate["content"];
 }

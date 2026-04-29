@@ -100,7 +100,7 @@ async function buildSecretsInfoReminder(
     }
 
     const list = names.map((n) => `- \`$${n}\``).join("\n");
-    return `${SYSTEM_REMINDER_OPEN}Use \`$SECRET_NAME\` syntax in shell commands to reference these secrets:\n\n${list}\n\nThe actual secret value will be automatically substituted before the command runs, and scrubbed from the output. You never see the real value — just use \`$SECRET_NAME\` directly (e.g. \`curl -H "Authorization: Bearer $MY_API_KEY" ...\`).\n${SYSTEM_REMINDER_CLOSE}`;
+    return `${SYSTEM_REMINDER_OPEN}\nThe following secrets are set on your agent and available for use.\nReference them with \`$SECRET_NAME\` in shell commands — substitution happens automatically at exec time:\n${list}\n\nYou cannot read the raw values. If a value would appear in tool output, you will see \`NAME=<REDACTED>\` instead. This means the secret IS set and working — the bytes are just hidden from your context. Keep using \`$NAME\`; it will resolve correctly.\n${SYSTEM_REMINDER_CLOSE}`;
   } catch (error) {
     debugLog(
       "secrets",
@@ -426,16 +426,72 @@ export function prependReminderPartsToContent(
     return content;
   }
 
+  // Extract the text between <system-reminder> … </system-reminder> tags.
+  // Returns null when the text is not a system-reminder block.
+  function extractSystemReminderInner(text: string): string | null {
+    const startIdx = text.indexOf(SYSTEM_REMINDER_OPEN);
+    const endIdx = text.lastIndexOf(SYSTEM_REMINDER_CLOSE);
+    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) return null;
+    return text
+      .slice(startIdx + SYSTEM_REMINDER_OPEN.length, endIdx)
+      .trim();
+  }
+
+  // Split reminder parts: system-reminder-wrapped → merge into one block;
+  // everything else (e.g. <skills>) → keep as separate prepended parts.
+  const mergedInnerSections: string[] = [];
+  const nonSrReminderParts: ReminderTextPart[] = [];
+
+  for (const part of reminderParts) {
+    const inner = extractSystemReminderInner(part.text);
+    if (inner !== null) {
+      mergedInnerSections.push(inner);
+    } else {
+      nonSrReminderParts.push(part);
+    }
+  }
+
+  // Normalize content to a mutable array
+  type ContentItem = Record<string, unknown>;
+  let contentArray: ContentItem[];
   if (typeof content === "string") {
-    return [
-      ...reminderParts,
-      { type: "text", text: content },
-    ] as MessageCreate["content"];
+    contentArray = [{ type: "text", text: content }];
+  } else if (Array.isArray(content)) {
+    contentArray = [...(content as ContentItem[])];
+  } else {
+    return [...reminderParts, content as never] as MessageCreate["content"];
   }
 
-  if (Array.isArray(content)) {
-    return [...reminderParts, ...content] as MessageCreate["content"];
+  // If the first text content part is also a system-reminder, absorb it into
+  // the merged block so the agent receives one cohesive <system-reminder>.
+  if (mergedInnerSections.length > 0) {
+    const firstTextIdx = contentArray.findIndex((p) => p["type"] === "text");
+    if (firstTextIdx !== -1) {
+      const firstText = contentArray[firstTextIdx]?.["text"];
+      if (typeof firstText === "string") {
+        const inner = extractSystemReminderInner(firstText);
+        if (inner !== null) {
+          mergedInnerSections.push(inner);
+          contentArray.splice(firstTextIdx, 1);
+        }
+      }
+    }
   }
 
-  return content;
+  const result: ContentItem[] = [];
+
+  if (mergedInnerSections.length > 0) {
+    result.push({
+      type: "text",
+      text: `${SYSTEM_REMINDER_OPEN}\n${mergedInnerSections.join("\n\n")}\n${SYSTEM_REMINDER_CLOSE}`,
+    });
+  }
+
+  for (const part of nonSrReminderParts) {
+    result.push(part as ContentItem);
+  }
+
+  result.push(...contentArray);
+
+  return result as MessageCreate["content"];
 }

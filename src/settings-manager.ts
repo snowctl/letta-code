@@ -4,6 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import type { ExperimentId } from "./experiments/types";
 import type { HooksConfig } from "./hooks/types";
 import type { PermissionRules } from "./permissions/types";
 import { getRuntimeContext } from "./runtime-context";
@@ -89,6 +90,7 @@ export interface Settings {
   hooks?: HooksConfig; // Hook commands that run at various lifecycle points (includes disabled flag)
   statusLine?: StatusLineConfig; // Configurable status line command
   env?: Record<string, string>;
+  experiments?: Partial<Record<ExperimentId, boolean>>;
   // Server-indexed settings (agent IDs are server-specific)
   sessionsByServer?: Record<string, SessionRef>; // key = normalized base URL (e.g., "api.letta.com", "localhost:8283")
   pinnedAgentsByServer?: Record<string, string[]>; // DEPRECATED: use agents array
@@ -200,6 +202,20 @@ function getCurrentServerKey(settings?: Settings | null): string {
   const baseUrl =
     process.env.LETTA_BASE_URL ||
     settings?.env?.LETTA_BASE_URL ||
+    DEFAULT_LETTA_API_URL;
+  return normalizeBaseUrl(baseUrl);
+}
+
+/**
+ * Get the current memfs server key for memfs-related agent settings.
+ * Uses LETTA_MEMFS_BASE_URL and falls back to api.letta.com.
+ * @param settings - Optional settings object to check for env overrides
+ * @returns Normalized server key (e.g., "api.letta.com", "localhost:8283")
+ */
+function getCurrentMemfsServerKey(settings?: Settings | null): string {
+  const baseUrl =
+    process.env.LETTA_MEMFS_BASE_URL ||
+    settings?.env?.LETTA_MEMFS_BASE_URL ||
     DEFAULT_LETTA_API_URL;
   return normalizeBaseUrl(baseUrl);
 }
@@ -1469,6 +1485,55 @@ class SettingsManager {
     this.unpinGlobal(agentId);
   }
 
+  /**
+   * Remove all traces of a deleted agent from settings: unpin it from both
+   * local and global lists, and clear the LRU session wherever it points to
+   * the deleted agent. Ensures the next startup shows the setup wizard rather
+   * than trying to resume a non-existent agent.
+   */
+  clearDeletedAgent(
+    agentId: string,
+    workingDirectory: string = process.cwd(),
+  ): void {
+    this.unpinBoth(agentId, workingDirectory);
+
+    // Clear global LRU if it points to the deleted agent
+    const settings = this.getSettings();
+    const serverKey = getCurrentServerKey(settings);
+    if (
+      settings.sessionsByServer?.[serverKey]?.agentId === agentId ||
+      settings.lastSession?.agentId === agentId ||
+      settings.lastAgent === agentId
+    ) {
+      const sessionsByServer = { ...settings.sessionsByServer };
+      delete sessionsByServer[serverKey];
+      this.updateSettings({
+        sessionsByServer,
+        lastSession: undefined,
+        lastAgent: null,
+      });
+    }
+
+    // Clear local LRU if it points to the deleted agent
+    const localSettings = this.getLocalProjectSettings(workingDirectory);
+    if (
+      localSettings.sessionsByServer?.[serverKey]?.agentId === agentId ||
+      localSettings.lastSession?.agentId === agentId ||
+      localSettings.lastAgent === agentId
+    ) {
+      const localSessionsByServer = { ...localSettings.sessionsByServer };
+      delete localSessionsByServer[serverKey];
+      this.updateLocalProjectSettings(
+        {
+          sessionsByServer: localSessionsByServer,
+          lastSession: undefined,
+          lastAgent: null,
+        },
+        workingDirectory,
+      );
+    }
+  }
+
   // DEPRECATED: Keep for backwards compatibility
   deleteProfile(
     _name: string,
@@ -1550,9 +1615,12 @@ class SettingsManager {
    * Get settings for a specific agent on the current server.
    * Returns undefined if agent not found in settings.
    */
-  private getAgentSettings(agentId: string): AgentSettings | undefined {
+  private getAgentSettings(
+    agentId: string,
+    serverKeyOverride?: string,
+  ): AgentSettings | undefined {
     const settings = this.getSettings();
-    const serverKey = getCurrentServerKey(settings);
+    const serverKey = serverKeyOverride ?? getCurrentServerKey(settings);
     const normalizedBaseUrl =
       serverKey === "api.letta.com" ? undefined : serverKey;
 
@@ -1568,9 +1636,10 @@ class SettingsManager {
   private upsertAgentSettings(
     agentId: string,
     updates: Partial<Omit<AgentSettings, "agentId" | "baseUrl">>,
+    serverKeyOverride?: string,
   ): void {
     const settings = this.getSettings();
-    const serverKey = getCurrentServerKey(settings);
+    const serverKey = serverKeyOverride ?? getCurrentServerKey(settings);
     const normalizedBaseUrl =
       serverKey === "api.letta.com" ? undefined : serverKey;
 
@@ -1631,14 +1700,18 @@ class SettingsManager {
    * Check if memory filesystem is enabled for an agent on the current server.
    */
   isMemfsEnabled(agentId: string): boolean {
-    return this.getAgentSettings(agentId)?.memfs === true;
+    const settings = this.getSettings();
+    const memfsServerKey = getCurrentMemfsServerKey(settings);
+    return this.getAgentSettings(agentId, memfsServerKey)?.memfs === true;
   }
 
   /**
    * Enable or disable memory filesystem for an agent on the current server.
    */
   setMemfsEnabled(agentId: string, enabled: boolean): void {
-    this.upsertAgentSettings(agentId, { memfs: enabled });
+    const settings = this.getSettings();
+    const memfsServerKey = getCurrentMemfsServerKey(settings);
+    this.upsertAgentSettings(agentId, { memfs: enabled }, memfsServerKey);
   }
 
   /**

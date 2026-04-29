@@ -60,6 +60,7 @@ class FakeBot {
     getFile: mock(async (fileId: string) => FakeBot.nextGetFileImpl(fileId)),
     answerCallbackQuery: mock(async () => true),
     editMessageText: mock(async () => ({ message_id: 999 })),
+    sendChatAction: mock(async () => true),
   };
   catchHandler:
     | ((error: {
@@ -80,8 +81,28 @@ class FakeBot {
     return this;
   }
 
-  command(_command: string, _handler: FakeHandler): this {
+  readonly commandHandlers = new Map<string, FakeHandler[]>();
+
+  command(commandName: string, handler: FakeHandler): this {
+    const existing = this.commandHandlers.get(commandName) ?? [];
+    existing.push(handler);
+    this.commandHandlers.set(commandName, existing);
     return this;
+  }
+
+  async fireCommand(
+    commandName: string,
+    chatId: string | number,
+    matchText = "",
+  ): Promise<void> {
+    const handlers = this.commandHandlers.get(commandName) ?? [];
+    for (const handler of handlers) {
+      await handler({
+        chat: { id: chatId },
+        match: matchText,
+        reply: mock(async (text: string) => ({ message_id: 999, text })),
+      });
+    }
   }
 
   async init(): Promise<void> {}
@@ -118,6 +139,21 @@ mock.module("../../channels/telegram/runtime", () => ({
     Bot: FakeBot,
     InputFile: FakeInputFile,
   }),
+}));
+
+// Default stub — operator command tests override this per-test via mock.module()
+mock.module("../../agent/client", () => ({
+  getClient: async () => ({}),
+}));
+
+// Default stub — operator command tests override this per-test via mock.module()
+mock.module("../../channels/registry", () => ({
+  getChannelRegistry: () => null,
+}));
+
+// Stub for operator-commands transitive dep
+mock.module("../../agent/modify", () => ({
+  recompileAgentSystemPrompt: async () => "ok",
 }));
 
 const { createTelegramAdapter } = await import(
@@ -1264,4 +1300,594 @@ test("callback_query edit failure falls back to sending text confirmation", asyn
   });
 
   expect(bot.api.sendMessage).toHaveBeenCalledWith("500", "✅ Approved", {});
+});
+
+// ── Lifecycle event tests ─────────────────────────────────────────────────────
+
+const LIFECYCLE_ACCOUNT = {
+  ...telegramAccountDefaults,
+  channel: "telegram" as const,
+  enabled: true,
+  token: "test-token",
+  dmPolicy: "pairing" as const,
+  allowedUsers: [],
+};
+
+const LIFECYCLE_SOURCE = {
+  channel: "telegram" as const,
+  accountId: "telegram-test-account",
+  chatId: "chat-42",
+  agentId: "agent-1",
+  conversationId: "conv-1",
+};
+
+test("typing indicator: sendChatAction called on queued event", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: LIFECYCLE_SOURCE,
+  });
+
+  expect(bot.api.sendChatAction).toHaveBeenCalledWith("chat-42", "typing");
+  await adapter.stop();
+});
+
+test("typing indicator: idempotent — second queued for same chat does not double-start", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: LIFECYCLE_SOURCE,
+  });
+  const callsAfterFirst = bot.api.sendChatAction.mock.calls.length;
+  await adapter.handleTurnLifecycleEvent!({
+    type: "queued",
+    source: LIFECYCLE_SOURCE,
+  });
+
+  expect(bot.api.sendChatAction.mock.calls.length).toBe(callsAfterFirst);
+  await adapter.stop();
+});
+
+test("typing indicator: processing event starts interval for new chats", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+  const newSource = { ...LIFECYCLE_SOURCE, chatId: "chat-99" };
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "processing",
+    batchId: "batch-1",
+    sources: [newSource],
+  });
+
+  expect(bot.api.sendChatAction).toHaveBeenCalledWith("chat-99", "typing");
+  await adapter.stop();
+});
+
+test("tool block: first tool_call sends a new message", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async tool block operation to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+  const [chatId, text] = bot.api.sendMessage.mock.calls[0]! as unknown as [
+    string,
+    string,
+  ];
+  expect(chatId).toBe("chat-42");
+  expect(text).toBe("🔧 Tools used:\nread_file");
+  await adapter.stop();
+});
+
+test("tool block: second tool_call edits the existing message", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operations to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(bot.api.sendMessage).toHaveBeenCalledTimes(1); // no second send
+  expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+  const [chatId, _msgId, text] = bot.api.editMessageText.mock
+    .calls[0]! as unknown as [string, number, string];
+  expect(chatId).toBe("chat-42");
+  expect(text).toBe("🔧 Tools used:\nread_file (x2)");
+  await adapter.stop();
+});
+
+test("tool block: tool with description grouped correctly", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    description: "Run tests",
+    sources: [LIFECYCLE_SOURCE],
+  });
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    description: "Run tests",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operations to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const [, _msgId, text] = bot.api.editMessageText.mock
+    .calls[0]! as unknown as [string, number, string];
+  expect(text).toBe("🔧 Tools used:\nbash — Run tests (x2)");
+  await adapter.stop();
+});
+
+test("tool block: exceeding 3800 chars sends new message", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  // First tool call creates the block
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "bash",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Push 100 distinct descriptions to exceed 3800 chars
+  for (let i = 0; i < 100; i++) {
+    await adapter.handleTurnLifecycleEvent!({
+      type: "tool_call",
+      batchId: "batch-1",
+      toolName: "bash",
+      description: `A very long description that makes things large number ${i}`,
+      sources: [LIFECYCLE_SOURCE],
+    });
+  }
+
+  // Wait for async operations to complete
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  // sendMessage should have been called more than once (overflow triggered)
+  expect(bot.api.sendMessage.mock.calls.length).toBeGreaterThan(1);
+  await adapter.stop();
+});
+
+test("tool block: cleared on finished (state does not persist across turns)", async () => {
+  const adapter = createTelegramAdapter(LIFECYCLE_ACCOUNT);
+  await adapter.start();
+  const bot = FakeBot.instances.at(-1)!;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-1",
+    toolName: "read_file",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operation to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const sendCallsBefore = bot.api.sendMessage.mock.calls.length;
+
+  await adapter.handleTurnLifecycleEvent!({
+    type: "finished",
+    batchId: "batch-1",
+    sources: [LIFECYCLE_SOURCE],
+    outcome: "completed",
+  });
+
+  // New turn — tool_call should create a fresh message, not edit
+  await adapter.handleTurnLifecycleEvent!({
+    type: "tool_call",
+    batchId: "batch-2",
+    toolName: "glob",
+    sources: [LIFECYCLE_SOURCE],
+  });
+
+  // Wait for async operation to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(bot.api.sendMessage.mock.calls.length).toBe(sendCallsBefore + 1);
+  expect(bot.api.editMessageText.mock.calls.length).toBe(0);
+  await adapter.stop();
+});
+
+test("telegram adapter appends Show reasoning button when reasoning was received", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  const source = {
+    channel: "telegram" as const,
+    accountId: "telegram-test-account",
+    chatId: "42",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("I need to think.", [source]);
+  await adapter.handleStreamReasoning!(" Done.", [source]);
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "Here is the answer.",
+  });
+
+  expect(bot?.api.sendMessage).toHaveBeenCalledTimes(1);
+  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown>,
+  ];
+  const keyboard = opts.reply_markup as {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+  expect(keyboard.inline_keyboard[0]?.[0]?.text).toBe("🧠 Show reasoning");
+
+  const callbackData = JSON.parse(
+    keyboard.inline_keyboard[0]![0]!.callback_data,
+  ) as {
+    k: string;
+    a: string;
+  };
+  expect(callbackData.a).toBe("show_reasoning");
+
+  await adapter.stop();
+});
+
+test("telegram adapter sends reasoning as reply when Show reasoning button is tapped", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  const source = {
+    channel: "telegram" as const,
+    accountId: "telegram-test-account",
+    chatId: "42",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("My reasoning.", [source]);
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "Answer.",
+  });
+
+  // Capture callback_data from the sent message
+  const [, , sendOpts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown>,
+  ];
+  const keyboard = sendOpts.reply_markup as {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+  const callbackData = keyboard.inline_keyboard[0]![0]!.callback_data;
+
+  bot!.api.sendMessage.mockClear();
+
+  // Simulate user tapping the button
+  await bot!.emit("callback_query", {
+    callbackQuery: {
+      id: "cq1",
+      from: { id: 7, username: "user" },
+      data: callbackData,
+      message: { message_id: 999, chat: { id: 42 } },
+    },
+  });
+
+  expect(bot?.api.sendMessage).toHaveBeenCalledTimes(1);
+  const [chatId, text] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+  ];
+  expect(chatId).toBe("42");
+  expect(text).toBe("My reasoning.");
+  expect(bot?.api.answerCallbackQuery).toHaveBeenCalledWith("cq1");
+
+  await adapter.stop();
+});
+
+test("telegram adapter sends message without button when no reasoning received", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "No reasoning here.",
+  });
+
+  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown> | undefined,
+  ];
+  expect((opts ?? {}).reply_markup).toBeUndefined();
+
+  await adapter.stop();
+});
+
+test("telegram adapter skips reasoning button when showReasoning is false", async () => {
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram" as const,
+    token: "test-token",
+    dmPolicy: "open" as const,
+    allowedUsers: [],
+    enabled: true,
+    showReasoning: false,
+  });
+  await adapter.start();
+  const bot = FakeBot.instances[0];
+  expect(bot).toBeDefined();
+
+  const source = {
+    channel: "telegram" as const,
+    accountId: "telegram-test-account",
+    chatId: "42",
+    agentId: "agent1",
+    conversationId: "conv1",
+  };
+
+  await adapter.handleStreamReasoning!("thinking...", [source]);
+
+  await adapter.sendMessage({
+    channel: "telegram",
+    accountId: "telegram-test-account",
+    chatId: "42",
+    text: "Answer.",
+  });
+
+  const [, , opts] = bot!.api.sendMessage.mock.calls[0] as unknown as [
+    string,
+    string,
+    Record<string, unknown> | undefined,
+  ];
+  expect((opts ?? {}).reply_markup).toBeUndefined();
+
+  await adapter.stop();
+});
+
+// ── Operator command tests ────────────────────────────────────────────────────
+
+test("telegram adapter /cancel replies Cancelled. when run is active", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({ agentId: "agent-1", conversationId: "conv-1" }),
+      cancelActiveRun: () => true,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1", agent_id: "agent-1" }),
+        fork: async () => ({ id: "cf", agent_id: "agent-1" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-42" },
+    match: "",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("cancel") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toBe("Cancelled.");
+});
+
+test("telegram adapter /cancel replies No active run. when no run", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({ agentId: "agent-1", conversationId: "conv-1" }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-43" },
+    match: "",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("cancel") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toBe("No active run.");
+});
+
+test("telegram adapter /conv list replies with numbered list", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => ({ agentId: "agent-1", conversationId: "default" }),
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({
+      agents: { messages: { compact: async () => ({}) } },
+      conversations: {
+        list: async () => [],
+        create: async () => ({ id: "c1" }),
+        fork: async () => ({ id: "cf" }),
+        delete: async () => ({}),
+        messages: { compact: async () => ({}) },
+      },
+    }),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-44" },
+    match: "list",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("conv") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toContain("1. default (current)");
+});
+
+test("telegram adapter replies to unconnected chat with error message", async () => {
+  mock.module("../../channels/registry", () => ({
+    getChannelRegistry: () => ({
+      getRoute: () => null,
+      cancelActiveRun: () => false,
+      updateRouteConversation: () => {},
+    }),
+  }));
+  mock.module("../../agent/client", () => ({
+    getClient: async () => ({}),
+  }));
+
+  const adapter = createTelegramAdapter({
+    ...telegramAccountDefaults,
+    channel: "telegram",
+    enabled: true,
+    token: "test-token",
+    dmPolicy: "open",
+    allowedUsers: [],
+  });
+  await adapter.start();
+
+  const bot = FakeBot.instances.at(-1)!;
+  let repliedText = "";
+  const fakeCtx = {
+    chat: { id: "chat-45" },
+    match: "",
+    reply: mock(async (text: string) => {
+      repliedText = text;
+      return { message_id: 1 };
+    }),
+  };
+  const handlers = bot.commandHandlers.get("cancel") ?? [];
+  for (const h of handlers) await h(fakeCtx);
+  expect(repliedText).toContain("not connected");
 });

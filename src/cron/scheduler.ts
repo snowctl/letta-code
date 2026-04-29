@@ -12,14 +12,16 @@
  * On stop: clears interval, releases lease.
  */
 
-import type WebSocket from "ws";
+import { getRoutesForChannel } from "../channels/routing";
 import type { CronPromptQueueItem, DequeuedBatch } from "../queue/queueRuntime";
+import { resolveConversationChannelToolScope } from "../tools/toolset";
 import { ensureConversationQueueRuntime } from "../websocket/listener/client";
 import { scheduleQueuePump } from "../websocket/listener/queue";
 import {
   getActiveRuntime,
   getOrCreateConversationRuntime,
 } from "../websocket/listener/runtime";
+import type { ListenerTransport } from "../websocket/listener/transport";
 import type {
   IncomingMessage,
   StartListenerOptions,
@@ -38,6 +40,12 @@ import {
 } from "./index";
 
 // ── Types ───────────────────────────────────────────────────────────
+
+export interface CronTarget {
+  channel: string;
+  chatId: string;
+  label?: string;
+}
 
 type ProcessQueuedTurn = (
   queuedTurn: IncomingMessage,
@@ -73,7 +81,19 @@ function minuteKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-function wrapCronPrompt(task: CronTask): string {
+export function wrapCronPrompt(task: CronTask, targets: CronTarget[]): string {
+  const targetLines =
+    targets.length > 0
+      ? [
+          "",
+          "**Available targets (for NotifyUser):**",
+          ...targets.map(
+            (t) =>
+              `- channel: \`${t.channel}\`, chat_id: \`${t.chatId}\`${t.label ? ` (${t.label})` : ""}`,
+          ),
+        ]
+      : [];
+
   const lines = [
     "<system-reminder>",
     `Scheduled task "${task.name}" is firing.`,
@@ -82,10 +102,56 @@ function wrapCronPrompt(task: CronTask): string {
       ? `This is fire #${task.fire_count + 1} (cron: ${task.cron}).`
       : `This is a one-off scheduled task.`,
     "",
+    "**Quiet run — no inbound message.**",
+    "Your response text is NOT delivered automatically in scheduled runs.",
+    "Use the `NotifyUser` tool to send a message to a channel user.",
+    "If no notification is needed, produce no response text.",
+    ...targetLines,
+    "",
     task.prompt,
     "</system-reminder>",
   ];
   return lines.join("\n");
+}
+
+function getFirstChatIdForRoute(
+  channelId: string,
+  agentId: string,
+  conversationId: string,
+): string | null {
+  for (const route of getRoutesForChannel(channelId)) {
+    if (
+      route.agentId === agentId &&
+      route.conversationId === conversationId &&
+      route.enabled
+    ) {
+      return route.chatId ?? null;
+    }
+  }
+  return null;
+}
+
+function resolveTargetsForTask(
+  task: CronTask,
+  effectiveConversationId?: string,
+): CronTarget[] {
+  const conversationId = effectiveConversationId ?? task.conversation_id;
+  try {
+    const scope = resolveConversationChannelToolScope(
+      task.agent_id,
+      conversationId,
+    );
+    return scope.channels
+      .map((ch) => ({
+        channel: ch.channelId,
+        chatId:
+          getFirstChatIdForRoute(ch.channelId, task.agent_id, conversationId) ??
+          "",
+      }))
+      .filter((t) => t.chatId !== "");
+  } catch {
+    return [];
+  }
 }
 
 // ── Core tick logic ─────────────────────────────────────────────────
@@ -114,17 +180,23 @@ function shouldFireTask(task: CronTask, now: Date): boolean {
 function fireCronTask(
   task: CronTask,
   now: Date,
-  socket: WebSocket,
+  socket: ListenerTransport,
   opts: StartListenerOptions,
   processQueuedTurn: ProcessQueuedTurn,
 ): void {
   const listener = getActiveRuntime();
   if (!listener) return;
 
+  const effectiveConversationId =
+    task.conversation_id !== "default"
+      ? task.conversation_id
+      : (listener.lastActiveConversationByAgentId.get(task.agent_id) ??
+        undefined);
+
   const rawRuntime = getOrCreateConversationRuntime(
     listener,
     task.agent_id,
-    task.conversation_id === "default" ? undefined : task.conversation_id,
+    effectiveConversationId,
   );
 
   if (!rawRuntime) return;
@@ -136,7 +208,10 @@ function fireCronTask(
     rawRuntime,
   );
 
-  const text = wrapCronPrompt(task);
+  const text = wrapCronPrompt(
+    task,
+    resolveTargetsForTask(task, effectiveConversationId),
+  );
 
   conversationRuntime.queueRuntime.enqueue({
     kind: "cron_prompt",
@@ -185,7 +260,7 @@ function handleMissedOneShot(task: CronTask, now: Date): boolean {
 
 function tick(
   state: SchedulerState,
-  socket: WebSocket,
+  socket: ListenerTransport,
   opts: StartListenerOptions,
   processQueuedTurn: ProcessQueuedTurn,
 ): void {
@@ -258,7 +333,7 @@ function tick(
  * No-ops if already running.
  */
 export function startScheduler(
-  socket: WebSocket,
+  socket: ListenerTransport,
   opts: StartListenerOptions,
   processQueuedTurn: ProcessQueuedTurn,
 ): void {

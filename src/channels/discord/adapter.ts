@@ -7,6 +7,7 @@ import type {
   InboundChannelMessage,
   OutboundChannelMessage,
 } from "../types";
+import { isDiscordGuildChannelAllowed } from "./channelGating";
 import {
   resolveDiscordInboundAttachments,
   resolveDiscordThreadHistory,
@@ -138,7 +139,6 @@ interface DiscordClient {
 
 type DiscordMessage = DiscordMessageLike;
 
-const DISCORD_MAX_LENGTH = 2000;
 const DISCORD_SPLIT_THRESHOLD = 1900;
 const INGRESS_DEDUPE_TTL_MS = 60_000;
 const INGRESS_DEDUPE_MAX = 2_000;
@@ -290,6 +290,7 @@ export function createDiscordAdapter(
     { state: LifecycleState; updatedAt: number }
   >();
   const lifecycleOperationByMessageKey = new Map<string, Promise<void>>();
+  const lastSentMessageIdByConversationId = new Map<string, string>();
 
   function buildIngressMessageKey(
     channelId: string | undefined,
@@ -612,6 +613,20 @@ export function createDiscordAdapter(
         // the thread is already routed, or whether a new mention is required.
         if (!isThread && !wasMentioned) return;
 
+        // Channel allowlist: when configured, only process guild messages whose
+        // channel ID (or parent channel ID for thread messages) is allowed.
+        if (
+          !isDiscordGuildChannelAllowed({
+            channelId: message.channelId,
+            parentChannelId:
+              (message.channel as { parentId?: string | null }).parentId ??
+              null,
+            isThread,
+            allowedChannels: config.allowedChannels,
+          })
+        )
+          return;
+
         if (markIngressMessageSeen(message.channelId, message.id)) return;
 
         let effectiveChatId = message.channelId;
@@ -701,6 +716,20 @@ export function createDiscordAdapter(
         // In guilds, only react on messages in threads we're tracking
         if (chatType === "channel" && !isThread) return;
 
+        // Apply channel allowlist gating in guilds (parent channel of the thread)
+        if (
+          chatType === "channel" &&
+          isThread &&
+          !isDiscordGuildChannelAllowed({
+            channelId,
+            parentChannelId:
+              (msg.channel as { parentId?: string | null }).parentId ?? null,
+            isThread: true,
+            allowedChannels: config.allowedChannels,
+          })
+        )
+          return;
+
         const inbound: InboundChannelMessage = {
           channel: "discord",
           accountId: config.accountId,
@@ -775,6 +804,8 @@ export function createDiscordAdapter(
         return;
       }
       if (event.type === "processing") return;
+      if (event.type === "tool_call") return;
+      if (event.type === "tool_started" || event.type === "tool_ended") return;
       const nextState: LifecycleState =
         event.outcome === "completed"
           ? "completed"
@@ -884,6 +915,35 @@ export function createDiscordAdapter(
         content: text,
         ...(reply ?? {}),
       });
+    },
+
+    async handleAutoForward(
+      text: string,
+      sources: ChannelTurnSource[],
+    ): Promise<string | undefined> {
+      const source = sources[0];
+      if (!source) return undefined;
+      if (!client) throw new Error("Discord not started");
+      const targetChannelId = source.threadId ?? source.chatId;
+      const channel = await client.channels.fetch(targetChannelId);
+      if (!isDiscordSendableChannel(channel)) return undefined;
+      const chunks = splitMessageText(text, DISCORD_SPLIT_THRESHOLD);
+      let lastMessageId = "";
+      for (const chunk of chunks) {
+        const result = await channel.send({ content: chunk });
+        lastMessageId = result.id;
+      }
+      if (lastMessageId) {
+        lastSentMessageIdByConversationId.set(
+          source.conversationId,
+          lastMessageId,
+        );
+      }
+      return lastMessageId || undefined;
+    },
+
+    getLastSentMessageId(conversationId: string): string | null {
+      return lastSentMessageIdByConversationId.get(conversationId) ?? null;
     },
 
     async prepareInboundMessage(

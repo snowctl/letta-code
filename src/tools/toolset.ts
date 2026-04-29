@@ -1,7 +1,7 @@
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
 import { getClient } from "../agent/client";
 import { resolveModel } from "../agent/model";
-import type { MessageChannelToolDiscoveryScope } from "../channels/messageTool";
+import type { ChannelToolScope } from "../channels/messageTool";
 import { getChannelRegistry } from "../channels/registry";
 import { getRoutesForChannel, loadRoutes } from "../channels/routing";
 import {
@@ -17,7 +17,6 @@ import {
   GEMINI_DEFAULT_TOOLS,
   GEMINI_PASCAL_TOOLS,
   getToolNames,
-  isGeminiModel,
   isOpenAIModel,
   loadSpecificTools,
   loadTools,
@@ -56,13 +55,9 @@ export type ToolsetPreference = ToolsetName | "auto";
 
 export function deriveToolsetFromModel(
   modelIdentifier: string,
-): "codex" | "gemini" | "default" {
+): "codex" | "default" {
   const resolvedModel = resolveModel(modelIdentifier) ?? modelIdentifier;
-  return isOpenAIModel(resolvedModel)
-    ? "codex"
-    : isGeminiModel(resolvedModel)
-      ? "gemini"
-      : "default";
+  return isOpenAIModel(resolvedModel) ? "codex" : "default";
 }
 
 type ScopeModelCarrier = Pick<AgentState, "model" | "llm_config">;
@@ -72,6 +67,7 @@ export type PreparedScopeToolContext = {
   toolset: ToolsetName;
   toolsetPreference: ToolsetPreference;
   effectiveModel: string | null;
+  agent: AgentState | null;
 };
 
 function buildModelHandleFromLlmConfig(
@@ -102,7 +98,7 @@ function getPreferredAgentModelHandle(
 
 function getToolNamesForToolset(
   toolsetName: ToolsetName,
-  channelToolScope?: MessageChannelToolDiscoveryScope | null,
+  channelToolScope?: ChannelToolScope | null,
 ): ToolName[] {
   let tools: ToolName[];
   switch (toolsetName) {
@@ -130,9 +126,10 @@ function getToolNamesForToolset(
       ? (channelToolScope?.channels.length ?? 0) > 0
       : (getChannelRegistry()?.getActiveChannelIds().length ?? 0) > 0;
 
-  // Append channel tool if channels are active (covers ALL pinned toolsets)
-  if (hasScopedChannelTool && !tools.includes("MessageChannel" as ToolName)) {
-    tools.push("MessageChannel" as ToolName);
+  // Append channel tools if channels are active (covers ALL pinned toolsets)
+  if (hasScopedChannelTool && !tools.includes("ChannelAction" as ToolName)) {
+    tools.push("ChannelAction" as ToolName);
+    tools.push("NotifyUser" as ToolName);
   }
 
   return tools;
@@ -144,7 +141,7 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
   exclude?: ToolName[];
   workingDirectory?: string;
   permissionModeState?: PermissionModeState;
-  channelToolScope?: MessageChannelToolDiscoveryScope | null;
+  channelToolScope?: ChannelToolScope | null;
   runtimeContext?: Partial<RuntimeContextSnapshot>;
 }): Promise<PreparedScopeToolContext> {
   const {
@@ -180,6 +177,7 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
         : "default",
       toolsetPreference,
       effectiveModel,
+      agent: null,
     };
   }
 
@@ -200,13 +198,14 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
     toolset: toolsetPreference,
     toolsetPreference,
     effectiveModel,
+    agent: null,
   };
 }
 
-function resolveConversationChannelToolScope(
+export function resolveConversationChannelToolScope(
   agentId: string,
   conversationId: string,
-): MessageChannelToolDiscoveryScope {
+): ChannelToolScope {
   const registry = getChannelRegistry();
   if (!registry) {
     return { channels: [] };
@@ -245,7 +244,6 @@ function resolveConversationChannelToolScope(
       });
     }
   }
-
   return { channels };
 }
 
@@ -256,6 +254,7 @@ export async function prepareToolExecutionContextForScope(params: {
   exclude?: ToolName[];
   workingDirectory?: string;
   permissionModeState?: PermissionModeState;
+  cachedAgent?: AgentState | null;
 }): Promise<PreparedScopeToolContext> {
   const {
     agentId,
@@ -264,10 +263,12 @@ export async function prepareToolExecutionContextForScope(params: {
     exclude,
     workingDirectory,
     permissionModeState,
+    cachedAgent,
   } = params;
 
   const client = await getClient();
-  const agent = (await client.agents.retrieve(agentId)) as ScopeModelCarrier;
+  const agent = (cachedAgent ??
+    (await client.agents.retrieve(agentId))) as ScopeModelCarrier;
   let effectiveModel =
     overrideModel && overrideModel.length > 0
       ? (resolveModel(overrideModel) ?? overrideModel)
@@ -293,7 +294,7 @@ export async function prepareToolExecutionContextForScope(params: {
     }
   })();
 
-  return prepareToolExecutionContextForResolvedTarget({
+  const result = await prepareToolExecutionContextForResolvedTarget({
     modelIdentifier: effectiveModel,
     toolsetPreference,
     exclude,
@@ -309,6 +310,7 @@ export async function prepareToolExecutionContextForScope(params: {
       conversationId ?? "default",
     ),
   });
+  return { ...result, agent: agent as AgentState };
 }
 
 /**
@@ -495,13 +497,15 @@ export function shouldClearPersistedToolRules(
 
 export async function clearPersistedClientToolRules(
   agentId: string,
+  cachedAgent?: AgentState | null,
 ): Promise<{ removedToolNames: string[] } | null> {
   const client = await getClient();
 
   try {
-    const agentWithTools = (await client.agents.retrieve(agentId, {
-      include: ["agent.tools"],
-    })) as AgentWithToolsAndRules;
+    const agentWithTools = (cachedAgent ??
+      (await client.agents.retrieve(agentId, {
+        include: ["agent.tools"],
+      }))) as AgentWithToolsAndRules;
     if (!shouldClearPersistedToolRules(agentWithTools)) {
       return null;
     }

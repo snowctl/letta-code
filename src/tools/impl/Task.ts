@@ -5,6 +5,7 @@
  * Supports both built-in subagent types and custom subagents defined in .letta/agents/.
  */
 
+import { getAvailableModelHandles } from "../../agent/available-models";
 import { getClient } from "../../agent/client";
 import { getConversationId, getCurrentAgentId } from "../../agent/context";
 import {
@@ -12,7 +13,10 @@ import {
   discoverSubagents,
   getAllSubagentConfigs,
 } from "../../agent/subagents";
-import { spawnSubagent } from "../../agent/subagents/manager";
+import {
+  getProviderPrefix,
+  spawnSubagent,
+} from "../../agent/subagents/manager";
 import { addToMessageQueue } from "../../cli/helpers/messageQueueBridge.js";
 import {
   completeSubagent,
@@ -38,7 +42,8 @@ import { LIMITS, truncateByChars } from "./truncation.js";
 import { validateRequiredParams } from "./validation";
 
 interface TaskArgs {
-  command?: "run" | "refresh";
+  command?: "run" | "refresh" | "list-models";
+  query?: string; // used with list-models
   subagent_type?: string;
   prompt?: string;
   description?: string;
@@ -53,8 +58,33 @@ interface TaskArgs {
 }
 
 // Valid subagent_types when deploying an existing agent
-const VALID_DEPLOY_TYPES = new Set(["explore", "general-purpose"]);
+const VALID_DEPLOY_TYPES = new Set(["general-purpose"]);
 const BACKGROUND_STARTUP_POLL_MS = 50;
+
+export function formatInvalidModelError(
+  model: string,
+  handles: Set<string>,
+): string {
+  const prefix = getProviderPrefix(model);
+  const filtered = [...handles]
+    .filter((h) => !prefix || h.startsWith(`${prefix}/`))
+    .sort();
+
+  if (filtered.length === 0) {
+    return `Model '${model}' is not available on this server. Use \`command: list-models\` to see all available models.`;
+  }
+
+  const label = prefix ?? "available";
+  return `Model '${model}' is not available on this server. Valid ${label} models: ${filtered.join(", ")}`;
+}
+
+export function filterModelHandles(
+  handles: Set<string>,
+  query: string | undefined,
+): string[] {
+  const q = query?.toLowerCase();
+  return [...handles].filter((h) => !q || h.toLowerCase().includes(q)).sort();
+}
 
 type TaskRunResult = {
   agentId: string;
@@ -370,6 +400,13 @@ export function spawnBackgroundSubagentTask(
   // Intentionally fire-and-forget: background tasks own their lifecycle and
   // capture failures in task state/transcripts instead of surfacing a promise
   // back to the caller.
+  //
+  // Capture parentAgentId synchronously here (not inside spawnSubagent, which
+  // runs after async yields and can see a drifted in-process context if the
+  // listener is processing another agent's turn). resolvedParentScope.agentId
+  // is the authoritative value — the listener and App.tsx both derive it
+  // from their own closure-captured agentId.
+  const parentAgentIdForSpawn = resolvedParentScope?.agentId;
   spawnSubagentFn(
     subagentType,
     prompt,
@@ -380,6 +417,7 @@ export function spawnBackgroundSubagentTask(
     existingConversationId,
     maxTurns,
     forkedContext,
+    parentAgentIdForSpawn,
   )
     .then(async (result) => {
       bgTask.status = result.success ? "completed" : "failed";
@@ -569,6 +607,18 @@ export function spawnBackgroundSubagentTask(
 export async function task(args: TaskArgs): Promise<string> {
   const { command = "run", model, toolCallId, signal } = args;
 
+  // Validate user-provided model early to avoid cryptic downstream errors.
+  if (model && command === "run") {
+    try {
+      const { handles } = await getAvailableModelHandles();
+      if (!handles.has(model)) {
+        return formatInvalidModelError(model, handles);
+      }
+    } catch {
+      // Can't reach the server to validate — let it proceed and fail downstream.
+    }
+  }
+
   // Handle refresh command - re-discover subagents from .letta/agents/ directories
   if (command === "refresh") {
     // Clear the cache to force re-discovery
@@ -593,6 +643,16 @@ export async function task(args: TaskArgs): Promise<string> {
 
     const errorSuffix = errors.length > 0 ? `, ${errors.length} error(s)` : "";
     return `Refreshed subagents list: found ${totalCount} total (${customCount} custom)${errorSuffix}`;
+  }
+
+  if (command === "list-models") {
+    try {
+      const { handles } = await getAvailableModelHandles();
+      const models = filterModelHandles(handles, args.query);
+      return JSON.stringify({ models });
+    } catch {
+      return "Error: Could not reach server to fetch model list.";
+    }
   }
 
   // Determine if deploying an existing agent
@@ -629,9 +689,9 @@ export async function task(args: TaskArgs): Promise<string> {
     return `Error: Invalid subagent type "${subagent_type}". Available types: ${available}`;
   }
 
-  // For existing agents, only allow explore or general-purpose
+  // For existing agents, only allow general-purpose
   if (isDeployingExisting && !VALID_DEPLOY_TYPES.has(subagent_type)) {
-    return `Error: When deploying an existing agent, subagent_type must be "explore" (read-only) or "general-purpose" (read-write). Got: "${subagent_type}"`;
+    return `Error: When deploying an existing agent, subagent_type must be "general-purpose". Got: "${subagent_type}"`;
   }
 
   // If subagent config requires forked context, fork the parent conversation
@@ -723,6 +783,9 @@ export async function task(args: TaskArgs): Promise<string> {
   writeTaskTranscriptStart(outputFile, description, subagent_type);
 
   try {
+    // See spawnBackgroundSubagentTask for rationale: capture parentAgentId
+    // synchronously here to avoid the async-drift race inside spawnSubagent.
+    const parentAgentIdForSpawn = resolvedParentScope?.agentId;
     const result = await spawnSubagent(
       subagent_type,
       prompt,
@@ -733,6 +796,7 @@ export async function task(args: TaskArgs): Promise<string> {
       effectiveConversationId,
       args.max_turns,
       config.fork,
+      parentAgentIdForSpawn,
     );
 
     // Mark subagent as completed in state store

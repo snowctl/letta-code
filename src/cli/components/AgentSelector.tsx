@@ -450,6 +450,7 @@ export function AgentSelector({
       const client = clientRef.current || (await getClient());
       clientRef.current = client;
       await client.agents.delete(agentId);
+      settingsManager.clearDeletedAgent(agentId);
 
       // Reset state and refresh tabs
       setViewState({ type: "list" });

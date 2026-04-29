@@ -5,7 +5,6 @@ import type {
   ApprovalCreate,
   LettaStreamingResponse,
 } from "@letta-ai/letta-client/resources/agents/messages";
-import type WebSocket from "ws";
 import {
   type ApprovalDecision,
   executeApprovalBatch,
@@ -22,6 +21,7 @@ import {
 } from "../../agent/turn-recovery-policy";
 import { createBuffers } from "../../cli/helpers/accumulator";
 import { drainStreamWithResume } from "../../cli/helpers/stream";
+import { formatPermissionDenial } from "../../permissions/formatDenial";
 import { isInteractiveApprovalTool } from "../../tools/interactivePolicy";
 import { prepareToolExecutionContextForScope } from "../../tools/toolset";
 import type {
@@ -61,6 +61,7 @@ import {
   clearRecoveredApprovalState,
   hasInterruptedCacheForScope,
 } from "./runtime";
+import type { ListenerTransport } from "./transport";
 import type {
   ConversationRuntime,
   IncomingMessage,
@@ -146,7 +147,7 @@ export async function isRetriablePostStopError(
 
 export async function drainRecoveryStreamWithEmission(
   recoveryStream: Stream<LettaStreamingResponse>,
-  socket: WebSocket,
+  socket: ListenerTransport,
   runtime: ConversationRuntime,
   params: {
     agentId?: string | null;
@@ -217,7 +218,7 @@ export async function drainRecoveryStreamWithEmission(
 
 export function finalizeHandledRecoveryTurn(
   runtime: ConversationRuntime,
-  socket: WebSocket,
+  socket: ListenerTransport,
   params: {
     drainResult: Awaited<ReturnType<typeof drainStreamWithResume>>;
     agentId?: string | null;
@@ -355,7 +356,7 @@ function buildRecoveredAutoDecisions(
     ...autoDenied.map((ac) => ({
       type: "deny" as const,
       approval: ac.approval,
-      reason: ac.denyReason || ac.permission.reason || "Permission denied",
+      reason: formatPermissionDenial(ac.permission, ac.denyReason),
     })),
   ];
 }
@@ -438,11 +439,11 @@ export async function recoverApprovalStateForSync(
 
 export async function resolveRecoveredApprovalResponse(
   runtime: ConversationRuntime,
-  socket: WebSocket,
+  socket: ListenerTransport,
   response: ApprovalResponseBody,
   processTurn: (
     msg: IncomingMessage,
-    socket: WebSocket,
+    socket: ListenerTransport,
     runtime: ConversationRuntime,
     onStatusChange?: (
       status: "idle" | "receiving" | "processing",
@@ -640,19 +641,24 @@ export async function resolveRecoveredApprovalResponse(
   runtime.currentLoadedTools =
     preparedToolContext.preparedToolContext.loadedToolNames;
   try {
-    const approvalResults = await executeApprovalBatch(decisions, undefined, {
-      abortSignal: recoveryAbortController.signal,
-      onStreamingOutput: emitToolExecutionOutput,
-      toolContextId: preparedToolContext.preparedToolContext.contextId,
-      workingDirectory,
-      parentScope:
-        recovered.agentId && recovered.conversationId
-          ? {
-              agentId: recovered.agentId,
-              conversationId: recovered.conversationId,
-            }
-          : undefined,
-    });
+    let approvalResults: Awaited<ReturnType<typeof executeApprovalBatch>>;
+    try {
+      approvalResults = await executeApprovalBatch(decisions, undefined, {
+        abortSignal: recoveryAbortController.signal,
+        onStreamingOutput: emitToolExecutionOutput,
+        toolContextId: preparedToolContext.preparedToolContext.contextId,
+        workingDirectory,
+        parentScope:
+          recovered.agentId && recovered.conversationId
+            ? {
+                agentId: recovered.agentId,
+                conversationId: recovered.conversationId,
+              }
+            : undefined,
+      });
+    } finally {
+      emitToolExecutionOutput.flush();
+    }
 
     emitToolExecutionFinishedEvents(socket, runtime, {
       approvals: approvalResults,
@@ -676,6 +682,7 @@ export async function resolveRecoveredApprovalResponse(
       {
         type: "approval",
         approvals: approvalResults,
+        otid: crypto.randomUUID(),
       },
     ];
     let continuationBatchId = `batch-recovered-${crypto.randomUUID()}`;

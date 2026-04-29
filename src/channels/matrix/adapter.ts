@@ -1,8 +1,21 @@
 // src/channels/matrix/adapter.ts
 import { join } from "node:path";
+import type { Letta } from "@letta-ai/letta-client";
+import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import { marked } from "marked";
+import { getClient } from "../../agent/client";
 import { getChannelDir } from "../config";
 import { formatChannelControlRequestPrompt } from "../interactive";
+import {
+  handleOperatorCommand,
+  type OperatorCommandContext,
+} from "../operator-commands";
+import { getChannelRegistry } from "../registry";
+import {
+  renderToolBlock,
+  type ToolCallGroup,
+  upsertToolCallGroup,
+} from "../tool-block";
 import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
@@ -13,6 +26,7 @@ import type {
   MatrixChannelAccount,
   OutboundChannelMessage,
 } from "../types";
+import { ensureCrossSigning } from "./crossSigning";
 import {
   collectMatrixMediaCandidate,
   downloadMatrixAttachment,
@@ -20,14 +34,171 @@ import {
   kindToMatrixMsgtype,
   MATRIX_DEFAULT_MAX_DOWNLOAD_BYTES,
 } from "./media";
-import { loadMatrixBotSdkModule } from "./runtime";
+import {
+  ensureMatrixCryptoUpToDate,
+  type LegacyRequestCallback,
+  type LegacyRequestParams,
+  type LegacyRequestResponse,
+  loadMatrixBotSdkModule,
+  loadMatrixCryptoModule,
+  loadUndiciModule,
+  type UndiciDispatcher,
+  type UndiciLike,
+} from "./runtime";
+
+// ── HTTP transport ────────────────────────────────────────────────────────────
+// matrix-bot-sdk@0.8.0 ships with the deprecated `request` library. Its
+// `timeout` option is implemented via socket-level timer events on Node's `net`
+// module — which Bun polyfills imperfectly — so a stalled `/sync` long-poll
+// can hang past its 40 s timeout and never recover. The fetch-based
+// replacement below uses AbortSignal-driven timeouts at the JS event-loop
+// level, which works identically under Node and Bun.
+//
+// Why undici instead of the platform `fetch`: Bun's built-in fetch keeps
+// connections alive in an internal pool we cannot tune. In production we
+// observed sockets that the homeserver (or an intermediate proxy) silently
+// closed during an idle window staying in Bun's pool as "alive"; every
+// reuse then hung until our AbortSignal fired, producing exact-on-timeout
+// errors in tight bursts and silencing the matrix channel for hours.
+// undici exposes a `keepAliveTimeout` knob — we set it tighter than any
+// reasonable proxy idle timeout (10 s) so undici evicts pooled sockets
+// before the server can quietly close them out from under us. We keep
+// pooling on for tight intra-sync bursts (e.g. fetching room state),
+// which are well within the 10 s window. Installed via `setRequestFn`
+// in `createClient()`.
+
+function buildLegacyRequestUrl(params: LegacyRequestParams): string {
+  if (!params.qs) return params.uri;
+  const url = new URL(params.uri);
+  for (const [key, value] of Object.entries(params.qs)) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      // matrix-bot-sdk passes `useQuerystring: true, arrayFormat: "repeat"`,
+      // which means `?key=v1&key=v2`. URLSearchParams.append matches that.
+      for (const item of value) url.searchParams.append(key, String(item));
+    } else {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url.toString();
+}
+
+/** Module-scoped lazy singletons. One Agent and one fetch reference shared
+ *  across every matrix adapter instance in this process. */
+let cachedUndici: UndiciLike | null = null;
+let cachedDispatcher: UndiciDispatcher | null = null;
+
+async function getUndiciDispatcher(): Promise<{
+  undici: UndiciLike;
+  dispatcher: UndiciDispatcher;
+}> {
+  if (cachedUndici && cachedDispatcher) {
+    return { undici: cachedUndici, dispatcher: cachedDispatcher };
+  }
+  const undici = await loadUndiciModule();
+  // Tight idle-eviction values: any pooled socket idle longer than
+  // keepAliveTimeout is closed by undici before the server's idle-close
+  // can leave it stale in our pool. keepAliveMaxTimeout caps the absolute
+  // age of any pooled socket. headersTimeout/bodyTimeout are belts on top
+  // of our own AbortSignal so a half-open response can't hang silently.
+  const dispatcher = new undici.Agent({
+    keepAliveTimeout: 10_000,
+    keepAliveMaxTimeout: 30_000,
+    headersTimeout: 15_000,
+    bodyTimeout: 65_000,
+    connect: { timeout: 10_000 },
+  });
+  cachedUndici = undici;
+  cachedDispatcher = dispatcher;
+  return { undici, dispatcher };
+}
+
+function makeFetchBackedRequestFn(
+  undici: UndiciLike,
+  dispatcher: UndiciDispatcher,
+) {
+  return async function fetchBackedRequestFn(
+    params: LegacyRequestParams,
+    callback: LegacyRequestCallback,
+  ): Promise<void> {
+    const timeoutMs = params.timeout > 0 ? params.timeout : 60_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort(
+        new Error(`matrix-bot-sdk request timed out after ${timeoutMs}ms`),
+      );
+    }, timeoutMs);
+
+    // Buffer is fetch-compatible at runtime (Node + Bun), but TS's BodyInit
+    // doesn't list it; copy out into a fresh ArrayBuffer so the type matches.
+    let requestBody: BodyInit | undefined;
+    if (params.body === undefined) {
+      requestBody = undefined;
+    } else if (typeof params.body === "string") {
+      requestBody = params.body;
+    } else {
+      const slice = params.body.buffer.slice(
+        params.body.byteOffset,
+        params.body.byteOffset + params.body.byteLength,
+      );
+      requestBody = slice as ArrayBuffer;
+    }
+
+    try {
+      const response = await undici.fetch(buildLegacyRequestUrl(params), {
+        method: params.method,
+        headers: params.headers,
+        body: requestBody,
+        signal: controller.signal,
+        dispatcher,
+      });
+      const buf = Buffer.from(await response.arrayBuffer());
+      const responseBody: string | Buffer =
+        params.encoding === null ? buf : buf.toString("utf-8");
+      const headers: Record<string, string> = {};
+      response.headers.forEach((value, key) => {
+        headers[key] = value;
+      });
+      const responseLike: LegacyRequestResponse = {
+        statusCode: response.status,
+        headers,
+        body: responseBody,
+      };
+      callback(null, responseLike, responseBody);
+    } catch (err) {
+      callback(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
 
 // ── Markdown helper ───────────────────────────────────────────────────────────
 
-// Inlined here rather than imported from MessageChannel.ts to avoid the transitive import
+// Inlined here rather than imported from channels/format.ts to avoid the transitive import
 // chain (registry → accounts → config) that conflicts with mock.module() in tests.
 function markdownToMatrixHtml(text: string): string {
   return (marked.parse(text) as string).trimEnd();
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ── Tool-progress UX threshold ────────────────────────────────────────────────
+// Tools that finish inside this window leave no trace in the chat — no running
+// block, no took-annotation. Anything longer renders the live progress UI and
+// the took-annotation when it ends. 1 s strikes a balance between hiding noise
+// from instant local ops (Read, Glob, etc.) and surfacing real waits.
+let toolProgressGraceMs = 1_000;
+
+/** Test-only override of the grace window. Production code must not call this. */
+export function __testSetToolProgressGraceMs(ms: number): void {
+  toolProgressGraceMs = ms;
 }
 
 // ── Control request state ─────────────────────────────────────────────────────
@@ -70,6 +241,7 @@ interface MatrixClientLike {
   mxcToHttp(mxc: string): string;
   getUserProfile(userId: string): Promise<{ displayname?: string }>;
   getJoinedRoomMembers(roomId: string): Promise<string[]>;
+  setTyping(roomId: string, isTyping: boolean, timeout?: number): Promise<void>;
 }
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
@@ -90,6 +262,9 @@ export function createMatrixAdapter(
 
   let matrixClient: MatrixClientLike | null = null;
   let running = false;
+
+  // Per-adapter conv list cache keyed by chatId
+  const convListCache = new Map<string, Conversation[]>();
 
   // Map from promptMessageEventId → PendingReactionRequest
   const pendingReactionRequests = new Map<string, PendingReactionRequest>();
@@ -222,12 +397,27 @@ export function createMatrixAdapter(
   }
 
   async function createClient(): Promise<MatrixClientLike> {
+    // If the installed crypto-nodejs predates 0.5.0, it can't expose the
+    // cross-signing upload requests. Upgrade before loading the SDK.
+    await ensureMatrixCryptoUpToDate();
+
+    const matrixBotSdk = await loadMatrixBotSdkModule();
+
+    // Replace matrix-bot-sdk's deprecated `request` library with an undici-
+    // backed fetch shim. AbortSignal-driven timeouts replace the legacy lib's
+    // broken socket-level timer, and undici's `Agent` gives us the pool-
+    // eviction knobs Bun's built-in fetch lacks (see top of file). The
+    // dispatcher is module-scoped and reused across createClient() calls,
+    // so a respawn of the same agent doesn't churn pools.
+    const { undici, dispatcher } = await getUndiciDispatcher();
+    matrixBotSdk.setRequestFn(makeFetchBackedRequestFn(undici, dispatcher));
+
     const {
       MatrixClient,
       SimpleFsStorageProvider,
       RustSdkCryptoStorageProvider,
       RustSdkCryptoStoreType,
-    } = await loadMatrixBotSdkModule();
+    } = matrixBotSdk;
 
     const channelDir = getChannelDir("matrix");
     const storageDir = join(channelDir, accountId);
@@ -239,9 +429,28 @@ export function createMatrixAdapter(
     let cryptoProvider: unknown;
     if (e2ee) {
       try {
+        // matrix-bot-sdk@0.8.0's JS doesn't re-export RustSdkCryptoStoreType
+        // even though the .d.ts claims it does. Load StoreType directly from
+        // @matrix-org/matrix-sdk-crypto-nodejs as the primary source, and fall
+        // back to whatever matrix-bot-sdk exports (in case a future version
+        // does re-export it). Sled was renamed to Sqlite in crypto-nodejs ≥ 0.3.
+        let storeValue: string | number | undefined =
+          RustSdkCryptoStoreType?.Sqlite ?? RustSdkCryptoStoreType?.Sled;
+
+        if (storeValue === undefined) {
+          const cryptoMod = await loadMatrixCryptoModule();
+          storeValue = cryptoMod.StoreType?.Sqlite ?? cryptoMod.StoreType?.Sled;
+        }
+
+        if (storeValue === undefined) {
+          throw new Error(
+            "StoreType not available from matrix-bot-sdk or @matrix-org/matrix-sdk-crypto-nodejs",
+          );
+        }
+
         cryptoProvider = new RustSdkCryptoStorageProvider(
           cryptoPath,
-          RustSdkCryptoStoreType.Sled,
+          storeValue,
         );
       } catch (err) {
         console.warn(
@@ -316,7 +525,16 @@ export function createMatrixAdapter(
         if (msgtype === "m.text" || msgtype === "m.notice") {
           const body = (content.body as string | undefined)?.trim() ?? "";
           if (body.startsWith("!")) {
-            await handleBotCommand(roomIdStr, body, eventObj);
+            await handleBotCommand(roomIdStr, body, eventObj).catch(
+              async (err) => {
+                await client
+                  .sendMessage(roomIdStr, {
+                    msgtype: "m.text",
+                    body: `Command failed: ${err instanceof Error ? err.message : String(err)}`,
+                  })
+                  .catch(() => {});
+              },
+            );
             return;
           }
         }
@@ -402,6 +620,30 @@ export function createMatrixAdapter(
       });
 
       await client.start();
+
+      // Ensure the bot's own device is cross-signed by its owner's SSK so
+      // Element X doesn't show "Encrypted by a device not verified by its
+      // owner" on every bot message. Idempotent; no-op after first success.
+      if (e2ee) {
+        try {
+          const outcome = await ensureCrossSigning(
+            client as unknown as Parameters<typeof ensureCrossSigning>[0],
+            homeserverUrl,
+            accessToken,
+          );
+          if (outcome === "bootstrapped") {
+            console.log(
+              `[matrix] cross-signing bootstrapped for ${userId} — Element X should now show verified shield`,
+            );
+          }
+        } catch (err) {
+          console.warn(
+            `[matrix] cross-signing bootstrap failed for ${userId} (continuing; will retry on next start):`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
       running = true;
     },
 
@@ -434,6 +676,36 @@ export function createMatrixAdapter(
       msg: OutboundChannelMessage,
     ): Promise<{ messageId: string }> {
       const client = await ensureClient();
+
+      // Edit existing message via m.replace. The edit must be one the bot
+      // itself sent — Matrix homeservers reject m.replace events whose
+      // sender doesn't match the original. We don't enforce that here; the
+      // homeserver will fail the request and the error surfaces back to
+      // the agent.
+      if (msg.editTargetMessageId) {
+        const html = markdownToMatrixHtml(msg.text);
+        const eventId = await client.sendMessage(msg.chatId, {
+          msgtype: "m.text",
+          // Element clients render `* <text>` as the fallback for users on
+          // older clients that don't honor m.replace. Match the format the
+          // adapter already uses for thinking-placeholder edits so behavior
+          // stays consistent.
+          body: `* ${msg.text}`,
+          format: "org.matrix.custom.html",
+          formatted_body: `* ${html}`,
+          "m.new_content": {
+            msgtype: "m.text",
+            body: msg.text,
+            format: "org.matrix.custom.html",
+            formatted_body: html,
+          },
+          "m.relates_to": {
+            rel_type: "m.replace",
+            event_id: msg.editTargetMessageId,
+          },
+        });
+        return { messageId: String(eventId) };
+      }
 
       // Reaction add
       if (msg.reaction) {
@@ -473,16 +745,29 @@ export function createMatrixAdapter(
         return { messageId: String(eventId) };
       }
 
+      // Drain all pending tool block operations to ensure tool block messages are above the response.
+      while (toolBlockOperationByChatId.has(msg.chatId)) {
+        await toolBlockOperationByChatId.get(msg.chatId)!.catch(() => {});
+      }
+
+      // If handleStreamReasoning is currently sending the thinking placeholder (__pending__),
+      // wait for it to land before sending the response — otherwise the response arrives first
+      // and the thinking block ends up below it in the Matrix timeline.
+      await waitForPendingPlaceholder(msg.chatId);
+
+      // Reasoning state is intentionally NOT finalized here — thinking continues after tool calls
+      // (including ChannelAction). Finalization happens only at the "finished" lifecycle event.
+      void stopTypingInterval(msg.chatId);
+
       // Plain text or HTML
       const content: Record<string, unknown> = {
         msgtype: "m.text",
         body: msg.text,
       };
 
-      if (msg.parseMode === "HTML") {
-        content.format = "org.matrix.custom.html";
-        content.formatted_body = markdownToMatrixHtml(msg.text);
-      }
+      // Always convert markdown to HTML for proper Matrix rendering
+      content.format = "org.matrix.custom.html";
+      content.formatted_body = markdownToMatrixHtml(msg.text);
 
       if (msg.replyToMessageId) {
         content["m.relates_to"] = {
@@ -508,6 +793,14 @@ export function createMatrixAdapter(
       }
 
       const eventId = await client.sendMessage(msg.chatId, content);
+
+      // Record the last plain-text response for the completion footer.
+      lastResponseByChatId.set(msg.chatId, {
+        eventId: String(eventId),
+        text: msg.text,
+        html: content.formatted_body as string,
+      });
+
       return { messageId: String(eventId) };
     },
 
@@ -520,6 +813,8 @@ export function createMatrixAdapter(
       const content: Record<string, unknown> = {
         msgtype: "m.text",
         body: text,
+        format: "org.matrix.custom.html",
+        formatted_body: markdownToMatrixHtml(text),
       };
       if (options?.replyToMessageId) {
         content["m.relates_to"] = {
@@ -527,6 +822,22 @@ export function createMatrixAdapter(
         };
       }
       await client.sendMessage(chatId, content);
+    },
+
+    async handleAutoForward(
+      text: string,
+      sources: ChannelTurnSource[],
+    ): Promise<string | undefined> {
+      // Deferred: store text for the "finished" lifecycle handler to send
+      // after finalizeReasoningMessage() to maintain Matrix timeline order.
+      for (const source of sources) {
+        pendingResponseTextByChatId.set(source.chatId, text);
+      }
+      return undefined;
+    },
+
+    getLastSentMessageId(conversationId: string): string | null {
+      return lastSentMessageIdByConversationId.get(conversationId) ?? null;
     },
 
     async handleControlRequestEvent(
@@ -540,6 +851,8 @@ export function createMatrixAdapter(
       const replyContent: Record<string, unknown> = {
         msgtype: "m.text",
         body: promptText,
+        format: "org.matrix.custom.html",
+        formatted_body: markdownToMatrixHtml(promptText),
       };
       const replyToId = threadId ?? messageId;
       if (replyToId) {
@@ -685,13 +998,70 @@ export function createMatrixAdapter(
 
   // ── Internal helpers ──────────────────────────────────────────────────────
 
+  async function dispatchOperatorCommand(
+    command: string,
+    args: string[],
+    chatId: string,
+  ): Promise<string> {
+    if (command === "help") {
+      return handleOperatorCommand("help", [], {
+        commandPrefix: "!",
+        agentId: "",
+        chatId,
+        client: {} as Letta,
+        getCurrentConvId: () => "default",
+        setCurrentConvId: async () => {},
+        requestCancel: () => false,
+        getConvListCache: () => null,
+        setConvListCache: () => {},
+      });
+    }
+    const registry = getChannelRegistry();
+    const route = registry?.getRoute("matrix", chatId, accountId);
+    if (!route) return "This chat is not connected to an agent.";
+    const client = await getClient();
+    const opCtx: OperatorCommandContext = {
+      agentId: route.agentId,
+      chatId,
+      commandPrefix: "!",
+      client,
+      getCurrentConvId: () =>
+        getChannelRegistry()?.getRoute("matrix", chatId, accountId)
+          ?.conversationId ?? "default",
+      setCurrentConvId: async (id) => {
+        getChannelRegistry()?.updateRouteConversation(
+          "matrix",
+          chatId,
+          accountId,
+          id,
+        );
+      },
+      requestCancel: () => {
+        const liveConvId =
+          getChannelRegistry()?.getRoute("matrix", chatId, accountId)
+            ?.conversationId ?? "default";
+        return registry?.cancelActiveRun(route.agentId, liveConvId) ?? false;
+      },
+      getConvListCache: () => convListCache.get(chatId) ?? null,
+      setConvListCache: (list) => {
+        if (list === null) {
+          convListCache.delete(chatId);
+        } else {
+          convListCache.set(chatId, list);
+        }
+      },
+    };
+    return handleOperatorCommand(command, args, opCtx);
+  }
+
   async function handleBotCommand(
     roomId: string,
     body: string,
     _event: Record<string, unknown>,
   ): Promise<void> {
     const client = await ensureClient();
-    const command = body.split(/\s+/)[0]?.toLowerCase();
+    const parts = body.trim().split(/\s+/);
+    const command = parts[0]?.toLowerCase();
 
     if (command === "!start") {
       await client.sendMessage(roomId, {
@@ -706,6 +1076,44 @@ export function createMatrixAdapter(
         msgtype: "m.text",
         body: `Bot: ${userId}\nDM Policy: ${dmPolicy}`,
       });
+      return;
+    }
+
+    if (command === "!cancel") {
+      const reply = await dispatchOperatorCommand("cancel", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!compact") {
+      const reply = await dispatchOperatorCommand("compact", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!recompile") {
+      const reply = await dispatchOperatorCommand("recompile", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!conv") {
+      const args = parts.slice(1).filter(Boolean);
+      const reply = await dispatchOperatorCommand("conv", args, roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!reset") {
+      const args = parts.slice(1).filter(Boolean);
+      const reply = await dispatchOperatorCommand("reset", args, roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!help") {
+      const reply = await dispatchOperatorCommand("help", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
       return;
     }
   }
