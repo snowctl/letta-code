@@ -387,6 +387,13 @@ export function createMatrixAdapter(
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   }
 
+  /** Compact token count: 48000 → "48K", 1_500_000 → "1.5M". */
+  function formatCompact(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${Math.round(n / 1000)}K`;
+    return String(n);
+  }
+
   /**
    * Redact common secret-like substrings before showing tool args back to
    * the user. Matches `--api-key=…`, `Authorization: Bearer …`,
@@ -1065,6 +1072,9 @@ export function createMatrixAdapter(
       toolProgressGraceTimerByChatId.clear();
       runningToolByChatId.clear();
       lastCompletedToolByChatId.clear();
+      lastResponseByChatId.clear();
+      turnStartedAtByChatId.clear();
+      pendingResponseTextByChatId.clear();
       convListCache.clear();
 
       await matrixClient?.stop();
@@ -1428,6 +1438,20 @@ export function createMatrixAdapter(
           await finalizeReasoningMessage(chatId);
           clearReasoningState(chatId);
 
+          const eventUsage =
+            event.type === "finished" ? event.usage : undefined;
+          const showUsage =
+            account.showContextUsage !== false &&
+            eventUsage &&
+            eventUsage.contextTokens > 0 &&
+            eventUsage.contextWindowMax > 0;
+          const usageSuffix = showUsage
+            ? ` · ${formatCompact(eventUsage.contextTokens)} / ${formatCompact(eventUsage.contextWindowMax)} tokens`
+            : "";
+          const usageHtml = showUsage
+            ? ` <span data-mx-color="#8b949e">· ${formatCompact(eventUsage.contextTokens)} / ${formatCompact(eventUsage.contextWindowMax)} tokens</span>`
+            : "";
+
           if (pendingText && matrixClient) {
             const html = markdownToMatrixHtml(pendingText);
             const sentEventId = await matrixClient
@@ -1458,8 +1482,8 @@ export function createMatrixAdapter(
               // Append completion footer to the sent message
               const footerHtml =
                 `<hr><span data-mx-color="#3fb950">✓</span> ` +
-                `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;
-              const footerText = `\n✓ completed in ${durationStr}`;
+                `<span data-mx-color="#8b949e">completed in ${durationStr}</span>${usageHtml}`;
+              const footerText = `\n✓ completed in ${durationStr}${usageSuffix}`;
               await matrixClient
                 .sendMessage(chatId, {
                   msgtype: "m.text",
@@ -1488,8 +1512,8 @@ export function createMatrixAdapter(
             // Fallback: no pending text from auto-forward (e.g. silent turn)
             const footerHtml =
               `<hr><span data-mx-color="#3fb950">✓</span> ` +
-              `<span data-mx-color="#8b949e">completed in ${durationStr}</span>`;
-            const footerText = `\n✓ completed in ${durationStr}`;
+              `<span data-mx-color="#8b949e">completed in ${durationStr}</span>${usageHtml}`;
+            const footerText = `\n✓ completed in ${durationStr}${usageSuffix}`;
             await matrixClient
               .sendMessage(chatId, {
                 msgtype: "m.text",

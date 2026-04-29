@@ -161,6 +161,10 @@ async function dispatchChannelTurnLifecycleEvent(
         sources: ChannelTurnSource[];
         outcome: ChannelTurnOutcome;
         error?: string;
+        usage?: {
+          contextTokens: number;
+          contextWindowMax: number;
+        };
       },
 ): Promise<void> {
   if (event.sources.length === 0) {
@@ -183,6 +187,7 @@ async function dispatchChannelTurnLifecycleEvent(
     sources: event.sources,
     outcome: event.outcome,
     ...(event.error ? { error: event.error } : {}),
+    ...(event.usage ? { usage: event.usage } : {}),
   });
 }
 
@@ -499,12 +504,21 @@ async function drainQueuedMessages(
               channelTurnSources,
             );
           }
+
+          const contextTokens = runtime.contextTracker.lastContextTokens;
+          const contextWindowMax = runtime.contextWindowMax;
+          const usage =
+            contextTokens > 0 && contextWindowMax && contextWindowMax > 0
+              ? { contextTokens, contextWindowMax }
+              : undefined;
+
           await dispatchChannelTurnLifecycleEvent({
             type: "finished",
             batchId: dequeuedBatch.batchId,
             sources: channelTurnSources,
             outcome: mapTurnLifecycleOutcome(runtime.lastStopReason, didThrow),
             ...(turnError ? { error: turnError } : {}),
+            ...(usage ? { usage } : {}),
           });
         }
       }

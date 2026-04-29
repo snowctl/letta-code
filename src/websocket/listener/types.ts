@@ -153,6 +153,8 @@ export type ConversationRuntime = {
   reminderState: SharedReminderState;
   /** Per-conversation tracker for compaction/reflection cadence. */
   contextTracker: ContextTracker;
+  /** Max context window size for this agent's model (from LLM config). */
+  contextWindowMax?: number;
 };
 
 export type ListenerRuntime = {

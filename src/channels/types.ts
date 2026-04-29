@@ -130,6 +130,13 @@ export type ChannelTurnLifecycleEvent =
       sources: ChannelTurnSource[];
       outcome: ChannelTurnOutcome;
       error?: string;
+      /** Context window token usage at end of turn. */
+      usage?: {
+        /** Tokens currently in the context window (from usage_statistics). */
+        contextTokens: number;
+        /** Max context window size for this agent's model. */
+        contextWindowMax: number;
+      };
     };
 
 // ── Adapter interface ─────────────────────────────────────────────
@@ -354,6 +361,8 @@ interface ChannelAccountBase {
   updatedAt: string;
   /** When false, reasoning display is disabled. Defaults to true. */
   showReasoning?: boolean;
+  /** When false, context window token usage is hidden in the message footer. Defaults to true. */
+  showContextUsage?: boolean;
 }
 
 export interface TelegramChannelConfig {
