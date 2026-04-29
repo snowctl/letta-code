@@ -4346,6 +4346,18 @@ async function startConnectedListenerRuntime(
     },
   );
 
+  // Install a per-listener queue-pump kicker so the turn loop can re-drain
+  // notifications (e.g. background subagent completions) once isProcessing
+  // flips back to false at end-of-turn.
+  runtime.queuePumpKicker = (scopedRuntime) => {
+    scheduleQueuePump(
+      scopedRuntime,
+      transport,
+      opts as StartListenerOptions,
+      processQueuedTurn,
+    );
+  };
+
   // Register the message queue bridge to route task notifications into the
   // correct per-conversation QueueRuntime. This enables background Task
   // completions to reach the agent in listen mode.
