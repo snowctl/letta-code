@@ -209,6 +209,13 @@ export type ListenerRuntime = {
   _unsubscribeSubagentState?: (() => void) | undefined;
   /** Unsubscribe from subagent stream events (set on socket open, cleared on close). */
   _unsubscribeSubagentStreamEvents?: (() => void) | undefined;
+  /**
+   * Re-kick the queue pump for a scoped runtime after a turn completes.
+   * Set by startConnectedListenerRuntime so turn.ts can drain queued
+   * task notifications (e.g. subagent completions) once isProcessing flips
+   * back to false. No-op when not in listener mode.
+   */
+  queuePumpKicker?: (runtime: ConversationRuntime) => void;
 };
 
 export interface InterruptPopulateInput {

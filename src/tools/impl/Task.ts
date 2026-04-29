@@ -499,8 +499,9 @@ export function spawnBackgroundSubagentTask(
         addToMessageQueueFn({
           kind: "task_notification",
           text: notificationXml,
-          agentId: resolvedParentScope?.agentId,
-          conversationId: resolvedParentScope?.conversationId,
+          agentId: resolvedParentScope?.agentId ?? existingAgentId,
+          conversationId:
+            resolvedParentScope?.conversationId ?? existingConversationId,
         });
       }
 
@@ -581,8 +582,9 @@ export function spawnBackgroundSubagentTask(
         addToMessageQueueFn({
           kind: "task_notification",
           text: notificationXml,
-          agentId: resolvedParentScope?.agentId,
-          conversationId: resolvedParentScope?.conversationId,
+          agentId: resolvedParentScope?.agentId ?? existingAgentId,
+          conversationId:
+            resolvedParentScope?.conversationId ?? existingConversationId,
         });
       }
 
