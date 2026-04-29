@@ -1,5 +1,5 @@
 // src/channels/matrix/media.ts
-import { randomUUID } from "node:crypto";
+import { createDecipheriv, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { getChannelDir } from "../config";
@@ -53,6 +53,24 @@ export function inferMimeTypeFromExtension(filename: string): string {
   return map[ext] ?? "application/octet-stream";
 }
 
+// Matrix EncryptedFile (MSC1767 / Matrix spec section on end-to-end encryption)
+// Present in content.file for media in E2EE rooms.
+export interface MatrixEncryptedFile {
+  url: string;
+  key: {
+    kty: string;
+    key_ops: string[];
+    alg: string;
+    k: string; // base64url-encoded 256-bit AES key
+    ext: boolean;
+  };
+  iv: string; // base64url-encoded 16-byte IV (AES-256-CTR)
+  hashes: {
+    sha256: string; // base64url-encoded SHA-256 of ciphertext
+  };
+  v: string; // "v2"
+}
+
 export interface MatrixMediaCandidate {
   mxcUrl: string;
   msgtype: string;
@@ -60,6 +78,29 @@ export interface MatrixMediaCandidate {
   mimeType?: string;
   sizeBytes?: number;
   isVoice?: boolean;
+  /** Present when the media is encrypted (E2EE room). Caller must decrypt before use. */
+  encryptedFile?: MatrixEncryptedFile;
+}
+
+function parseBase64Url(b64url: string): Buffer {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), "=");
+  return Buffer.from(padded, "base64");
+}
+
+/**
+ * Decrypt a Matrix encrypted attachment downloaded from an E2EE room.
+ * Matrix uses AES-256-CTR with a JWK key and 128-bit IV per the spec.
+ */
+export function decryptMatrixAttachment(
+  encrypted: ArrayBuffer,
+  file: MatrixEncryptedFile,
+): Buffer {
+  const key = parseBase64Url(file.key.k);
+  const iv = parseBase64Url(file.iv);
+  const decipher = createDecipheriv("aes-256-ctr", key, iv);
+  const data = Buffer.from(encrypted);
+  return Buffer.concat([decipher.update(data), decipher.final()]);
 }
 
 export function collectMatrixMediaCandidate(
@@ -76,18 +117,69 @@ export function collectMatrixMediaCandidate(
     return null;
   }
 
-  const url = content.url as string | undefined;
-  if (!url?.startsWith("mxc://")) return null;
-
   const info = content.info as Record<string, unknown> | undefined;
+
+  // Non-E2EE: media URL is in content.url
+  const plainUrl = content.url as string | undefined;
+  if (plainUrl?.startsWith("mxc://")) {
+    const mimeType =
+      (info?.mimetype as string | undefined) ??
+      (content.filename
+        ? inferMimeTypeFromExtension(content.filename as string)
+        : undefined);
+
+    return {
+      mxcUrl: plainUrl,
+      msgtype,
+      filename:
+        (content.filename as string | undefined) ??
+        (content.body as string | undefined),
+      mimeType,
+      sizeBytes: info?.size as number | undefined,
+      isVoice:
+        msgtype === "m.audio" &&
+        (content["org.matrix.msc3245.voice"] != null || content.voice != null),
+    };
+  }
+
+  // E2EE: media URL and encryption info are in content.file
+  const encryptedFile = content.file as Record<string, unknown> | undefined;
+  const encryptedUrl = encryptedFile?.url as string | undefined;
+  if (!encryptedUrl?.startsWith("mxc://")) return null;
+
+  // Validate the encrypted file object has the fields we need for decryption
+  const key = encryptedFile?.key as Record<string, unknown> | undefined;
+  const iv = encryptedFile?.iv as string | undefined;
+  const hashes = encryptedFile?.hashes as Record<string, unknown> | undefined;
+  if (!key?.k || !iv || !hashes?.sha256) {
+    console.warn(
+      "[matrix] E2EE media found but missing key/iv/hashes — cannot decrypt",
+    );
+    return null;
+  }
+
   const mimeType =
     (info?.mimetype as string | undefined) ??
     (content.filename
       ? inferMimeTypeFromExtension(content.filename as string)
       : undefined);
 
+  const parsedFile: MatrixEncryptedFile = {
+    url: encryptedUrl,
+    key: {
+      kty: (key.kty as string | undefined) ?? "oct",
+      key_ops: (key.key_ops as string[] | undefined) ?? [],
+      alg: (key.alg as string | undefined) ?? "A256CTR",
+      k: key.k as string,
+      ext: (key.ext as boolean | undefined) ?? true,
+    },
+    iv,
+    hashes: { sha256: hashes.sha256 as string },
+    v: (encryptedFile?.v as string | undefined) ?? "v2",
+  };
+
   return {
-    mxcUrl: url,
+    mxcUrl: encryptedUrl,
     msgtype,
     filename:
       (content.filename as string | undefined) ??
@@ -97,6 +189,7 @@ export function collectMatrixMediaCandidate(
     isVoice:
       msgtype === "m.audio" &&
       (content["org.matrix.msc3245.voice"] != null || content.voice != null),
+    encryptedFile: parsedFile,
   };
 }
 
@@ -121,7 +214,20 @@ export async function downloadMatrixAttachment(
     return null;
   }
 
-  const downloaded = Buffer.from(buffer);
+  let downloaded: Buffer;
+  if (candidate.encryptedFile) {
+    try {
+      downloaded = decryptMatrixAttachment(buffer, candidate.encryptedFile);
+    } catch (err) {
+      console.warn(
+        "[matrix] Failed to decrypt E2EE attachment:",
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    }
+  } else {
+    downloaded = Buffer.from(buffer);
+  }
 
   const ext = candidate.filename ? extname(candidate.filename) : "";
   const filename = `${Date.now()}-${randomUUID()}${ext || ".bin"}`;

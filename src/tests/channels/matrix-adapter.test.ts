@@ -1,5 +1,6 @@
 // src/tests/channels/matrix-adapter.test.ts
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { createCipheriv } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +56,14 @@ class FakeMatrixClient {
   mxcToHttp = mock(
     (_mxc: string) =>
       "https://matrix.org/_matrix/media/v3/download/matrix.org/abc123",
+  );
+  downloadContent = mock(
+    async (
+      _mxcUrl: string,
+    ): Promise<{ body: ArrayBuffer; contentType: string }> => ({
+      body: new ArrayBuffer(0),
+      contentType: "application/octet-stream",
+    }),
   );
   start = mock(async () => {
     this._started = true;
@@ -2992,4 +3001,177 @@ test("Matrix turn state: finished(cancelled) with no thinking block sends no ext
   });
 
   expect(client.sendMessage).not.toHaveBeenCalled();
+});
+
+// ── Image / media handling ────────────────────────────────────────────────────
+
+test("adapter handles non-E2EE image message and emits attachment with imageDataBase64", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Provide a small PNG-like buffer as the "downloaded" image
+  const fakeImageBytes = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
+  client.downloadContent.mockResolvedValueOnce({
+    body: fakeImageBytes.buffer,
+    contentType: "image/png",
+  });
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$img1",
+    content: {
+      msgtype: "m.image",
+      url: "mxc://example.com/abc123",
+      body: "photo.png",
+      info: { mimetype: "image/png", size: fakeImageBytes.byteLength },
+    },
+  });
+
+  expect(received).toHaveLength(1);
+  expect(received[0]?.attachments).toHaveLength(1);
+  const att = received[0]?.attachments?.[0];
+  expect(att?.kind).toBe("image");
+  expect(att?.mimeType).toBe("image/png");
+  expect(att?.imageDataBase64).toBe(fakeImageBytes.toString("base64"));
+  expect(att?.localPath).toMatch(/\.png$/);
+  // text should be empty (body == filename with no separate caption)
+  expect(received[0]?.text).toBe("");
+  expect(client.downloadContent).toHaveBeenCalledWith(
+    "mxc://example.com/abc123",
+  );
+});
+
+test("adapter handles non-E2EE image with caption — caption becomes text", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+
+  const fakeImageBytes = Buffer.alloc(16, 0xff);
+  client.downloadContent.mockResolvedValueOnce({
+    body: fakeImageBytes.buffer,
+    contentType: "image/jpeg",
+  });
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$img2",
+    content: {
+      msgtype: "m.image",
+      url: "mxc://example.com/xyz789",
+      // MSC2530: filename is separate from body (caption)
+      filename: "photo.jpg",
+      body: "look at this",
+      info: { mimetype: "image/jpeg", size: fakeImageBytes.byteLength },
+    },
+  });
+
+  expect(received).toHaveLength(1);
+  expect(received[0]?.text).toBe("look at this");
+  expect(received[0]?.attachments).toHaveLength(1);
+  expect(received[0]?.attachments?.[0]?.kind).toBe("image");
+});
+
+test("adapter handles E2EE image message (content.file) and decrypts attachment", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+
+  // Generate a real AES-256-CTR key + IV and encrypt a small payload
+  const plaintext = Buffer.from("fake image data 1234567890abcdef");
+  const key = Buffer.alloc(32, 0xaa); // 256-bit key
+  const iv = Buffer.alloc(16, 0); // 128-bit IV
+  const cipher = createCipheriv("aes-256-ctr", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+
+  // base64url-encode key and iv
+  const toBase64Url = (buf: Buffer) =>
+    buf
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=/g, "");
+
+  client.downloadContent.mockResolvedValueOnce({
+    body: ciphertext.buffer.slice(
+      ciphertext.byteOffset,
+      ciphertext.byteOffset + ciphertext.byteLength,
+    ) as ArrayBuffer,
+    contentType: "application/octet-stream",
+  });
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$e2ee-img1",
+    content: {
+      msgtype: "m.image",
+      // No content.url — E2EE style
+      body: "secret.jpg",
+      info: { mimetype: "image/jpeg", size: plaintext.byteLength },
+      file: {
+        url: "mxc://example.com/encrypted456",
+        key: {
+          kty: "oct",
+          key_ops: ["encrypt", "decrypt"],
+          alg: "A256CTR",
+          k: toBase64Url(key),
+          ext: true,
+        },
+        iv: toBase64Url(iv),
+        hashes: { sha256: "dGVzdA==" }, // not verified in current impl
+        v: "v2",
+      },
+    },
+  });
+
+  expect(received).toHaveLength(1);
+  expect(received[0]?.attachments).toHaveLength(1);
+  const att = received[0]?.attachments?.[0];
+  expect(att?.kind).toBe("image");
+  // Decrypted content should equal the original plaintext
+  expect(att?.imageDataBase64).toBe(plaintext.toString("base64"));
+  expect(client.downloadContent).toHaveBeenCalledWith(
+    "mxc://example.com/encrypted456",
+  );
+});
+
+test("adapter skips E2EE image when content.file lacks key/iv (malformed)", async () => {
+  const adapter = await makeAdapter();
+  const received: InboundChannelMessage[] = [];
+  adapter.onMessage = async (msg) => {
+    received.push(msg);
+  };
+  await adapter.start();
+  const client = getFakeClient();
+
+  await client.emit("room.message", "!room:example.com", {
+    type: "m.room.message",
+    sender: "@user:example.com",
+    event_id: "$bad-e2ee",
+    content: {
+      msgtype: "m.image",
+      body: "broken.jpg",
+      // file present but missing key/iv/hashes
+      file: { url: "mxc://example.com/bad999" },
+    },
+  });
+
+  // Should not emit — no text, no attachment (malformed E2EE)
+  expect(received).toHaveLength(0);
+  expect(client.downloadContent).not.toHaveBeenCalled();
 });
