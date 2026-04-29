@@ -602,12 +602,13 @@ export function createMatrixAdapter(
     text: string,
   ): Promise<void> {
     const state = streamStates.get(roomId);
-    if (!state || !matrixClient) return;
+    if (!state || !matrixClient || state.messageId === "__pending__") return;
     try {
       await matrixClient.sendEvent(roomId, "m.room.message", {
+        msgtype: "m.text",
+        body: text,
         "m.new_content": { msgtype: "m.text", body: text },
         "m.relates_to": { rel_type: "m.replace", event_id: state.messageId },
-        body: "[editing…]",
       });
       state.lastEditAt = Date.now();
       state.lastText = text;
@@ -1271,18 +1272,19 @@ export function createMatrixAdapter(
       // If a streaming preview message exists, replace it with the final
       // canonical message instead of sending a new one.
       const streamState = streamStates.get(msg.chatId);
-      if (streamState) {
+      if (streamState && streamState.messageId !== "__pending__") {
         if (streamState.cleanupTimeout)
           clearTimeout(streamState.cleanupTimeout);
         if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
         streamStates.delete(msg.chatId);
         await client.sendEvent(msg.chatId, "m.room.message", {
+          msgtype: "m.text",
+          body: msg.text,
           "m.new_content": content,
           "m.relates_to": {
             rel_type: "m.replace",
             event_id: streamState.messageId,
           },
-          body: msg.text,
         });
 
         // Track for completion footer
@@ -1763,26 +1765,38 @@ export function createMatrixAdapter(
         const existing = streamStates.get(roomId);
 
         if (!existing) {
+          // Claim the slot synchronously before the async send to prevent a
+          // race where concurrent void-dispatched calls each see !existing and
+          // each create a separate initial message.
+          const sentinel: MatrixStreamState = {
+            messageId: "__pending__",
+            lastText: accumulatedText,
+            lastEditAt: Date.now(),
+            pendingTimer: null,
+            currentInterval: MATRIX_STREAM_INTERVAL_MS,
+            cleanupTimeout: null,
+          };
+          streamStates.set(roomId, sentinel);
           await stopTypingInterval(roomId);
           try {
             const eventId = await matrixClient.sendMessage(roomId, {
               msgtype: "m.text",
               body: accumulatedText,
             });
-            streamStates.set(roomId, {
-              messageId: String(eventId),
-              lastText: accumulatedText,
-              lastEditAt: Date.now(),
-              pendingTimer: null,
-              currentInterval: MATRIX_STREAM_INTERVAL_MS,
-              cleanupTimeout: null,
-            });
+            sentinel.messageId = String(eventId);
           } catch (error) {
+            streamStates.delete(roomId);
             console.error(
               "[Matrix] Initial stream post failed:",
               error instanceof Error ? error.message : error,
             );
           }
+          continue;
+        }
+
+        // Still waiting for the initial sendMessage to resolve — keep latest text.
+        if (existing.messageId === "__pending__") {
+          existing.lastText = accumulatedText;
           continue;
         }
 
