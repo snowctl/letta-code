@@ -1029,8 +1029,21 @@ export function createMatrixAdapter(
         }
 
         const body = ((content.body as string | undefined) ?? "").trim();
+        // Suppress body text for any media-type event: either the candidate
+        // was parsed and body equals the filename (Matrix sends the filename
+        // as body by default), OR the candidate failed to parse (malformed
+        // E2EE / missing URL) in which case body is still just the filename.
+        const isMediaMsgtype = [
+          "m.image",
+          "m.video",
+          "m.audio",
+          "m.file",
+        ].includes(msgtype ?? "");
         const textContent =
-          candidate && body === candidate.filename ? "" : body;
+          (candidate && body === candidate.filename) ||
+          (!candidate && isMediaMsgtype)
+            ? ""
+            : body;
 
         if (!textContent && attachments.length === 0) return;
 
@@ -1259,7 +1272,8 @@ export function createMatrixAdapter(
       // canonical message instead of sending a new one.
       const streamState = streamStates.get(msg.chatId);
       if (streamState) {
-        if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
+        if (streamState.cleanupTimeout)
+          clearTimeout(streamState.cleanupTimeout);
         if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
         streamStates.delete(msg.chatId);
         await client.sendEvent(msg.chatId, "m.room.message", {
@@ -1681,7 +1695,8 @@ export function createMatrixAdapter(
         const streamState = streamStates.get(chatId);
         if (streamState) {
           if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
-          if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
+          if (streamState.cleanupTimeout)
+            clearTimeout(streamState.cleanupTimeout);
           streamStates.delete(chatId);
         }
       }
