@@ -550,6 +550,10 @@ export async function handleIncomingMessage(
                 (agent as { last_run_completion?: string | null })
                   .last_run_completion ?? null,
             };
+            const ctxWindow = agent.llm_config?.context_window;
+            if (ctxWindow && ctxWindow > 0) {
+              runtime.contextWindowMax = ctxWindow;
+            }
           } catch {
             // Best-effort only. If the fetch fails, reminder building will
             // fall back to the existing null/placeholder behavior.
