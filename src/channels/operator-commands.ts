@@ -248,7 +248,8 @@ async function handleReset(
         return `No conversation at position ${n}. Run conv list to see options.`;
       }
       targetId = target.id;
-      targetLabel = target.id === "default" ? "default" : (target.summary ?? target.id);
+      targetLabel =
+        target.id === "default" ? "default" : (target.summary ?? target.id);
     }
   }
 

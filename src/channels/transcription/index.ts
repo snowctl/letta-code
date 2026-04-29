@@ -9,9 +9,9 @@
  * Outputs transcription with confidence scoring and XML wrapping for the agent.
  */
 
-import { readFileSync } from "node:fs";
-import { basename, extname } from "node:path";
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 
 export interface TranscriptionResult {
   success: boolean;
@@ -22,10 +22,7 @@ export interface TranscriptionResult {
 }
 
 /** XML-wrap transcribed text with confidence metadata for the agent. */
-export function formatTranscribed(
-  text: string,
-  confidence: number,
-): string {
+export function formatTranscribed(text: string, confidence: number): string {
   const label: "high" | "medium" | "low" =
     confidence > 0.9 ? "high" : confidence >= 0.7 ? "medium" : "low";
   const escaped = text
@@ -61,7 +58,7 @@ export function isTranscriptionConfigured(): boolean {
   return isCloudTranscriptionConfigured() || isLocalTranscriptionConfigured();
 }
 
-function estimateConfidence(rawResult: { text: string }): number {
+function estimateConfidence(_rawResult: { text: string }): number {
   // OpenAI API doesn't expose logprobs; conservative default
   return 0.9;
 }
@@ -85,22 +82,32 @@ async function transcribeViaLocalApi(
     const buffer = readFileSync(localPath);
     const filename = basename(localPath);
     const formData = new FormData();
-    formData.append("file", new Blob([buffer], { type: "audio/ogg" }), filename);
+    formData.append(
+      "file",
+      new Blob([buffer], { type: "audio/ogg" }),
+      filename,
+    );
     formData.append("model", "whisper-1");
     formData.append("response_format", "verbose_json");
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), LOCAL_TRANSCRIPTION_TIMEOUT_MS);
+    const timeout = setTimeout(
+      () => controller.abort(),
+      LOCAL_TRANSCRIPTION_TIMEOUT_MS,
+    );
 
     try {
       const response = await fetch(
-        PARAKEET_WHISPER_URL + "/v1/audio/transcriptions",
+        `${PARAKEET_WHISPER_URL}/v1/audio/transcriptions`,
         { method: "POST", body: formData, signal: controller.signal },
       );
 
       if (!response.ok) {
         const errorText = await response.text();
-        return { success: false, error: "Local Whisper API error: " + errorText };
+        return {
+          success: false,
+          error: `Local Whisper API error: ${errorText}`,
+        };
       }
 
       const data = (await response.json()) as {
@@ -133,7 +140,11 @@ async function transcribeViaWhisply(
 ): Promise<TranscriptionResult> {
   try {
     const venvPython = "/home/cypher/.local/venvs/lettabot/bin/python3";
-    const cmd = venvPython + " -m whisply run --files " + localPath + " --json 2>/dev/null";
+    const cmd =
+      venvPython +
+      " -m whisply run --files " +
+      localPath +
+      " --json 2>/dev/null";
 
     const output = execSync(cmd, {
       timeout: LOCAL_TRANSCRIPTION_TIMEOUT_MS,
@@ -172,7 +183,8 @@ async function transcribeViaCloudApi(
   if (!apiKey) {
     return {
       success: false,
-      error: "No transcription backend: set OPENAI_API_KEY, PARAKEET_WHISPER_URL, or install whisply.",
+      error:
+        "No transcription backend: set OPENAI_API_KEY, PARAKEET_WHISPER_URL, or install whisply.",
     };
   }
 
@@ -180,27 +192,38 @@ async function transcribeViaCloudApi(
     const buffer = readFileSync(localPath);
     const filename = basename(localPath);
     const formData = new FormData();
-    formData.append("file", new Blob([buffer], { type: "audio/ogg" }), filename);
+    formData.append(
+      "file",
+      new Blob([buffer], { type: "audio/ogg" }),
+      filename,
+    );
     formData.append("model", "whisper-1");
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), TRANSCRIPTION_TIMEOUT_MS);
+    const timeout = setTimeout(
+      () => controller.abort(),
+      TRANSCRIPTION_TIMEOUT_MS,
+    );
 
     try {
       const response = await fetch(WHISPER_API_URL, {
         method: "POST",
-        headers: { Authorization: "Bearer " + apiKey },
+        headers: { Authorization: `Bearer ${apiKey}` },
         body: formData,
         signal: controller.signal,
       });
 
       if (!response.ok) {
         const errorText = await response.text();
-        return { success: false, error: "Whisper API error: " + errorText };
+        return { success: false, error: `Whisper API error: ${errorText}` };
       }
 
       const data = (await response.json()) as { text: string };
-      return { success: true, text: data.text, confidence: estimateConfidence(data) };
+      return {
+        success: true,
+        text: data.text,
+        confidence: estimateConfidence(data),
+      };
     } finally {
       clearTimeout(timeout);
     }

@@ -24,7 +24,6 @@ class FakeMatrixClient {
 
   private handlers = new Map<string, EventHandler[]>();
   private inviteHandlers: InviteHandler[] = [];
-  private _started = false;
 
   sendMessage = mock(
     async (_roomId: string, _content: unknown) => "$fake-event-id",
@@ -64,6 +63,7 @@ class FakeMatrixClient {
     this._started = false;
   });
   dms = { isDm: (_roomId: string) => false };
+  _started: boolean = false;
   cryptoProviderArg: unknown = undefined;
 
   constructor(
@@ -104,13 +104,9 @@ class FakeMatrixClient {
   }
 }
 
-class FakeSimpleFsStorageProvider {
-  constructor(_path: string) {}
-}
+class FakeSimpleFsStorageProvider {}
 
-class FakeRustSdkCryptoStorageProvider {
-  constructor(_path: string, _type: unknown) {}
-}
+class FakeRustSdkCryptoStorageProvider {}
 
 // ── Test setup ─────────────────────────────────────────────────────────────────
 
@@ -284,7 +280,7 @@ test("matrixMessageActions.handleAction edit sends m.replace with new content", 
   expect(result).toContain("Message edited");
   expect(result).toContain("$edit-event");
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const callArgs = client.sendMessage.mock.calls[0]![1] as Record<
+  const callArgs = client.sendMessage.mock.calls[0]?.[1] as Record<
     string,
     unknown
   >;
@@ -729,7 +725,7 @@ test("handleControlRequestEvent sends prompt and pre-reacts for generic_tool_app
   client.sendMessage.mockResolvedValueOnce("$prompt-event");
   client.sendEvent.mockResolvedValue("$reaction-event");
 
-  await adapter.handleControlRequestEvent!({
+  await adapter.handleControlRequestEvent?.({
     requestId: "req1",
     kind: "generic_tool_approval",
     source: {
@@ -772,7 +768,7 @@ test("tapping ✅ emits synthetic approve message", async () => {
   client.sendMessage.mockResolvedValueOnce("$prompt-event");
   client.sendEvent.mockResolvedValue("$reaction-event");
 
-  await adapter.handleControlRequestEvent!({
+  await adapter.handleControlRequestEvent?.({
     requestId: "req1",
     kind: "generic_tool_approval",
     source: {
@@ -821,7 +817,7 @@ test("tapping ❌ emits synthetic deny message", async () => {
   client.sendMessage.mockResolvedValueOnce("$prompt-event");
   client.sendEvent.mockResolvedValue("$reaction-event");
 
-  await adapter.handleControlRequestEvent!({
+  await adapter.handleControlRequestEvent?.({
     requestId: "req2",
     kind: "enter_plan_mode",
     source: {
@@ -866,7 +862,7 @@ test("bot's own reactions to the prompt are ignored (no self-feedback loop)", as
   client.sendMessage.mockResolvedValueOnce("$prompt-event");
   client.sendEvent.mockResolvedValue("$reaction-event");
 
-  await adapter.handleControlRequestEvent!({
+  await adapter.handleControlRequestEvent?.({
     requestId: "req3",
     kind: "generic_tool_approval",
     source: {
@@ -912,7 +908,7 @@ test("tapping 📝 sends follow-up prompt and waits for freeform text", async ()
     .mockResolvedValueOnce("$followup-event"); // follow-up "please type"
   client.sendEvent.mockResolvedValue("$reaction-event");
 
-  await adapter.handleControlRequestEvent!({
+  await adapter.handleControlRequestEvent?.({
     requestId: "req-freeform",
     kind: "generic_tool_approval",
     source: {
@@ -982,7 +978,7 @@ test("ask_user_question with options: tapping 1️⃣ emits synthetic text '1'",
   client.sendMessage.mockResolvedValueOnce("$prompt-event");
   client.sendEvent.mockResolvedValue("$reaction-event");
 
-  await adapter.handleControlRequestEvent!({
+  await adapter.handleControlRequestEvent?.({
     requestId: "req-ask",
     kind: "ask_user_question",
     source: {
@@ -1035,7 +1031,7 @@ test("ask_user_question with >10 options sends 10 keycap + 📝 = 11 pre-reactio
     label: `Option ${i + 1}`,
   }));
 
-  await adapter.handleControlRequestEvent!({
+  await adapter.handleControlRequestEvent?.({
     requestId: "req-many",
     kind: "ask_user_question",
     source: {
@@ -1141,7 +1137,7 @@ test("Matrix typing indicator: setTyping(true) called on queued event", async ()
   await adapter.start();
   const client = getLifecycleFakeClient();
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "queued",
     source: MATRIX_LIFECYCLE_SOURCE,
   });
@@ -1158,12 +1154,12 @@ test("Matrix typing indicator: setTyping(false) called on finished event", async
   await adapter.start();
   const client = getLifecycleFakeClient();
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "queued",
     source: MATRIX_LIFECYCLE_SOURCE,
   });
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
@@ -1184,7 +1180,7 @@ test("Matrix turn state: finished(completed) edits last response with completion
   // processing stamps turn start; sendMessage captures last response event ID
   client.sendMessage.mockResolvedValueOnce("$response-1"); // plain text response
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "processing",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
@@ -1199,7 +1195,7 @@ test("Matrix turn state: finished(completed) edits last response with completion
 
   client.sendMessage.mockResolvedValueOnce("$footer-edit-1"); // completion footer edit
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
@@ -1241,7 +1237,7 @@ test("Matrix tool block: first tool_call sends thinking placeholder then tool bl
     .mockResolvedValueOnce("$thinking-1")
     .mockResolvedValueOnce("$tool-block-1");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "bash",
@@ -1283,14 +1279,14 @@ test("Matrix tool block: second tool_call edits tool block via m.replace", async
     .mockResolvedValueOnce("$tool-block-1")
     .mockResolvedValueOnce("$tool-block-edit-1");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "bash",
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "read_file",
@@ -1327,7 +1323,7 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
   client.sendMessage.mockResolvedValue("$tool-block-main");
 
   for (let i = 0; i < 150; i++) {
-    await adapter.handleTurnLifecycleEvent!({
+    await adapter.handleTurnLifecycleEvent?.({
       type: "tool_call",
       batchId: "batch-1",
       toolName: `tool_${i}`,
@@ -1342,15 +1338,15 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
     [string, Record<string, unknown>]
   >;
   // calls[0]: thinking placeholder (no m.relates_to)
-  expect(calls[0]![1]["m.relates_to"]).toBeUndefined();
+  expect(calls[0]?.[1]["m.relates_to"]).toBeUndefined();
   expect(
-    (calls[0]![1] as Record<string, unknown>).formatted_body as string,
+    (calls[0]?.[1] as Record<string, unknown>).formatted_body as string,
   ).toContain("Thinking...");
   // calls[1]: tool block create (no m.relates_to)
-  expect(calls[1]![1]["m.relates_to"]).toBeUndefined();
+  expect(calls[1]?.[1]["m.relates_to"]).toBeUndefined();
   // calls[2..150]: tool block edits
   for (let i = 2; i < calls.length; i++) {
-    const relatesTo = calls[i]![1]["m.relates_to"] as
+    const relatesTo = calls[i]?.[1]["m.relates_to"] as
       | Record<string, unknown>
       | undefined;
     expect(relatesTo?.rel_type).toBe("m.replace");
@@ -1369,7 +1365,7 @@ test("Matrix tool block: cleared on finished, no redaction (thinking stays)", as
     .mockResolvedValueOnce("$thinking-second")
     .mockResolvedValueOnce("$block-second");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "bash",
@@ -1378,7 +1374,7 @@ test("Matrix tool block: cleared on finished, no redaction (thinking stays)", as
   await new Promise((r) => setTimeout(r, 10));
 
   // Finish with no response — thinking stays (buffer empty, no final edit, no redact)
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
@@ -1389,7 +1385,7 @@ test("Matrix tool block: cleared on finished, no redaction (thinking stays)", as
   expect(client.redactEvent).not.toHaveBeenCalled();
 
   // Second tool_call in a new turn
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-2",
     toolName: "read_file",
@@ -1423,7 +1419,7 @@ test("Matrix tool block: no thinking placeholder when showReasoning is false", a
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValueOnce("$tool-block-1");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "batch-1",
     toolName: "bash",
@@ -1464,10 +1460,10 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
     conversationId: "conv1",
   };
 
-  await adapter.handleStreamReasoning!("I need to search for this.", [source]);
+  await adapter.handleStreamReasoning?.("I need to search for this.", [source]);
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
-  await adapter.handleStreamReasoning!(" Found 3 results.", [source]);
+  await adapter.handleStreamReasoning?.(" Found 3 results.", [source]);
 
   const result = await adapter.sendMessage({
     channel: "matrix",
@@ -1492,7 +1488,7 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   ).toBeUndefined();
 
   // Thinking is finalized only when the turn ends
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [source],
@@ -1566,7 +1562,7 @@ test("matrix adapter skips reasoning drawer when showReasoning is false", async 
   await adapter.start();
   const client = getFakeClient();
 
-  await adapter.handleStreamReasoning!("thinking...", [
+  await adapter.handleStreamReasoning?.("thinking...", [
     {
       channel: "matrix" as const,
       accountId: "acc1",
@@ -1616,7 +1612,7 @@ test("matrix adapter: thinking placeholder (no reasoning content) stays, plain a
   };
 
   // Tool call sends thinking placeholder then tool block
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "b1",
     toolName: "bash",
@@ -1668,11 +1664,11 @@ test("matrix adapter: thinking finalized when turn ends without response", async
     conversationId: "conv1",
   };
 
-  await adapter.handleStreamReasoning!("Reasoning about this...", [source]);
+  await adapter.handleStreamReasoning?.("Reasoning about this...", [source]);
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
   // Turn ends without response
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [source],
@@ -1724,9 +1720,9 @@ test("matrix adapter: very long reasoning is sliding-window truncated to fit Mat
   const filler = "x".repeat(30_000);
   const longReasoning = `${headMarker}${filler}${tailMarker}`;
 
-  await adapter.handleStreamReasoning!(longReasoning, [source]);
+  await adapter.handleStreamReasoning?.(longReasoning, [source]);
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [source],
@@ -1777,9 +1773,9 @@ test("matrix adapter: short reasoning is NOT truncated (no notice)", async () =>
   };
 
   // Short reasoning — well under the cap, must pass through unchanged.
-  await adapter.handleStreamReasoning!("Just a brief thought.", [source]);
+  await adapter.handleStreamReasoning?.("Just a brief thought.", [source]);
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [source],
@@ -1821,11 +1817,11 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   };
 
   // First reasoning segment
-  await adapter.handleStreamReasoning!("First thought.", [source]);
+  await adapter.handleStreamReasoning?.("First thought.", [source]);
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
   // Tool call interrupts — marks separator needed
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "b1",
     toolName: "bash",
@@ -1834,10 +1830,10 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   await new Promise((r) => setTimeout(r, 10));
 
   // Second reasoning segment (after tool)
-  await adapter.handleStreamReasoning!("Second thought.", [source]);
+  await adapter.handleStreamReasoning?.("Second thought.", [source]);
 
   // ChannelAction tool call (response send) — skipped by adapter, no tool block
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "b1",
     toolName: "ChannelAction",
@@ -1855,7 +1851,7 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   expect(client.sendMessage).toHaveBeenCalledTimes(3); // thinking + tool block + answer
 
   // Finalize at "finished"
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "b1",
     sources: [source],
@@ -2504,7 +2500,7 @@ test("matrix adapter !help replies with all command names", async () => {
     ((c[1] as Record<string, unknown>).body as string)?.includes("!cancel"),
   );
   expect(helpCall).toBeDefined();
-  const body = (helpCall![1] as Record<string, unknown>).body as string;
+  const body = (helpCall?.[1] as Record<string, unknown>).body as string;
   expect(body).toContain("!compact");
   expect(body).toContain("!conv list");
   expect(body).toContain("!help");
@@ -2550,7 +2546,7 @@ test("Matrix tool progress: tool_started edits placeholder with running tool blo
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-bash-1",
@@ -2578,7 +2574,7 @@ test("Matrix tool progress: timeoutMs shown in m:ss when agent set custom timeou
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-bash-2",
@@ -2599,7 +2595,7 @@ test("Matrix tool progress: no `/ max` shown when tool has no timeout", async ()
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-read-1",
@@ -2624,7 +2620,7 @@ test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotat
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-bash-3",
@@ -2635,7 +2631,7 @@ test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotat
   });
   await new Promise((r) => setTimeout(r, 30));
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-1",
     toolCallId: "call-bash-3",
@@ -2658,7 +2654,7 @@ test("Matrix tool progress: error outcome shows `errored after m:ss`", async () 
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-bash-err",
@@ -2669,7 +2665,7 @@ test("Matrix tool progress: error outcome shows `errored after m:ss`", async () 
   });
   await new Promise((r) => setTimeout(r, 30));
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-1",
     toolCallId: "call-bash-err",
@@ -2692,7 +2688,7 @@ test("Matrix tool progress: a new tool_started clears the previous `took` annota
   client.sendMessage.mockResolvedValue("$placeholder");
 
   // First tool runs and ends.
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-1",
@@ -2702,7 +2698,7 @@ test("Matrix tool progress: a new tool_started clears the previous `took` annota
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
   await new Promise((r) => setTimeout(r, 30));
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-1",
     toolCallId: "call-1",
@@ -2715,7 +2711,7 @@ test("Matrix tool progress: a new tool_started clears the previous `took` annota
 
   // Second tool starts. The "took" annotation should be replaced with a fresh
   // running block — not stacked alongside it.
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-2",
@@ -2737,7 +2733,7 @@ test("Matrix tool progress: secret-shaped substrings in args are redacted in the
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-curl",
@@ -2765,7 +2761,7 @@ test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis",
 
   const longCommand =
     "echo this is a very long command that should definitely exceed the eighty character preview limit imposed by buildArgsPreview";
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-long",
@@ -2787,7 +2783,7 @@ test("Matrix tool progress: ChannelAction and NotifyUser do not trigger tool-pro
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
     toolCallId: "call-ca",
@@ -2808,7 +2804,7 @@ test("Matrix tool progress: tool that completes inside grace window is invisible
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-fast",
     toolCallId: "call-instant",
@@ -2818,7 +2814,7 @@ test("Matrix tool progress: tool that completes inside grace window is invisible
   });
   // Tool ends well inside the 120 ms grace window.
   await new Promise((r) => setTimeout(r, 30));
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-fast",
     toolCallId: "call-instant",
@@ -2846,7 +2842,7 @@ test("Matrix tool progress: tool that survives the grace window renders normally
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-slow",
     toolCallId: "call-slow",
@@ -2857,7 +2853,7 @@ test("Matrix tool progress: tool that survives the grace window renders normally
   });
   // Wait past the grace window — the running block should now be visible.
   await new Promise((r) => setTimeout(r, 100));
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-slow",
     toolCallId: "call-slow",
@@ -2884,12 +2880,12 @@ test("Matrix turn state: finished(error) with thinking block appends error foote
     .mockResolvedValueOnce("$thinking-1") // initial thinking placeholder
     .mockResolvedValueOnce("$finalize-1"); // final edit at finished
 
-  await adapter.handleStreamReasoning!("Checking email…", [
+  await adapter.handleStreamReasoning?.("Checking email…", [
     MATRIX_LIFECYCLE_SOURCE,
   ]);
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
@@ -2922,7 +2918,7 @@ test("Matrix turn state: finished(error) with no thinking block sends fallback e
 
   client.sendMessage.mockResolvedValueOnce("$fallback-error-1");
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
@@ -2953,12 +2949,12 @@ test("Matrix turn state: finished(cancelled) with thinking block appends cancell
     .mockResolvedValueOnce("$thinking-1")
     .mockResolvedValueOnce("$finalize-1");
 
-  await adapter.handleStreamReasoning!("Drafting essay…", [
+  await adapter.handleStreamReasoning?.("Drafting essay…", [
     MATRIX_LIFECYCLE_SOURCE,
   ]);
   expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],
@@ -2988,7 +2984,7 @@ test("Matrix turn state: finished(cancelled) with no thinking block sends no ext
   await adapter.start();
   const client = getLifecycleFakeClient();
 
-  await adapter.handleTurnLifecycleEvent!({
+  await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
     sources: [MATRIX_LIFECYCLE_SOURCE],

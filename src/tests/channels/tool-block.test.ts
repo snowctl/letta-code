@@ -2,8 +2,8 @@
 import { expect, test } from "bun:test";
 import {
   renderToolBlock,
-  upsertToolCallGroup,
   type ToolCallGroup,
+  upsertToolCallGroup,
 } from "../../channels/tool-block";
 
 test("renderToolBlock: empty groups returns empty string", () => {

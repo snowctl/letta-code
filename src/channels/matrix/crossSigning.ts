@@ -199,8 +199,9 @@ export async function ensureCrossSigning(
   }
   // `/keys/signatures/upload` always returns 200; actual per-key failures
   // come back in a `failures` map. If non-empty, the upload didn't apply.
-  const failures = (signaturesResp.json as { failures?: Record<string, unknown> } | null)
-    ?.failures;
+  const failures = (
+    signaturesResp.json as { failures?: Record<string, unknown> } | null
+  )?.failures;
   if (failures && Object.keys(failures).length > 0) {
     throw new Error(
       `[matrix] cross-signing: /keys/signatures/upload partial failure: ${JSON.stringify(failures)}`,
