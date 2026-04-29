@@ -972,6 +972,7 @@ export function createTelegramAdapter(
           const eventUsage =
             event.type === "finished" ? event.usage : undefined;
           const showUsage =
+            config.showContextUsage !== false &&
             eventUsage &&
             eventUsage.contextTokens > 0 &&
             eventUsage.contextWindowMax > 0;

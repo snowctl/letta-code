@@ -361,7 +361,7 @@ interface ChannelAccountBase {
   updatedAt: string;
   /** When false, reasoning display is disabled. Defaults to true. */
   showReasoning?: boolean;
-  /** Show context window token usage in message footer. Defaults to false. */
+  /** When false, context window token usage is hidden in the message footer. Defaults to true. */
   showContextUsage?: boolean;
 }
 

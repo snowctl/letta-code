@@ -1441,6 +1441,7 @@ export function createMatrixAdapter(
           const eventUsage =
             event.type === "finished" ? event.usage : undefined;
           const showUsage =
+            account.showContextUsage !== false &&
             eventUsage &&
             eventUsage.contextTokens > 0 &&
             eventUsage.contextWindowMax > 0;
