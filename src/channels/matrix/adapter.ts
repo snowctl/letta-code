@@ -239,6 +239,9 @@ interface MatrixClientLike {
     filename: string,
   ): Promise<string>;
   mxcToHttp(mxc: string): string;
+  downloadContent(
+    mxcUrl: string,
+  ): Promise<{ body: ArrayBuffer; contentType: string }>;
   getUserProfile(userId: string): Promise<{ displayname?: string }>;
   getJoinedRoomMembers(roomId: string): Promise<string[]>;
   setTyping(roomId: string, isTyping: boolean, timeout?: number): Promise<void>;
@@ -270,6 +273,20 @@ export function createMatrixAdapter(
   const pendingReactionRequests = new Map<string, PendingReactionRequest>();
   // Map from `${chatId}:${senderId}` → requestId
   const awaitingFreeformByChat = new Map<string, string>();
+
+  // ── Streaming state ──────────────────────────────────────────────
+  const MATRIX_STREAM_INTERVAL_MS = 500;
+  const MATRIX_STREAM_INTERVAL_MAX_MS = 8_000;
+
+  interface MatrixStreamState {
+    messageId: string;
+    lastText: string;
+    lastEditAt: number;
+    pendingTimer: ReturnType<typeof setTimeout> | null;
+    currentInterval: number;
+    cleanupTimeout: ReturnType<typeof setTimeout> | null;
+  }
+  const streamStates = new Map<string, MatrixStreamState>();
 
   // ── Typing indicator state ────────────────────────────────────────
   const typingIntervalByChatId = new Map<
@@ -576,6 +593,39 @@ export function createMatrixAdapter(
       });
     }, 150);
     reasoningFlushIntervalByChatId.set(chatId, interval);
+  }
+
+  // ── Stream edit helper ────────────────────────────────────────────
+
+  async function editStreamMessage(
+    roomId: string,
+    text: string,
+  ): Promise<void> {
+    const state = streamStates.get(roomId);
+    if (!state || !matrixClient) return;
+    try {
+      await matrixClient.sendEvent(roomId, "m.room.message", {
+        "m.new_content": { msgtype: "m.text", body: text },
+        "m.relates_to": { rel_type: "m.replace", event_id: state.messageId },
+        body: "[editing…]",
+      });
+      state.lastEditAt = Date.now();
+      state.lastText = text;
+    } catch (error: unknown) {
+      const errCode = (error as { errcode?: string }).errcode;
+      if (errCode === "M_LIMIT_EXCEEDED") {
+        state.currentInterval = Math.min(
+          state.currentInterval * 2,
+          MATRIX_STREAM_INTERVAL_MAX_MS,
+        );
+        if (state.pendingTimer) clearTimeout(state.pendingTimer);
+        state.pendingTimer = setTimeout(() => {
+          state.pendingTimer = null;
+          void editStreamMessage(roomId, state.lastText);
+        }, state.currentInterval);
+      }
+      // other errors: silently drop (streaming edit failures are non-fatal)
+    }
   }
 
   /** Ensure a thinking-placeholder message exists for this chat, creating one
@@ -956,15 +1006,26 @@ export function createMatrixAdapter(
         const candidate = collectMatrixMediaCandidate(eventObj);
         const attachments = [];
         if (candidate) {
-          const httpUrl = client.mxcToHttp(candidate.mxcUrl);
-          const attachment = await downloadMatrixAttachment(
-            candidate,
-            httpUrl,
-            accountId,
-            maxMediaDownloadBytes,
-            transcribeVoice,
-          );
-          if (attachment) attachments.push(attachment);
+          let mediaBuffer: ArrayBuffer | null = null;
+          try {
+            const { body } = await client.downloadContent(candidate.mxcUrl);
+            mediaBuffer = body;
+          } catch (err) {
+            console.warn(
+              "[Matrix] Failed to download media:",
+              err instanceof Error ? err.message : err,
+            );
+          }
+          if (mediaBuffer) {
+            const attachment = await downloadMatrixAttachment(
+              candidate,
+              mediaBuffer,
+              accountId,
+              maxMediaDownloadBytes,
+              transcribeVoice,
+            );
+            if (attachment) attachments.push(attachment);
+          }
         }
 
         const body = ((content.body as string | undefined) ?? "").trim();
@@ -1054,6 +1115,11 @@ export function createMatrixAdapter(
         }
       }
       typingIntervalByChatId.clear();
+      for (const state of streamStates.values()) {
+        if (state.pendingTimer) clearTimeout(state.pendingTimer);
+        if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
+      }
+      streamStates.clear();
       toolBlockStateByChatId.clear();
       toolBlockOperationByChatId.clear();
       for (const [, timer] of reasoningFlushIntervalByChatId) {
@@ -1187,6 +1253,31 @@ export function createMatrixAdapter(
         content["m.relates_to"] = {
           "m.in_reply_to": { event_id: msg.replyToMessageId },
         };
+      }
+
+      // If a streaming preview message exists, replace it with the final
+      // canonical message instead of sending a new one.
+      const streamState = streamStates.get(msg.chatId);
+      if (streamState) {
+        if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
+        if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
+        streamStates.delete(msg.chatId);
+        await client.sendEvent(msg.chatId, "m.room.message", {
+          "m.new_content": content,
+          "m.relates_to": {
+            rel_type: "m.replace",
+            event_id: streamState.messageId,
+          },
+          body: msg.text,
+        });
+
+        // Track for completion footer
+        lastResponseByChatId.set(msg.chatId, {
+          eventId: streamState.messageId,
+          text: msg.text,
+          html: content.formatted_body as string,
+        });
+        return { messageId: streamState.messageId };
       }
 
       const eventId = await client.sendMessage(msg.chatId, content);
@@ -1584,6 +1675,15 @@ export function createMatrixAdapter(
           }
           clearReasoningState(chatId);
         }
+
+        // Clean up any dangling streaming state (e.g. silent turn never sent
+        // a final sendMessage that would have replaced the stream message).
+        const streamState = streamStates.get(chatId);
+        if (streamState) {
+          if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
+          if (streamState.cleanupTimeout) clearTimeout(streamState.cleanupTimeout);
+          streamStates.delete(chatId);
+        }
       }
     },
 
@@ -1633,6 +1733,71 @@ export function createMatrixAdapter(
               error instanceof Error ? error.message : error,
             );
           }
+        }
+      }
+    },
+
+    async handleStreamText(
+      accumulatedText: string,
+      sources: ChannelTurnSource[],
+    ): Promise<void> {
+      if (!running || !matrixClient) return;
+
+      for (const source of sources) {
+        const roomId = source.chatId;
+        const existing = streamStates.get(roomId);
+
+        if (!existing) {
+          await stopTypingInterval(roomId);
+          try {
+            const eventId = await matrixClient.sendMessage(roomId, {
+              msgtype: "m.text",
+              body: accumulatedText,
+            });
+            streamStates.set(roomId, {
+              messageId: String(eventId),
+              lastText: accumulatedText,
+              lastEditAt: Date.now(),
+              pendingTimer: null,
+              currentInterval: MATRIX_STREAM_INTERVAL_MS,
+              cleanupTimeout: null,
+            });
+          } catch (error) {
+            console.error(
+              "[Matrix] Initial stream post failed:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+          continue;
+        }
+
+        existing.lastText = accumulatedText;
+        const elapsed = Date.now() - existing.lastEditAt;
+
+        if (elapsed >= existing.currentInterval) {
+          if (existing.pendingTimer) {
+            clearTimeout(existing.pendingTimer);
+            existing.pendingTimer = null;
+          }
+          void editStreamMessage(roomId, accumulatedText);
+        } else {
+          if (existing.pendingTimer) clearTimeout(existing.pendingTimer);
+          existing.pendingTimer = setTimeout(() => {
+            existing.pendingTimer = null;
+            void editStreamMessage(roomId, existing.lastText);
+          }, existing.currentInterval - elapsed);
+        }
+      }
+    },
+
+    async handleStreamReset(sources: ChannelTurnSource[]): Promise<void> {
+      if (!running) return;
+      for (const source of sources) {
+        const state = streamStates.get(source.chatId);
+        if (state) {
+          if (state.pendingTimer) clearTimeout(state.pendingTimer);
+          if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
+          streamStates.delete(source.chatId);
         }
       }
     },

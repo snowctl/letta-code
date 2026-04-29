@@ -5,7 +5,6 @@ import { extname, join } from "node:path";
 import { getChannelDir } from "../config";
 import type { ChannelMessageAttachment } from "../types";
 
-export const MATRIX_DOWNLOAD_TIMEOUT_MS = 15_000;
 export const MATRIX_DEFAULT_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 export const MATRIX_INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -103,7 +102,7 @@ export function collectMatrixMediaCandidate(
 
 export async function downloadMatrixAttachment(
   candidate: MatrixMediaCandidate,
-  httpUrl: string,
+  buffer: ArrayBuffer,
   accountId: string,
   maxBytes: number,
   transcribeVoice: boolean,
@@ -115,79 +114,47 @@ export async function downloadMatrixAttachment(
     return null;
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    MATRIX_DOWNLOAD_TIMEOUT_MS,
-  );
-
-  try {
-    const response = await fetch(httpUrl, { signal: controller.signal });
-    if (!response.ok) {
-      console.warn(
-        `[matrix] Attachment download failed: HTTP ${response.status}`,
-      );
-      return null;
-    }
-
-    const contentLength = Number(response.headers.get("content-length") ?? 0);
-    if (contentLength > maxBytes) {
-      console.warn(
-        `[matrix] Skipping attachment: content-length ${contentLength} exceeds limit ${maxBytes}`,
-      );
-      return null;
-    }
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.byteLength > maxBytes) {
-      console.warn(
-        `[matrix] Skipping attachment: downloaded size ${buffer.byteLength} exceeds limit ${maxBytes}`,
-      );
-      return null;
-    }
-
-    const ext = candidate.filename ? extname(candidate.filename) : "";
-    const filename = `${Date.now()}-${randomUUID()}${ext || ".bin"}`;
-    const dir = join(getChannelDir("matrix"), "inbound", accountId);
-    await mkdir(dir, { recursive: true });
-    const localPath = join(dir, filename);
-    await writeFile(localPath, buffer);
-
-    const mimeType = candidate.mimeType ?? inferMimeTypeFromExtension(filename);
-    const kind = matrixMsgtypeToKind(candidate.msgtype, mimeType);
-
-    const attachment: ChannelMessageAttachment = {
-      name: candidate.filename,
-      mimeType,
-      sizeBytes: buffer.byteLength,
-      kind,
-      localPath,
-    };
-
-    if (
-      kind === "image" &&
-      buffer.byteLength <= MATRIX_INLINE_IMAGE_MAX_BYTES
-    ) {
-      attachment.imageDataBase64 = buffer.toString("base64");
-    }
-
-    if (candidate.isVoice && transcribeVoice) {
-      const { transcribeAudioFile } = await import("../transcription/index");
-      const result = await transcribeAudioFile(localPath);
-      if (result.success && result.text) {
-        attachment.transcription = result.text;
-      }
-    }
-
-    return attachment;
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      console.warn("[matrix] Attachment download timed out");
-    } else {
-      console.warn("[matrix] Attachment download error:", err);
-    }
+  if (buffer.byteLength > maxBytes) {
+    console.warn(
+      `[matrix] Skipping attachment: downloaded size ${buffer.byteLength} exceeds limit ${maxBytes}`,
+    );
     return null;
-  } finally {
-    clearTimeout(timer);
   }
+
+  const downloaded = Buffer.from(buffer);
+
+  const ext = candidate.filename ? extname(candidate.filename) : "";
+  const filename = `${Date.now()}-${randomUUID()}${ext || ".bin"}`;
+  const dir = join(getChannelDir("matrix"), "inbound", accountId);
+  await mkdir(dir, { recursive: true });
+  const localPath = join(dir, filename);
+  await writeFile(localPath, downloaded);
+
+  const mimeType = candidate.mimeType ?? inferMimeTypeFromExtension(filename);
+  const kind = matrixMsgtypeToKind(candidate.msgtype, mimeType);
+
+  const attachment: ChannelMessageAttachment = {
+    name: candidate.filename,
+    mimeType,
+    sizeBytes: downloaded.byteLength,
+    kind,
+    localPath,
+  };
+
+  if (
+    kind === "image" &&
+    downloaded.byteLength <= MATRIX_INLINE_IMAGE_MAX_BYTES
+  ) {
+    attachment.imageDataBase64 = downloaded.toString("base64");
+  }
+
+  if (candidate.isVoice && transcribeVoice) {
+    const { transcribeAudioFile } = await import("../transcription/index");
+    const result = await transcribeAudioFile(localPath);
+    if (result.success && result.text) {
+      attachment.transcription = result.text;
+    }
+  }
+
+  return attachment;
 }
