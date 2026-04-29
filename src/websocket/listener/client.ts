@@ -251,6 +251,7 @@ import {
   normalizeMessageContentImages,
   scheduleQueuePump,
   shouldQueueInboundMessage,
+  tryStripSteerPrefix,
 } from "./queue";
 import { emitLoopErrorNotice } from "./recoverable-notices";
 import {
@@ -3941,6 +3942,8 @@ async function handleAbortMessageInput(
 
   const interruptedRunId = scopedRuntime.activeRunId;
   scopedRuntime.cancelRequested = true;
+  // Increment epoch to invalidate any stale context from the aborted turn
+  scopedRuntime.continuationEpoch += 1;
   const pendingRequestsSnapshot = hasPendingApprovals
     ? resolvedDeps.getPendingControlRequests(listener, scope)
     : [];
@@ -4815,6 +4818,56 @@ async function connectWithRetry(
           incoming.agentId,
           incoming.conversationId,
         );
+
+        // Check for !steer prefix — bypass queue, treat as immediate interrupt
+        if (tryStripSteerPrefix(incoming)) {
+          // Strip the prefix (mutated in place), route through abort-then-inject
+          if (scopedRuntime.isProcessing) {
+            scopedRuntime.cancelRequested = true;
+            scopedRuntime.isProcessing = false;
+            clearActiveRunState(scopedRuntime);
+            setLoopStatus(scopedRuntime, "WAITING_ON_INPUT", {
+              agent_id: incoming.agentId,
+              conversation_id: incoming.conversationId,
+            });
+            emitRuntimeStateUpdates(scopedRuntime, {
+              agent_id: incoming.agentId,
+              conversation_id: incoming.conversationId,
+            });
+          }
+          scopedRuntime.continuationEpoch += 1;
+
+          // Chain directly on messageQueue (bypasses queue — same pattern as non-queueable path)
+          scopedRuntime.messageQueue = scopedRuntime.messageQueue
+            .then(async () => {
+              if (runtime !== getActiveRuntime() || runtime.intentionallyClosed) {
+                return;
+              }
+              emitListenerStatus(runtime, opts.onStatusChange, opts.connectionId);
+              await handleIncomingMessage(
+                incoming,
+                socket,
+                scopedRuntime,
+                opts.onStatusChange,
+                opts.connectionId,
+              );
+              emitListenerStatus(runtime, opts.onStatusChange, opts.connectionId);
+              scheduleQueuePump(scopedRuntime, socket, opts, processQueuedTurn);
+            })
+            .catch((error: unknown) => {
+              trackListenerError(
+                "listener_queued_input_failed",
+                error,
+                "listener_message_queue",
+              );
+              if (process.env.DEBUG) {
+                console.error("[Listen] Error handling steer message:", error);
+              }
+              emitListenerStatus(runtime, opts.onStatusChange, opts.connectionId);
+              scheduleQueuePump(scopedRuntime, socket, opts, processQueuedTurn);
+            });
+          return;
+        }
 
         if (shouldQueueInboundMessage(incoming)) {
           const queuedIncoming = stampInboundUserMessageOtids(incoming);

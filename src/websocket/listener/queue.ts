@@ -336,6 +336,46 @@ export function shouldQueueInboundMessage(parsed: IncomingMessage): boolean {
   return parsed.messages.some((payload) => "content" in payload);
 }
 
+/**
+ * Detect and strip the `!steer <message>` prefix from an incoming message.
+ * When found, the prefix is removed (mutating in place) and the function
+ * returns `true`, indicating the message should bypass the queue and be
+ * processed as an immediate interrupt.
+ */
+export function tryStripSteerPrefix(incoming: IncomingMessage): boolean {
+  const firstPayload = incoming.messages.find(
+    (p): p is MessageCreate & { client_message_id?: string } => "content" in p,
+  );
+  if (!firstPayload) return false;
+
+  const content = firstPayload.content;
+
+  // String content: check for `!steer <arg>`
+  if (typeof content === "string") {
+    const match = content.match(/^!steer\s+(.*)/s);
+    if (match) {
+      firstPayload.content = match[1].trim();
+      return true;
+    }
+    return false;
+  }
+
+  // Array content (e.g. text + image): check text parts
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (part.type === "text" && typeof part.text === "string") {
+        const match = part.text.match(/^!steer\s+(.*)/s);
+        if (match) {
+          part.text = match[1].trim();
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 export function consumeQueuedTurn(runtime: ConversationRuntime): {
   dequeuedBatch: DequeuedBatch;
   queuedTurn: IncomingMessage;
@@ -420,10 +460,6 @@ async function drainQueuedMessages(
     dequeuedBatch: DequeuedBatch,
   ) => Promise<void>,
 ): Promise<void> {
-  if (runtime.queuePumpActive) {
-    return;
-  }
-
   runtime.queuePumpActive = true;
   try {
     while (true) {
@@ -528,20 +564,37 @@ export function scheduleQueuePump(
     dequeuedBatch: DequeuedBatch,
   ) => Promise<void>,
 ): void {
-  if (runtime.queuePumpScheduled) {
-    return;
-  }
-  runtime.queuePumpScheduled = true;
+  // Chain pump on messageQueue — never bail silently.
+  // The promise-based lock (queueLock/queueLockResolve) serializes
+  // concurrent pump invocations instead of the fragile boolean guard.
   runtime.messageQueue = runtime.messageQueue
     .then(async () => {
-      runtime.queuePumpScheduled = false;
-      if (
-        runtime.listener !== getActiveRuntime() ||
-        runtime.listener.intentionallyClosed
-      ) {
-        return;
+      // Wait for any in-flight pump to finish before starting
+      if (runtime.queueLockResolve) {
+        await runtime.queueLock;
       }
-      await drainQueuedMessages(runtime, socket, opts, processQueuedTurn);
+
+      // Acquire the lock
+      let resolveLock: () => void;
+      runtime.queueLock = new Promise<void>((resolve) => {
+        resolveLock = resolve;
+      });
+      runtime.queueLockResolve = resolveLock!;
+
+      try {
+        if (
+          runtime.listener !== getActiveRuntime() ||
+          runtime.listener.intentionallyClosed
+        ) {
+          return;
+        }
+        await drainQueuedMessages(runtime, socket, opts, processQueuedTurn);
+      } finally {
+        // Release the lock
+        const release = runtime.queueLockResolve;
+        runtime.queueLockResolve = null;
+        release!();
+      }
     })
     .catch((error: unknown) => {
       runtime.queuePumpScheduled = false;

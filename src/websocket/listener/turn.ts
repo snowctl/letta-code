@@ -344,6 +344,13 @@ function finalizeInterruptedTurn(
     conversationId: string;
   },
 ): void {
+  // Guard: if a new turn has already started (e.g. !steer message was
+  // injected by the abort handler), don't trample the new turn's state.
+  if (runtime.isProcessing) {
+    debugLog("listener", "Skipping finalizeInterruptedTurn: new turn already in progress");
+    return;
+  }
+
   const scope = {
     agent_id: params.agentId ?? null,
     conversation_id: params.conversationId,

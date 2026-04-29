@@ -176,6 +176,8 @@ export function createConversationRuntime(
     queuedMessagesByItemId: new Map(),
     queuePumpActive: false,
     queuePumpScheduled: false,
+    queueLock: Promise.resolve(),
+    queueLockResolve: null,
     pendingTurns: 0,
     isRecoveringApprovals: false,
     loopStatus: "WAITING_ON_INPUT",
@@ -267,6 +269,8 @@ export function clearConversationRuntimeState(
   runtime.pendingTurns = 0;
   runtime.queuePumpActive = false;
   runtime.queuePumpScheduled = false;
+  runtime.queueLock = Promise.resolve();
+  runtime.queueLockResolve = null;
   clearActiveRunState(runtime);
 }
 

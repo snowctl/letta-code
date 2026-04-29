@@ -133,6 +133,8 @@ export type ConversationRuntime = {
   queuedMessagesByItemId: Map<string, IncomingMessage>;
   queuePumpActive: boolean;
   queuePumpScheduled: boolean;
+  queueLock: Promise<void>;
+  queueLockResolve: (() => void) | null;
   pendingTurns: number;
   isRecoveringApprovals: boolean;
   loopStatus: LoopStatus;
