@@ -967,8 +967,9 @@ export function createMatrixAdapter(
           if (attachment) attachments.push(attachment);
         }
 
-        const textContent = ((content.body as string | undefined) ?? "").trim();
-        const isMediaOnly = candidate != null;
+        const body = ((content.body as string | undefined) ?? "").trim();
+        const textContent =
+          candidate && body === candidate.filename ? "" : body;
 
         if (!textContent && attachments.length === 0) return;
 
@@ -989,7 +990,7 @@ export function createMatrixAdapter(
           chatId: roomIdStr,
           senderId: senderIdStr,
           senderName,
-          text: isMediaOnly ? "" : textContent,
+          text: textContent,
           timestamp: Date.now(),
           messageId: eventObj.event_id as string | undefined,
           chatType,

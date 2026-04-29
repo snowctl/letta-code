@@ -172,16 +172,11 @@ export async function downloadMatrixAttachment(
     }
 
     if (candidate.isVoice && transcribeVoice) {
-      const { unlinkSync } = await import("node:fs");
-      const { transcribeAndFormat } = await import("../transcription/index");
-      const result = await transcribeAndFormat(localPath);
+      const { transcribeAudioFile } = await import("../transcription/index");
+      const result = await transcribeAudioFile(localPath);
       if (result.success && result.text) {
         attachment.transcription = result.text;
       }
-      // Ephemeral: delete audio immediately after transcription (privacy)
-      try {
-        unlinkSync(localPath);
-      } catch {}
     }
 
     return attachment;
