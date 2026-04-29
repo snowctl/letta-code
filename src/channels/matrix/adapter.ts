@@ -1562,23 +1562,58 @@ export function createMatrixAdapter(
 
           if (pendingText && matrixClient) {
             const html = markdownToMatrixHtml(pendingText);
-            const sentEventId = await matrixClient
-              .sendMessage(chatId, {
-                msgtype: "m.text",
-                body: pendingText,
-                format: "org.matrix.custom.html",
-                formatted_body: html,
-              })
-              .catch((err: unknown) => {
-                console.warn(
-                  "[Matrix] handleAutoForward send failed:",
-                  err instanceof Error ? err.message : err,
-                );
-                return null;
-              });
+            const finalContent = {
+              msgtype: "m.text",
+              body: pendingText,
+              format: "org.matrix.custom.html",
+              formatted_body: html,
+            };
 
-            if (sentEventId) {
-              const messageId = String(sentEventId);
+            // If there is a streaming preview for this room, replace it with
+            // the final formatted content instead of sending a second message.
+            const streamState = streamStates.get(chatId);
+            const useStreamReplace =
+              streamState && streamState.messageId !== "__pending__";
+
+            let messageId: string | null = null;
+
+            if (useStreamReplace) {
+              if (streamState.pendingTimer)
+                clearTimeout(streamState.pendingTimer);
+              if (streamState.cleanupTimeout)
+                clearTimeout(streamState.cleanupTimeout);
+              streamStates.delete(chatId);
+              await matrixClient
+                .sendEvent(chatId, "m.room.message", {
+                  msgtype: "m.text",
+                  body: pendingText,
+                  "m.new_content": finalContent,
+                  "m.relates_to": {
+                    rel_type: "m.replace",
+                    event_id: streamState.messageId,
+                  },
+                })
+                .catch((err: unknown) => {
+                  console.warn(
+                    "[Matrix] handleAutoForward stream-replace failed:",
+                    err instanceof Error ? err.message : err,
+                  );
+                });
+              messageId = streamState.messageId;
+            } else {
+              const sentEventId = await matrixClient
+                .sendMessage(chatId, finalContent)
+                .catch((err: unknown) => {
+                  console.warn(
+                    "[Matrix] handleAutoForward send failed:",
+                    err instanceof Error ? err.message : err,
+                  );
+                  return null;
+                });
+              messageId = sentEventId ? String(sentEventId) : null;
+            }
+
+            if (messageId) {
               // Track for ChannelAction edits
               const source = event.sources.find((s) => s.chatId === chatId);
               if (source) {
