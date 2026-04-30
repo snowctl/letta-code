@@ -101,7 +101,20 @@ async def describe_image_async(data_url: str, *, prompt: Optional[str] = None) -
 
 **Cache:** module-level `OrderedDict` keyed by `(task: str, content_hash: str, aux_model: str)`, capped at 256 entries with LRU eviction. `content_hash = sha256(image_bytes)` extracted from the `data:…;base64,…` URL. Cache hits skip the aux call entirely. Thread-safe via a single `threading.Lock`.
 
-**Default prompt:** `"Describe this image. Be concise but capture text content (OCR if visible) and notable visual elements."` — chosen because the most common tool-return image source (Read of a screenshot, terminal-state image, error dialog) tends to need OCR over prose. Overridable per call via the `prompt` kwarg, and globally via the `LETTA_AUX_VISION_PROMPT` env var.
+**Default prompt:**
+
+```
+Describe this image concisely (2-4 sentences, ~150 words max).
+Transcribe any visible text or code verbatim.
+For charts or diagrams: include axis labels, legend, and key values.
+Be factual; skip decorative details (colors, mood, style) unless they convey meaning.
+```
+
+Adapted from the proposed fix in [NousResearch/hermes-agent#10809](https://github.com/NousResearch/hermes-agent/issues/10809), which documents a real-world latency regression caused by an unbounded "describe everything in thorough detail" prompt (~2000-char outputs, ~44s on local models). The bounded form keeps outputs around 500-800 chars, which keeps the aux roundtrip under ~3s on commodity vision models and doesn't blow up the *consuming* main-model's context budget when the description is inlined.
+
+Overridable per call via the `prompt` kwarg, and globally via the `LETTA_AUX_VISION_PROMPT` env var.
+
+**Statelessness — important:** `describe_image` constructs its OWN minimal request to the aux model. It does **not** include letta's system prompt, conversation history, tool definitions, or any other agent state. The aux call is a one-shot `[{role: "user", content: [{type: "text", text: PROMPT}, {type: "image_url", image_url: {url: data_url}}]}]` request. Aux output is consumed only as text and inlined back into the main agent's call; it never affects agent memory or wakes a new step.
 
 **Errors:** raises a new `AuxUnavailable` exception in `letta/errors.py` for the missing-config and aux-call-failed cases. Callers decide whether to fall back to placeholder text or strip the image.
 
@@ -186,6 +199,27 @@ else:
 
 `_safely_describe` is a tiny inline helper that catches `AuxUnavailable` and substitutes `"[Image (auto-description failed)]"` so a single aux failure can't poison the whole serialization.
 
+### 3a. `letta/llm_api/openai_client.py` — `fill_image_content_in_messages`
+
+Tool-return images flow through `to_openai_dicts_from_list`, but direct user uploads (matrix attachment, PWA upload, channel ingest) flow through a separate function — `fill_image_content_in_messages` — which patches multimodal content onto user-role openai dicts based on the corresponding pydantic user message.
+
+This function gets the same `image_describer` kwarg with mirror semantics:
+
+```python
+def fill_image_content_in_messages(
+    openai_message_list: List[dict],
+    pydantic_message_list: List[PydanticMessage],
+    *,
+    image_describer: Optional[ImageDescriber] = None,  # NEW
+) -> List[dict]:
+```
+
+When `image_describer` is `None`: behavior unchanged (produces multimodal `[text, image_url]` user content as today).
+
+When provided: instead of `image_url`, the function calls `image_describer(data_url)` for each image part on the pydantic user message and emits text-only content `[text, text(f"[Image (auto-described): {description}]")]`. Role stays `user`. The same `_safely_describe` wrapper catches `AuxUnavailable` and substitutes the failure placeholder.
+
+This means **both ingestion paths — tool returns *and* direct uploads — produce identical text shape when aux is engaged**, so the main model's prompt looks consistent regardless of how the image arrived.
+
 ### 4. `letta/llm_api/openai_client.py` — repurpose retry hooks
 
 The reactive hooks added in commits `936b4057` (sync), `906adf1e` (async), `612b8534` (stream), and `239561ae` (empty-stream retry) currently call `_strip_tool_return_image_messages` to remove image content on retry. This work changes the *retry factory* of those hooks to call aux-description rewrites instead, with strip-images preserved as the final fallback.
@@ -215,7 +249,7 @@ The existing `_strip_tool_return_image_messages` stays as the final fallback. Th
 
 ### 5. Caller wiring — `letta/agents/letta_agent.py`
 
-Every call site that invokes `to_openai_dicts_from_list` for the OpenAI Chat Completions path passes the same sync `image_describer`:
+Every call site that invokes `to_openai_dicts_from_list` *and* `fill_image_content_in_messages` for the OpenAI Chat Completions path passes the same sync `image_describer`:
 
 ```python
 image_describer = (
@@ -228,9 +262,14 @@ openai_dicts = Message.to_openai_dicts_from_list(
     image_describer=image_describer,
     ...
 )
+openai_dicts = fill_image_content_in_messages(
+    openai_dicts,
+    messages,
+    image_describer=image_describer,  # same describer covers user-upload images
+)
 ```
 
-Whether the LLM call that follows is sync, async, or streaming is irrelevant to the serializer — the aux roundtrip happens during sync message-list construction, before the LLM call begins.
+Whether the LLM call that follows is sync, async, or streaming is irrelevant to the serializer — the aux roundtrip happens during sync message-list construction, before the LLM call begins. The same `image_describer` is used by both serialization passes so cache hits (keyed by `sha256(image_bytes)`) carry over: an image read once via tool return and later referenced as a user-attached file gets described only once.
 
 ## Configuration
 
@@ -269,13 +308,14 @@ Or in agent state JSON:
 
 **Pre-call mode** (`vision = "unsupported"`):
 
-1. Agent step starts. Builds pydantic message list as today.
-2. Caller checks `llm_config.vision_capability()`. Sees `"unsupported"`. Passes `image_describer=auxiliary_client.describe_image` (sync) into `to_openai_dicts_from_list`.
-3. Serializer encounters an `image_url` content part. For each part:
+1. Agent step starts. Builds pydantic message list as today (still containing original `ImageContent` for any tool-return or user-upload image).
+2. Caller checks `llm_config.vision_capability()`. Sees `"unsupported"`. Passes `image_describer=auxiliary_client.describe_image` (sync) into both `to_openai_dicts_from_list` AND `fill_image_content_in_messages`.
+3. For each image source (tool return and user upload):
    - Compute `content_hash = sha256(image_bytes)` from the data URL.
-   - Cache lookup. Hit → use cached description. Miss → call aux model with the data URL, cache the result.
-   - Inline `{"type": "text", "text": f"[Image (auto-described): {description}]"}` into the message body. Skip the synthetic image-only user message generation.
-4. Serialized messages — text-only, no `image_url` parts — go to the LLM. No reactive retry path triggers; the LLM sees only text.
+   - Cache lookup. Hit → use cached description. Miss → aux call with the bare `[user_msg(prompt+image_url)]` request (no system prompt, no agent state), cache the result.
+   - Inline `{"type": "text", "text": f"[Image (auto-described): {description}]"}` in place of the image content. Role of the carrying message is preserved (tool stays tool, user stays user). Synthetic image-only user message is not generated for tool returns.
+4. Serialized messages — text-only, no `image_url` parts anywhere — go to the main LLM. No reactive retry path triggers; the LLM sees only text.
+5. Pydantic message in postgres is **untouched** — agent memory still holds the original `ImageContent`. The next time this image is sent to the same vision-unsupported model, step 3's cache hits and no fresh aux roundtrip is paid.
 
 **Reactive mode** (`vision = "auto"`, default):
 
