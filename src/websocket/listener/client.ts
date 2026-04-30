@@ -4182,6 +4182,7 @@ function createRuntime(): ListenerRuntime {
     permissionModeByConversation: loadPersistedPermissionModeMap(),
     reminderStateByConversation: new Map(),
     contextTrackerByConversation: new Map(),
+    contextWindowMaxByConversation: new Map(),
     systemPromptRecompileByConversation: new Map(),
     queuedSystemPromptRecompileByConversation: new Set(),
     connectionId: null,
@@ -4216,6 +4217,7 @@ function stopRuntime(
   runtime.approvalRuntimeKeyByRequestId.clear();
   runtime.reminderStateByConversation.clear();
   runtime.contextTrackerByConversation.clear();
+  runtime.contextWindowMaxByConversation.clear();
   runtime.systemPromptRecompileByConversation.clear();
   runtime.queuedSystemPromptRecompileByConversation.clear();
   stopAllWorktreeWatchers(runtime);
@@ -6392,6 +6394,7 @@ function createLegacyTestRuntime(): ConversationRuntime & {
   permissionModeByConversation: ListenerRuntime["permissionModeByConversation"];
   reminderStateByConversation: ListenerRuntime["reminderStateByConversation"];
   contextTrackerByConversation: ListenerRuntime["contextTrackerByConversation"];
+  contextWindowMaxByConversation: ListenerRuntime["contextWindowMaxByConversation"];
   systemPromptRecompileByConversation: ListenerRuntime["systemPromptRecompileByConversation"];
   queuedSystemPromptRecompileByConversation: ListenerRuntime["queuedSystemPromptRecompileByConversation"];
   bootWorkingDirectory: string;
@@ -6428,6 +6431,7 @@ function createLegacyTestRuntime(): ConversationRuntime & {
     permissionModeByConversation: ListenerRuntime["permissionModeByConversation"];
     reminderStateByConversation: ListenerRuntime["reminderStateByConversation"];
     contextTrackerByConversation: ListenerRuntime["contextTrackerByConversation"];
+    contextWindowMaxByConversation: ListenerRuntime["contextWindowMaxByConversation"];
     systemPromptRecompileByConversation: ListenerRuntime["systemPromptRecompileByConversation"];
     queuedSystemPromptRecompileByConversation: ListenerRuntime["queuedSystemPromptRecompileByConversation"];
     bootWorkingDirectory: string;
@@ -6483,6 +6487,12 @@ function createLegacyTestRuntime(): ConversationRuntime & {
       get: () => listener.contextTrackerByConversation,
       set: (value: ListenerRuntime["contextTrackerByConversation"]) => {
         listener.contextTrackerByConversation = value;
+      },
+    },
+    contextWindowMaxByConversation: {
+      get: () => listener.contextWindowMaxByConversation,
+      set: (value: ListenerRuntime["contextWindowMaxByConversation"]) => {
+        listener.contextWindowMaxByConversation = value;
       },
     },
     systemPromptRecompileByConversation: {

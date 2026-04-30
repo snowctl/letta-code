@@ -553,6 +553,10 @@ export async function handleIncomingMessage(
             const ctxWindow = agent.llm_config?.context_window;
             if (ctxWindow && ctxWindow > 0) {
               runtime.contextWindowMax = ctxWindow;
+              runtime.listener.contextWindowMaxByConversation.set(
+                runtime.key,
+                ctxWindow,
+              );
             }
           } catch {
             // Best-effort only. If the fetch fails, reminder building will
