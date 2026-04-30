@@ -60,8 +60,8 @@ class FakeMatrixClient {
   downloadContent = mock(
     async (
       _mxcUrl: string,
-    ): Promise<{ body: ArrayBuffer; contentType: string }> => ({
-      body: new ArrayBuffer(0),
+    ): Promise<{ data: Buffer; contentType: string }> => ({
+      data: Buffer.alloc(0),
       contentType: "application/octet-stream",
     }),
   );
@@ -3017,7 +3017,7 @@ test("adapter handles non-E2EE image message and emits attachment with imageData
   // Provide a small PNG-like buffer as the "downloaded" image
   const fakeImageBytes = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
   client.downloadContent.mockResolvedValueOnce({
-    body: fakeImageBytes.buffer,
+    data: fakeImageBytes,
     contentType: "image/png",
   });
 
@@ -3058,7 +3058,7 @@ test("adapter handles non-E2EE image with caption — caption becomes text", asy
 
   const fakeImageBytes = Buffer.alloc(16, 0xff);
   client.downloadContent.mockResolvedValueOnce({
-    body: fakeImageBytes.buffer,
+    data: fakeImageBytes,
     contentType: "image/jpeg",
   });
 
@@ -3107,10 +3107,7 @@ test("adapter handles E2EE image message (content.file) and decrypts attachment"
       .replace(/=/g, "");
 
   client.downloadContent.mockResolvedValueOnce({
-    body: ciphertext.buffer.slice(
-      ciphertext.byteOffset,
-      ciphertext.byteOffset + ciphertext.byteLength,
-    ) as ArrayBuffer,
+    data: Buffer.from(ciphertext),
     contentType: "application/octet-stream",
   });
 

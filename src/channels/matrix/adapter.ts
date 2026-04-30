@@ -294,6 +294,54 @@ export function createMatrixAdapter(
     ReturnType<typeof setInterval>
   >();
 
+  // ── Inbound metadata caches ───────────────────────────────────────
+  // getJoinedRoomMembers and getUserProfile are HTTP round-trips to the
+  // homeserver. Doing them sequentially on every inbound message added
+  // hundreds of ms before the typing indicator could fire. Cache with a
+  // short TTL — membership and display names rarely change between turns.
+  const MEMBERS_CACHE_TTL_MS = 5 * 60 * 1000;
+  const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+  const roomMembersCache = new Map<
+    string,
+    { members: string[]; expiresAt: number }
+  >();
+  const userProfileCache = new Map<
+    string,
+    { displayname?: string; expiresAt: number }
+  >();
+
+  async function getRoomMembersCached(
+    client: MatrixClientLike,
+    roomId: string,
+  ): Promise<string[]> {
+    const now = Date.now();
+    const hit = roomMembersCache.get(roomId);
+    if (hit && hit.expiresAt > now) return hit.members;
+    const members = await client.getJoinedRoomMembers(roomId).catch(() => []);
+    roomMembersCache.set(roomId, {
+      members,
+      expiresAt: now + MEMBERS_CACHE_TTL_MS,
+    });
+    return members;
+  }
+
+  async function getUserProfileCached(
+    client: MatrixClientLike,
+    userId: string,
+  ): Promise<{ displayname?: string }> {
+    const now = Date.now();
+    const hit = userProfileCache.get(userId);
+    if (hit && hit.expiresAt > now) return { displayname: hit.displayname };
+    const profile = await client
+      .getUserProfile(userId)
+      .catch(() => ({ displayname: undefined }));
+    userProfileCache.set(userId, {
+      displayname: (profile as { displayname?: string }).displayname,
+      expiresAt: now + PROFILE_CACHE_TTL_MS,
+    });
+    return profile;
+  }
+
   // ── Tool block state ─────────────────────────────────────────────
   interface MatrixToolBlockState {
     messageId: string;
@@ -1048,16 +1096,12 @@ export function createMatrixAdapter(
 
         if (!textContent && attachments.length === 0) return;
 
-        const members = await client
-          .getJoinedRoomMembers(roomIdStr)
-          .catch(() => []);
+        const [members, profile] = await Promise.all([
+          getRoomMembersCached(client, roomIdStr),
+          getUserProfileCached(client, senderIdStr),
+        ]);
         const chatType = members.length === 2 ? "direct" : "channel";
-
-        const profile = await client
-          .getUserProfile(senderIdStr)
-          .catch(() => ({ displayname: undefined }));
-        const senderName =
-          (profile as { displayname?: string }).displayname ?? senderIdStr;
+        const senderName = profile.displayname ?? senderIdStr;
 
         const msg: InboundChannelMessage = {
           channel: "matrix",
@@ -1088,6 +1132,15 @@ export function createMatrixAdapter(
 
         if (type === "m.room.redaction") {
           await handleRedactionEvent(roomIdStr, eventObj);
+          return;
+        }
+
+        // Invalidate caches on membership/profile state changes so the next
+        // inbound message picks up fresh display names and member counts.
+        if (type === "m.room.member") {
+          roomMembersCache.delete(roomIdStr);
+          const stateKey = eventObj.state_key as string | undefined;
+          if (stateKey) userProfileCache.delete(stateKey);
           return;
         }
       });
