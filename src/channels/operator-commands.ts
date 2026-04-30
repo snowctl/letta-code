@@ -1,6 +1,8 @@
 import type { Letta } from "@letta-ai/letta-client";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
 import { recompileAgentSystemPrompt } from "../agent/modify.js";
+import { getAvailableModelHandles } from "../agent/available-models.js";
+import { updateAgentLLMConfig, updateConversationLLMConfig } from "../agent/modify.js";
 
 export interface OperatorCommandContext {
   agentId: string;
@@ -36,6 +38,10 @@ export async function handleOperatorCommand(
         return await handleConv(args, ctx);
       case "reset":
         return await handleReset(args, ctx);
+      case "models":
+        return await handleModels(ctx);
+      case "model":
+        return await handleModelSwitch(args, ctx);
       case "help":
         return handleHelp(ctx);
       default:
@@ -58,6 +64,8 @@ function handleHelp(ctx: OperatorCommandContext): string {
     `${p}conv switch <n> — switch to conversation <n>`,
     `${p}conv delete <n> — delete conversation <n>`,
     `${p}reset — wipe messages on the current conversation`,
+    `${p}models — list available models`,
+    `${p}model <handle> — switch the active model`,
     `${p}reset <n> — wipe messages on conversation <n> (run conv list first)`,
     `${p}help — show this message`,
   ].join("\n");
@@ -270,3 +278,57 @@ async function handleReset(
   }
   return `Reset conversation "${targetLabel}" (deleted).`;
 }
+
+async function handleModels(ctx: OperatorCommandContext): Promise<string> {
+  const [result, agent] = await Promise.all([
+    getAvailableModelHandles(),
+    ctx.client.agents.retrieve(ctx.agentId),
+  ]);
+
+  const activeModel = agent.model;
+  const lines: string[] = ["Models:"];
+
+  for (const handle of result.handles) {
+    if (handle === activeModel) {
+      lines.push(`**\`${handle}\`**`);
+    } else {
+      lines.push(`\`${handle}\``);
+    }
+  }
+
+  lines.push("");
+  lines.push("Use !model <handle> to switch.");
+  return lines.join("\n");
+}
+
+async function handleModelSwitch(
+  args: string[],
+  ctx: OperatorCommandContext,
+): Promise<string> {
+  if (args.length === 0) {
+    return "Usage: !model <provider/model-name>";
+  }
+
+  const handle = args[0] as string;
+
+  if (!handle.includes("/")) {
+    return "Model handles must be in provider/model-name format (e.g. anthropic/claude-sonnet-4-6). Use !models to see available handles.";
+  }
+
+  const [available] = await Promise.all([getAvailableModelHandles()]);
+  if (!available.handles.has(handle)) {
+    return `Model '${handle}' is not available on this server. Use !models to see what's available.`;
+  }
+
+  const convId = ctx.getCurrentConvId();
+  if (convId && convId !== "default") {
+    await updateConversationLLMConfig(convId, handle);
+  } else {
+    await updateAgentLLMConfig(ctx.agentId, handle);
+  }
+
+  return `Model switched to ${handle}.`;
+}
+
+// Exported for testing
+export { handleModels, handleModelSwitch, handleHelp };

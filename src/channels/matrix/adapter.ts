@@ -2024,6 +2024,19 @@ export function createMatrixAdapter(
       return;
     }
 
+    if (command === "!models") {
+      const reply = await dispatchOperatorCommand("models", [], roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
+    if (command === "!model") {
+      const args = parts.slice(1).filter(Boolean);
+      const reply = await dispatchOperatorCommand("model", args, roomId);
+      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      return;
+    }
+
     if (command === "!help") {
       const reply = await dispatchOperatorCommand("help", [], roomId);
       await client.sendMessage(roomId, { msgtype: "m.text", body: reply });

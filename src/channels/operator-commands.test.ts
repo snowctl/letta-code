@@ -1,0 +1,193 @@
+import { describe, it, expect, vi, beforeEach } from "bun:test";
+
+vi.mock("../agent/available-models.js", () => ({
+  getAvailableModelHandles: vi.fn(),
+}));
+
+vi.mock("../agent/modify.js", () => ({
+  updateAgentLLMConfig: vi.fn(),
+  updateConversationLLMConfig: vi.fn(),
+}));
+
+import { getAvailableModelHandles } from "../agent/available-models.js";
+import { updateAgentLLMConfig, updateConversationLLMConfig } from "../agent/modify.js";
+import { handleModels, handleModelSwitch, handleHelp } from "./operator-commands.js";
+import type { OperatorCommandContext } from "./operator-commands.js";
+
+function makeMockContext(overrides: Partial<OperatorCommandContext> = {}): OperatorCommandContext {
+  return {
+    agentId: "agent-test-123",
+    chatId: "!room:example.org",
+    client: {
+      agents: {
+        retrieve: vi.fn().mockResolvedValue({ model: "anthropic/claude-sonnet-4-6" }),
+      },
+    } as any,
+    commandPrefix: "!",
+    getCurrentConvId: vi.fn().mockReturnValue("default"),
+    setCurrentConvId: vi.fn().mockResolvedValue(undefined),
+    requestCancel: vi.fn().mockReturnValue(false),
+    getConvListCache: vi.fn().mockReturnValue(null),
+    setConvListCache: vi.fn(),
+    ...overrides,
+  };
+}
+
+function mockResult(handles: string[]) {
+  return {
+    handles: new Set(handles),
+    source: "cache" as const,
+    fetchedAt: Date.now(),
+  };
+}
+
+describe("handleModels", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("should list models with the active one bolded", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["letta/auto", "anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-7"]),
+    );
+
+    const ctx = makeMockContext();
+    const result = await handleModels(ctx);
+
+    expect(result).toContain("Models:");
+    expect(result).toContain("**`anthropic/claude-sonnet-4-6`**");
+    expect(result).toContain("`letta/auto`");
+    expect(result).toContain("`anthropic/claude-opus-4-7`");
+    expect(result).toContain("Use !model <handle> to switch.");
+  });
+
+  it("should bold only the active model", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["letta/auto", "anthropic/claude-sonnet-4-6"]),
+    );
+
+    const ctx = makeMockContext({
+      client: {
+        agents: {
+          retrieve: vi.fn().mockResolvedValue({ model: "letta/auto" }),
+        },
+      } as any,
+    });
+
+    const result = await handleModels(ctx);
+    expect(result).toContain("**`letta/auto`**");
+    expect(result).not.toContain("**`anthropic/claude-sonnet-4-6`**");
+  });
+
+  it("should handle a single-model server", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["anthropic/claude-sonnet-4-6"]),
+    );
+
+    const ctx = makeMockContext();
+    const result = await handleModels(ctx);
+    expect(result).toContain("**`anthropic/claude-sonnet-4-6`**");
+  });
+
+  it("should fetch handles and agent in parallel", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["letta/auto"]),
+    );
+
+    const retrieve = vi.fn().mockResolvedValue({ model: "letta/auto" });
+    const ctx = makeMockContext({
+      client: {
+        agents: { retrieve },
+      } as any,
+    });
+
+    await handleModels(ctx);
+    expect(getAvailableModelHandles).toHaveBeenCalledTimes(1);
+    expect(retrieve).toHaveBeenCalledWith("agent-test-123");
+  });
+
+  it("should propagate errors", async () => {
+    (getAvailableModelHandles as any).mockRejectedValue(new Error("Server unreachable"));
+
+    const ctx = makeMockContext();
+    await expect(handleModels(ctx)).rejects.toThrow("Server unreachable");
+  });
+});
+
+describe("handleModelSwitch", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("should return usage when no args provided", async () => {
+    const ctx = makeMockContext();
+    const result = await handleModelSwitch([], ctx);
+    expect(result).toBe("Usage: !model <provider/model-name>");
+  });
+
+  it("should return format error for handles without /", async () => {
+    const ctx = makeMockContext();
+    const result = await handleModelSwitch(["sonnet"], ctx);
+    expect(result).toContain("provider/model-name format");
+    expect(result).toContain("anthropic/claude-sonnet-4-6");
+  });
+
+  it("should return not-available error for unknown models", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["anthropic/claude-sonnet-4-6"]),
+    );
+
+    const ctx = makeMockContext();
+    const result = await handleModelSwitch(["anthropic/fake"], ctx);
+    expect(result).toContain("not available");
+    expect(result).toContain("anthropic/fake");
+  });
+
+  it("should switch agent model for default conversation", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["anthropic/claude-sonnet-4-6"]),
+    );
+
+    const ctx = makeMockContext({ getCurrentConvId: vi.fn().mockReturnValue("default") });
+    const result = await handleModelSwitch(["anthropic/claude-sonnet-4-6"], ctx);
+
+    expect(updateAgentLLMConfig).toHaveBeenCalledWith("agent-test-123", "anthropic/claude-sonnet-4-6");
+    expect(updateConversationLLMConfig).not.toHaveBeenCalled();
+    expect(result).toBe("Model switched to anthropic/claude-sonnet-4-6.");
+  });
+
+  it("should switch conversation model for named conversation", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["anthropic/claude-opus-4-7"]),
+    );
+
+    const ctx = makeMockContext({ getCurrentConvId: vi.fn().mockReturnValue("conv-abc") });
+    const result = await handleModelSwitch(["anthropic/claude-opus-4-7"], ctx);
+
+    expect(updateConversationLLMConfig).toHaveBeenCalledWith("conv-abc", "anthropic/claude-opus-4-7");
+    expect(updateAgentLLMConfig).not.toHaveBeenCalled();
+    expect(result).toBe("Model switched to anthropic/claude-opus-4-7.");
+  });
+
+  it("should use agent-level switch when getCurrentConvId returns empty string", async () => {
+    (getAvailableModelHandles as any).mockResolvedValue(
+      mockResult(["letta/auto"]),
+    );
+
+    const ctx = makeMockContext({ getCurrentConvId: vi.fn().mockReturnValue("") });
+    const result = await handleModelSwitch(["letta/auto"], ctx);
+
+    expect(updateAgentLLMConfig).toHaveBeenCalled();
+    expect(updateConversationLLMConfig).not.toHaveBeenCalled();
+    expect(result).toBe("Model switched to letta/auto.");
+  });
+});
+
+describe("handleHelp", () => {
+  it("should include !models and !model in help output", async () => {
+    const ctx = makeMockContext();
+    const result = await handleHelp(ctx);
+    expect(result).toContain("!models");
+    expect(result).toContain("!model");
+  });
+});
