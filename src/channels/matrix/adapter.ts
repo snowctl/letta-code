@@ -1895,7 +1895,13 @@ export function createMatrixAdapter(
         if (state) {
           if (state.pendingTimer) clearTimeout(state.pendingTimer);
           if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
-          streamStates.delete(source.chatId);
+          // Preserve the messageId so the next streaming segment edits the
+          // same Matrix message rather than posting a fresh one. Reset the
+          // rate-limit interval and force an immediate edit on the next chunk.
+          state.pendingTimer = null;
+          state.cleanupTimeout = null;
+          state.currentInterval = MATRIX_STREAM_INTERVAL_MS;
+          state.lastEditAt = 0;
         }
       }
     },
