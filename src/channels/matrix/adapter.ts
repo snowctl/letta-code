@@ -179,8 +179,99 @@ function makeFetchBackedRequestFn(
 
 // Inlined here rather than imported from channels/format.ts to avoid the transitive import
 // chain (registry → accounts → config) that conflicts with mock.module() in tests.
-function markdownToMatrixHtml(text: string): string {
-  return (marked.parse(text) as string).trimEnd();
+/**
+ * Convert HTML <table> to a column-aligned ASCII table in a <pre> block.
+ * Strips <table>, <thead>, <tbody>, <tr>, <th>, <td> tags, then aligns columns.
+ * Returns null if no table found in the HTML.
+ */
+function htmlTableToAscii(html: string): string | null {
+  // Quick check: no table, bail early
+  if (!html.includes("<table")) return null;
+
+  // Extract all rows as arrays of cell texts
+  const rows: string[][] = [];
+  const rowRegex = /<tr[^>]*>(.*?)<\/tr>/gis;
+  const cellRegex = /<(?:th|td)[^>]*>([\s\S]*?)<\/(?:th|td)>/gi;
+
+  let rowMatch: RegExpExecArray | null;
+  while ((rowMatch = rowRegex.exec(html)) !== null) {
+    const rowHtml = rowMatch[1] ?? "";
+    const cells: string[] = [];
+    let cellMatch: RegExpExecArray | null;
+    while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+      // Strip HTML tags from cell content, collapse whitespace
+      let cell = (cellMatch[1] ?? "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&#34;/g, '"')
+        .replace(/\s+/g, " ")
+        .trim();
+      cells.push(cell);
+    }
+    if (cells.length > 0) rows.push(cells);
+  }
+
+  if (rows.length === 0) return null;
+
+  // Calculate column widths
+  const numCols = Math.max(...rows.map(r => r.length));
+  const widths = new Array(numCols).fill(0);
+  for (const row of rows) {
+    for (let i = 0; i < numCols; i++) {
+      widths[i] = Math.max(widths[i], row[i]?.length ?? 0);
+    }
+  }
+
+  // Minimum column width
+  const minW = 3;
+  for (let i = 0; i < numCols; i++) {
+    widths[i] = Math.max(widths[i], minW);
+  }
+
+  // Build ASCII table
+  const pad = (s: string, w: number) => {
+    const padLen = w - s.length;
+    return s + " ".repeat(Math.max(0, padLen));
+  };
+
+  const separator = rows.map((_, i) => {
+    const w = widths[i];
+    return "-".repeat(w);
+  }).join(" | ");
+
+  const lines: string[] = [];
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri]!;
+    const cells = row.map((c, i) => pad(c, widths[i])).join(" | ");
+    lines.push(cells);
+    // Insert separator after header row (first row)
+    if (ri === 0 && rows.length > 1) {
+      lines.push(separator);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Convert markdown to Matrix-compatible HTML with a plaintext fallback.
+ * If the rendered HTML contains <table>, a column-aligned ASCII table
+ * is generated as the `body` (plaintext) field, while the original HTML
+ * is kept as `formatted_body`. This ensures Element X iOS (which doesn't
+ * render <table>) still sees a readable representation.
+ */
+function markdownToMatrixHtml(text: string): { html: string; plaintext: string } {
+  const html = (marked.parse(text) as string).trimEnd();
+  const ascii = htmlTableToAscii(html);
+  return {
+    html,
+    plaintext: ascii ?? html.replace(/<[^>]+>/g, ""),
+  };
 }
 
 function escapeHtml(text: string): string {
@@ -1204,14 +1295,14 @@ export function createMatrixAdapter(
       // homeserver will fail the request and the error surfaces back to
       // the agent.
       if (msg.editTargetMessageId) {
-        const html = markdownToMatrixHtml(msg.text);
+        const { html, plaintext } = markdownToMatrixHtml(msg.text);
         const eventId = await client.sendMessage(msg.chatId, {
           msgtype: "m.text",
           // Element clients render `* <text>` as the fallback for users on
           // older clients that don't honor m.replace. Match the format the
           // adapter already uses for thinking-placeholder edits so behavior
           // stays consistent.
-          body: `* ${msg.text}`,
+          body: `* ${plaintext}`,
           format: "org.matrix.custom.html",
           formatted_body: `* ${html}`,
           "m.new_content": {
@@ -1288,7 +1379,9 @@ export function createMatrixAdapter(
 
       // Always convert markdown to HTML for proper Matrix rendering
       content.format = "org.matrix.custom.html";
-      content.formatted_body = markdownToMatrixHtml(msg.text);
+      const { html, plaintext } = markdownToMatrixHtml(msg.text);
+      content.formatted_body = html;
+      content.body = plaintext;
 
       if (msg.replyToMessageId) {
         content["m.relates_to"] = {
@@ -1341,11 +1434,12 @@ export function createMatrixAdapter(
       options?: { replyToMessageId?: string },
     ): Promise<void> {
       const client = await ensureClient();
+      const { html, plaintext } = markdownToMatrixHtml(text);
       const content: Record<string, unknown> = {
         msgtype: "m.text",
-        body: text,
+        body: plaintext,
         format: "org.matrix.custom.html",
-        formatted_body: markdownToMatrixHtml(text),
+        formatted_body: html,
       };
       if (options?.replyToMessageId) {
         content["m.relates_to"] = {
@@ -1379,11 +1473,12 @@ export function createMatrixAdapter(
 
       const { promptText, emojis } = buildMatrixControlRequestPrompt(event);
 
+      const { html, plaintext } = markdownToMatrixHtml(promptText);
       const replyContent: Record<string, unknown> = {
         msgtype: "m.text",
-        body: promptText,
+        body: plaintext,
         format: "org.matrix.custom.html",
-        formatted_body: markdownToMatrixHtml(promptText),
+        formatted_body: html,
       };
       const replyToId = threadId ?? messageId;
       if (replyToId) {
@@ -1594,14 +1689,14 @@ export function createMatrixAdapter(
           const footerText = `\n✓ completed in ${durationStr}${usageSuffix}`;
 
           if (pendingText && matrixClient) {
-            const html = markdownToMatrixHtml(pendingText);
+            const { html, plaintext } = markdownToMatrixHtml(pendingText);
             // Bake footer directly into the content so the footer and the
             // message body are delivered in a single Matrix event. Sending a
             // separate edit afterwards races with homeserver rate-limits and
             // causes the footer to be silently dropped on intermittent turns.
             const finalContent = {
               msgtype: "m.text",
-              body: pendingText + footerText,
+              body: plaintext + footerText,
               format: "org.matrix.custom.html",
               formatted_body: html + footerHtml,
             };
@@ -1999,11 +2094,12 @@ export function createMatrixAdapter(
     }
 
     const sendReply = async (text: string) => {
+      const { html, plaintext } = markdownToMatrixHtml(text);
       await client.sendMessage(roomId, {
         msgtype: "m.text",
-        body: text,
+        body: plaintext,
         format: "org.matrix.custom.html",
-        formatted_body: markdownToMatrixHtml(text),
+        formatted_body: html,
       });
     };
 
