@@ -418,6 +418,16 @@ export function createTelegramAdapter(
           convListCache.set(chatId, list);
         }
       },
+      onContextWindowChange: (size) => {
+        const liveConvId =
+          getChannelRegistry()?.getRoute("telegram", chatId, config.accountId)
+            ?.conversationId ?? "default";
+        getChannelRegistry()?.updateContextWindowMax(
+          route.agentId,
+          liveConvId,
+          size,
+        );
+      },
     };
     return handleOperatorCommand(command, args, opCtx);
   }

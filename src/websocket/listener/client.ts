@@ -3444,6 +3444,19 @@ async function wireChannelIngress(
     return true;
   });
 
+  registry.setContextWindowMaxHandler(
+    (agentId: string, conversationId: string, contextWindowMax: number) => {
+      const key = getConversationRuntimeKey(agentId, conversationId);
+      listener.contextWindowMaxByConversation.set(key, contextWindowMax);
+      const scopedRuntime = getConversationRuntime(
+        listener,
+        agentId,
+        conversationId,
+      );
+      if (scopedRuntime) scopedRuntime.contextWindowMax = contextWindowMax;
+    },
+  );
+
   registry.setReady();
 }
 

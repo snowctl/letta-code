@@ -1959,6 +1959,16 @@ export function createMatrixAdapter(
           convListCache.set(chatId, list);
         }
       },
+      onContextWindowChange: (size) => {
+        const liveConvId =
+          getChannelRegistry()?.getRoute("matrix", chatId, accountId)
+            ?.conversationId ?? "default";
+        getChannelRegistry()?.updateContextWindowMax(
+          route.agentId,
+          liveConvId,
+          size,
+        );
+      },
     };
     return handleOperatorCommand(command, args, opCtx);
   }

@@ -16,6 +16,7 @@ export interface OperatorCommandContext {
   requestCancel(): boolean;
   getConvListCache(): Conversation[] | null;
   setConvListCache(list: Conversation[] | null): void;
+  onContextWindowChange?: (size: number) => void;
 }
 
 type RecompileDeps = {
@@ -375,6 +376,7 @@ async function handleContextWindow(
 
   await updateAgentLLMConfig(ctx.agentId, model, { context_window: size });
 
+  ctx.onContextWindowChange?.(size);
   const sizeLabel =
     size >= 1_000_000
       ? `${Math.round(size / 1_000_000)}M`

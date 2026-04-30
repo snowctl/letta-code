@@ -225,6 +225,12 @@ export type ChannelCancelHandler = (
   conversationId: string,
 ) => boolean;
 
+export type ChannelContextWindowMaxHandler = (
+  agentId: string,
+  conversationId: string,
+  contextWindowMax: number,
+) => void;
+
 type PendingChannelControlRequest = {
   event: ChannelControlRequestEvent;
   deliveredThisProcess: boolean;
@@ -275,6 +281,7 @@ export class ChannelRegistry {
     ChannelTurnSource
   >();
   private cancelHandler: ChannelCancelHandler | null = null;
+  private contextWindowMaxHandler: ChannelContextWindowMaxHandler | null = null;
 
   constructor() {
     if (instance) {
@@ -602,6 +609,18 @@ export class ChannelRegistry {
     return this.cancelHandler?.(agentId, conversationId) ?? false;
   }
 
+  setContextWindowMaxHandler(fn: ChannelContextWindowMaxHandler | null): void {
+    this.contextWindowMaxHandler = fn;
+  }
+
+  updateContextWindowMax(
+    agentId: string,
+    conversationId: string,
+    contextWindowMax: number,
+  ): void {
+    this.contextWindowMaxHandler?.(agentId, conversationId, contextWindowMax);
+  }
+
   updateRouteConversation(
     channel: string,
     chatId: string,
@@ -904,6 +923,7 @@ export class ChannelRegistry {
     this.eventHandler = null;
     this.approvalResponseHandler = null;
     this.cancelHandler = null;
+    this.contextWindowMaxHandler = null;
   }
 
   /**
