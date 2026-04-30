@@ -6,14 +6,10 @@ vi.mock("../agent/available-models.js", () => ({
 
 vi.mock("../agent/modify.js", () => ({
   updateAgentLLMConfig: vi.fn(),
-  updateConversationLLMConfig: vi.fn(),
 }));
 
 import { getAvailableModelHandles } from "../agent/available-models.js";
-import {
-  updateAgentLLMConfig,
-  updateConversationLLMConfig,
-} from "../agent/modify.js";
+import { updateAgentLLMConfig } from "../agent/modify.js";
 import type { OperatorCommandContext } from "./operator-commands.js";
 import {
   handleContextWindow,
@@ -166,58 +162,27 @@ describe("handleModelSwitch", () => {
     expect(result).toContain("anthropic/fake");
   });
 
-  it("should switch agent model for default conversation", async () => {
+  it("should always switch the agent model regardless of active conversation", async () => {
     (getAvailableModelHandles as any).mockResolvedValue(
       mockResult(["anthropic/claude-sonnet-4-6"]),
     );
 
-    const ctx = makeMockContext({
-      getCurrentConvId: vi.fn().mockReturnValue("default"),
-    });
-    const result = await handleModelSwitch(
-      ["anthropic/claude-sonnet-4-6"],
-      ctx,
-    );
+    for (const convId of ["default", "conv-abc", ""]) {
+      vi.clearAllMocks();
+      const ctx = makeMockContext({
+        getCurrentConvId: vi.fn().mockReturnValue(convId),
+      });
+      const result = await handleModelSwitch(
+        ["anthropic/claude-sonnet-4-6"],
+        ctx,
+      );
 
-    expect(updateAgentLLMConfig).toHaveBeenCalledWith(
-      "agent-test-123",
-      "anthropic/claude-sonnet-4-6",
-    );
-    expect(updateConversationLLMConfig).not.toHaveBeenCalled();
-    expect(result).toBe("Model switched to anthropic/claude-sonnet-4-6.");
-  });
-
-  it("should switch conversation model for named conversation", async () => {
-    (getAvailableModelHandles as any).mockResolvedValue(
-      mockResult(["anthropic/claude-opus-4-7"]),
-    );
-
-    const ctx = makeMockContext({
-      getCurrentConvId: vi.fn().mockReturnValue("conv-abc"),
-    });
-    const result = await handleModelSwitch(["anthropic/claude-opus-4-7"], ctx);
-
-    expect(updateConversationLLMConfig).toHaveBeenCalledWith(
-      "conv-abc",
-      "anthropic/claude-opus-4-7",
-    );
-    expect(updateAgentLLMConfig).not.toHaveBeenCalled();
-    expect(result).toBe("Model switched to anthropic/claude-opus-4-7.");
-  });
-
-  it("should use agent-level switch when getCurrentConvId returns empty string", async () => {
-    (getAvailableModelHandles as any).mockResolvedValue(
-      mockResult(["letta/auto"]),
-    );
-
-    const ctx = makeMockContext({
-      getCurrentConvId: vi.fn().mockReturnValue(""),
-    });
-    const result = await handleModelSwitch(["letta/auto"], ctx);
-
-    expect(updateAgentLLMConfig).toHaveBeenCalled();
-    expect(updateConversationLLMConfig).not.toHaveBeenCalled();
-    expect(result).toBe("Model switched to letta/auto.");
+      expect(updateAgentLLMConfig).toHaveBeenCalledWith(
+        "agent-test-123",
+        "anthropic/claude-sonnet-4-6",
+      );
+      expect(result).toBe("Model switched to anthropic/claude-sonnet-4-6.");
+    }
   });
 });
 
@@ -280,9 +245,9 @@ describe("handleContextWindow", () => {
     expect(result).toContain("Invalid size");
   });
 
-  it("updates agent LLM config for default conversation", async () => {
+  it("always updates agent LLM config regardless of active conversation", async () => {
     const ctx = makeMockContext({
-      getCurrentConvId: vi.fn().mockReturnValue("default"),
+      getCurrentConvId: vi.fn().mockReturnValue("conv-abc"),
     });
     const result = await handleContextWindow(["128K"], ctx);
 
@@ -295,17 +260,10 @@ describe("handleContextWindow", () => {
     expect(result).toContain("128,000");
   });
 
-  it("updates conversation LLM config for named conversation", async () => {
-    const ctx = makeMockContext({
-      getCurrentConvId: vi.fn().mockReturnValue("conv-abc"),
-    });
+  it("formats 1M correctly", async () => {
+    const ctx = makeMockContext();
     const result = await handleContextWindow(["1M"], ctx);
-
-    expect(updateConversationLLMConfig).toHaveBeenCalledWith(
-      "conv-abc",
-      "anthropic/claude-sonnet-4-6",
-      { context_window: 1000000 },
-    );
     expect(result).toContain("1M");
+    expect(result).toContain("1,000,000");
   });
 });

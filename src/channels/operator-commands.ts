@@ -4,7 +4,6 @@ import { getAvailableModelHandles } from "../agent/available-models.js";
 import {
   recompileAgentSystemPrompt,
   updateAgentLLMConfig,
-  updateConversationLLMConfig,
 } from "../agent/modify.js";
 
 export interface OperatorCommandContext {
@@ -331,13 +330,7 @@ async function handleModelSwitch(
     return `Model '${handle}' is not available on this server. Use !models to see what's available.`;
   }
 
-  const convId = ctx.getCurrentConvId();
-  if (convId && convId !== "default") {
-    await updateConversationLLMConfig(convId, handle);
-  } else {
-    await updateAgentLLMConfig(ctx.agentId, handle);
-  }
-
+  await updateAgentLLMConfig(ctx.agentId, handle);
   return `Model switched to ${handle}.`;
 }
 
@@ -371,12 +364,7 @@ async function handleContextWindow(
     return "Could not determine current model.";
   }
 
-  const convId = ctx.getCurrentConvId();
-  if (convId && convId !== "default") {
-    await updateConversationLLMConfig(convId, model, { context_window: size });
-  } else {
-    await updateAgentLLMConfig(ctx.agentId, model, { context_window: size });
-  }
+  await updateAgentLLMConfig(ctx.agentId, model, { context_window: size });
 
   const sizeLabel =
     size >= 1_000_000
