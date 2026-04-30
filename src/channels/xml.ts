@@ -14,7 +14,6 @@
 import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "../constants";
 import type {
-  ChannelMessageAttachment,
   ChannelThreadContext,
   ChannelThreadContextEntry,
   InboundChannelMessage,
@@ -233,43 +232,23 @@ export function buildChannelMessageBody(msg: InboundChannelMessage): string {
 
 // ── top-level formatter ──────────────────────────────────────────────────────
 
-function imageContentParts(
-  attachments: ChannelMessageAttachment[] | undefined,
-) {
-  if (!attachments?.length) return [];
-  return attachments.flatMap((attachment) => {
-    if (
-      attachment.kind !== "image" ||
-      typeof attachment.imageDataBase64 !== "string" ||
-      attachment.imageDataBase64.length === 0 ||
-      typeof attachment.mimeType !== "string" ||
-      !attachment.mimeType.startsWith("image/")
-    ) {
-      return [];
-    }
-    return [
-      {
-        type: "image" as const,
-        source: {
-          type: "base64" as const,
-          media_type: attachment.mimeType,
-          data: attachment.imageDataBase64,
-        },
-      },
-    ];
-  });
-}
-
 /**
  * Format an inbound channel message as structured content parts.
  *
  * Output layout:
  *   1. Reminder text — system-reminder with sectioned-markdown metadata,
- *      chat context, and response directives.
+ *      chat context (including attachment local_path / mime / size), and
+ *      response directives.
  *   2. Message body  — thread-context XML (if any) + the user's bare text.
  *      Skipped entirely when the body would be empty (e.g. reaction-only
  *      events have no body — the reaction is described in chat context).
- *   3. Image content parts — one per inline-decodable image attachment.
+ *
+ * Image attachments are NOT inlined as base64 content blocks. The agent
+ * is given the file's local_path in the chat-context reminder and can
+ * Read it with its own tools. Inlining base64 caused upstream LLM proxies
+ * (e.g. crof.ai) to reject the request once the image entered history,
+ * because Letta's OpenAI client serializes tools/tool_choice as null
+ * instead of omitting them on multimodal requests.
  */
 export function formatChannelNotification(
   msg: InboundChannelMessage,
@@ -280,8 +259,5 @@ export function formatChannelNotification(
     { type: "text", text: reminderText },
   ];
   if (bodyText) textParts.push({ type: "text", text: bodyText });
-  return [
-    ...textParts,
-    ...imageContentParts(msg.attachments),
-  ] as MessageCreate["content"];
+  return textParts as MessageCreate["content"];
 }

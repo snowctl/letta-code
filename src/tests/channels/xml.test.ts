@@ -304,7 +304,7 @@ describe("formatChannelNotification", () => {
     expect(body).toContain('"goodbye"');
   });
 
-  test("emits image content parts for inbound image attachments alongside the text parts", () => {
+  test("does not inline image attachments as base64 content parts (agent reads via local_path instead)", () => {
     const msg: InboundChannelMessage = {
       channel: "slack",
       chatId: "C123",
@@ -325,15 +325,14 @@ describe("formatChannelNotification", () => {
       ],
     };
     const content = formatChannelNotification(msg);
-    expect(content).toHaveLength(3);
-    expect((content as unknown[])[2]).toEqual({
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: "image/png",
-        data: "YWJj",
-      },
-    });
+    // Reminder + body — no image content block.
+    expect(content).toHaveLength(2);
+    for (const part of content as Array<{ type: string }>) {
+      expect(part.type).toBe("text");
+    }
+    // Local path is surfaced in the chat-context reminder so the agent can Read it.
+    const first = (content as Array<{ type: string; text: string }>)[0];
+    expect(first?.text).toContain("/tmp/screenshot.png");
   });
 
   test("reaction-only event with no thread context produces a single reminder part (no body part)", () => {
