@@ -1992,54 +1992,55 @@ export function createMatrixAdapter(
       return;
     }
 
+    const sendReply = async (text: string) => {
+      await client.sendMessage(roomId, {
+        msgtype: "m.text",
+        body: text,
+        format: "org.matrix.custom.html",
+        formatted_body: markdownToMatrixHtml(text),
+      });
+    };
+
     if (command === "!cancel") {
-      const reply = await dispatchOperatorCommand("cancel", [], roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("cancel", [], roomId));
       return;
     }
 
     if (command === "!compact") {
-      const reply = await dispatchOperatorCommand("compact", [], roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("compact", [], roomId));
       return;
     }
 
     if (command === "!recompile") {
-      const reply = await dispatchOperatorCommand("recompile", [], roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("recompile", [], roomId));
       return;
     }
 
     if (command === "!conv") {
       const args = parts.slice(1).filter(Boolean);
-      const reply = await dispatchOperatorCommand("conv", args, roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("conv", args, roomId));
       return;
     }
 
     if (command === "!reset") {
       const args = parts.slice(1).filter(Boolean);
-      const reply = await dispatchOperatorCommand("reset", args, roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("reset", args, roomId));
       return;
     }
 
     if (command === "!models") {
-      const reply = await dispatchOperatorCommand("models", [], roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("models", [], roomId));
       return;
     }
 
     if (command === "!model") {
       const args = parts.slice(1).filter(Boolean);
-      const reply = await dispatchOperatorCommand("model", args, roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("model", args, roomId));
       return;
     }
 
     if (command === "!help") {
-      const reply = await dispatchOperatorCommand("help", [], roomId);
-      await client.sendMessage(roomId, { msgtype: "m.text", body: reply });
+      await sendReply(await dispatchOperatorCommand("help", [], roomId));
       return;
     }
   }
