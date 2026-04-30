@@ -26,6 +26,7 @@ Out of scope for this design (deferred to a possible future iteration):
 - Per-task auxiliary tasks beyond vision (compression, search, web extraction)
 - Per-agent aux override (env-var-only configuration is enough)
 - Async-and-sync parallel client variants — only the variant each call site needs
+- Caption-aware aux (passing the user's caption into the aux prompt) — keeps the cache simple, can be added later
 
 The module is *named* and *shaped* so adding any of the above later is extension, not rewrite.
 
@@ -115,6 +116,8 @@ Adapted from the proposed fix in [NousResearch/hermes-agent#10809](https://githu
 Overridable per call via the `prompt` kwarg, and globally via the `LETTA_AUX_VISION_PROMPT` env var.
 
 **Statelessness — important:** `describe_image` constructs its OWN minimal request to the aux model. It does **not** include letta's system prompt, conversation history, tool definitions, or any other agent state. The aux call is a one-shot `[{role: "user", content: [{type: "text", text: PROMPT}, {type: "image_url", image_url: {url: data_url}}]}]` request. Aux output is consumed only as text and inlined back into the main agent's call; it never affects agent memory or wakes a new step.
+
+**Aux does NOT see the user's caption.** When a user sends a captioned image (e.g. matrix message of `"what do you think of this?"` + attachment), the caption goes only to the main agent — bundled in front of the envelope in the user-role message. The aux call uses the default vision prompt and operates on the image alone. This keeps the description cache effective (same `sha256(image_bytes)` always yields the same description regardless of which turn the user is on), at the cost of the description not being tuned to the user's question. The bounded default prompt is comprehensive enough — with verbatim text transcription and chart-element coverage — that the main model can typically answer follow-up questions from the description alone. If we later observe quality regressions on this path, caption-aware aux can be added as a backwards-compatible enhancement (cache key gains a `+caption_hash` component; the aux prompt gains a `User context: …` line). Out of scope for v1.
 
 **Errors:** raises a new `AuxUnavailable` exception in `letta/errors.py` for the missing-config and aux-call-failed cases. Callers decide whether to fall back to placeholder text or strip the image.
 
@@ -233,7 +236,7 @@ def fill_image_content_in_messages(
 
 When `image_describer` is `None`: behavior unchanged (produces multimodal `[text, image_url]` user content as today).
 
-When provided: instead of `image_url`, the function calls `image_describer(data_url)` for each image part on the pydantic user message and emits text-only content `[text(original_user_text), text(_format_user_image_envelope(filename, description))]`. Role stays `user`. The same `_safely_describe` wrapper catches `AuxUnavailable` and substitutes the failure placeholder.
+When provided: instead of `image_url`, the function calls `image_describer(data_url)` for each image part on the pydantic user message and emits a single text content string of the form `"<original_user_text>\n\n<envelope>"`. The user's original caption (if any) is preserved verbatim and sits **before** the envelope, so the model sees the user's question first and reads the description as supporting context. If the user sent only an image with no caption, the content is just the envelope. Role stays `user`. The same `_safely_describe` wrapper catches `AuxUnavailable` and substitutes the failure placeholder.
 
 The envelope format for direct-user-upload images, produced by `_format_user_image_envelope(filename, description)`:
 
