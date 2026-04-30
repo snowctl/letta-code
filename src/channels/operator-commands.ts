@@ -45,6 +45,8 @@ export async function handleOperatorCommand(
         return await handleModels(ctx);
       case "model":
         return await handleModelSwitch(args, ctx);
+      case "ctx":
+        return await handleContextWindow(args, ctx);
       case "help":
         return handleHelp(ctx);
       default:
@@ -69,6 +71,7 @@ function handleHelp(ctx: OperatorCommandContext): string {
     `${p}reset — wipe messages on the current conversation`,
     `${p}models — list available models`,
     `${p}model <handle> — switch the active model`,
+    `${p}ctx <size> — set context window (e.g. 128K, 1M, 200000)`,
     `${p}reset <n> — wipe messages on conversation <n> (run conv list first)`,
     `${p}help — show this message`,
   ].join("\n");
@@ -338,5 +341,55 @@ async function handleModelSwitch(
   return `Model switched to ${handle}.`;
 }
 
+function parseContextWindowSize(raw: string): number | null {
+  const s = raw.trim().toUpperCase();
+  const match = s.match(/^(\d+(?:\.\d+)?)\s*([KM]?)$/);
+  if (!match) return null;
+  const n = parseFloat(match[1] as string);
+  const suffix = match[2];
+  if (suffix === "M") return Math.round(n * 1_000_000);
+  if (suffix === "K") return Math.round(n * 1_000);
+  return Math.round(n);
+}
+
+async function handleContextWindow(
+  args: string[],
+  ctx: OperatorCommandContext,
+): Promise<string> {
+  if (args.length === 0) {
+    return `Usage: !ctx <size>  (e.g. !ctx 128K, !ctx 1M, !ctx 200000)`;
+  }
+
+  const size = parseContextWindowSize(args[0] as string);
+  if (!size || size < 1000) {
+    return `Invalid size '${args[0]}'. Use a number with optional K/M suffix (e.g. 128K, 1M).`;
+  }
+
+  const agent = await ctx.client.agents.retrieve(ctx.agentId);
+  const model = agent.model;
+  if (!model) {
+    return "Could not determine current model.";
+  }
+
+  const convId = ctx.getCurrentConvId();
+  if (convId && convId !== "default") {
+    await updateConversationLLMConfig(convId, model, { context_window: size });
+  } else {
+    await updateAgentLLMConfig(ctx.agentId, model, { context_window: size });
+  }
+
+  const sizeLabel =
+    size >= 1_000_000
+      ? `${Math.round(size / 1_000_000)}M`
+      : `${Math.round(size / 1_000)}K`;
+  return `Context window set to ${sizeLabel} (${size.toLocaleString()} tokens).`;
+}
+
 // Exported for testing
-export { handleModels, handleModelSwitch, handleHelp };
+export {
+  handleModels,
+  handleModelSwitch,
+  handleHelp,
+  handleContextWindow,
+  parseContextWindowSize,
+};

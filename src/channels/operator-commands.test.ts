@@ -16,9 +16,11 @@ import {
 } from "../agent/modify.js";
 import type { OperatorCommandContext } from "./operator-commands.js";
 import {
+  handleContextWindow,
   handleHelp,
   handleModelSwitch,
   handleModels,
+  parseContextWindowSize,
 } from "./operator-commands.js";
 
 function makeMockContext(
@@ -225,5 +227,85 @@ describe("handleHelp", () => {
     const result = await handleHelp(ctx);
     expect(result).toContain("!models");
     expect(result).toContain("!model");
+  });
+
+  it("should include !ctx in help output", async () => {
+    const ctx = makeMockContext();
+    const result = await handleHelp(ctx);
+    expect(result).toContain("!ctx");
+  });
+});
+
+describe("parseContextWindowSize", () => {
+  it("parses plain numbers", () => {
+    expect(parseContextWindowSize("200000")).toBe(200000);
+  });
+
+  it("parses K suffix case-insensitively", () => {
+    expect(parseContextWindowSize("128K")).toBe(128000);
+    expect(parseContextWindowSize("128k")).toBe(128000);
+  });
+
+  it("parses M suffix", () => {
+    expect(parseContextWindowSize("1M")).toBe(1000000);
+    expect(parseContextWindowSize("1.5M")).toBe(1500000);
+  });
+
+  it("returns null for invalid input", () => {
+    expect(parseContextWindowSize("abc")).toBeNull();
+    expect(parseContextWindowSize("")).toBeNull();
+  });
+});
+
+describe("handleContextWindow", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns usage when no args provided", async () => {
+    const ctx = makeMockContext();
+    const result = await handleContextWindow([], ctx);
+    expect(result).toContain("Usage");
+  });
+
+  it("returns error for invalid size", async () => {
+    const ctx = makeMockContext();
+    const result = await handleContextWindow(["abc"], ctx);
+    expect(result).toContain("Invalid size");
+  });
+
+  it("returns error for size below minimum", async () => {
+    const ctx = makeMockContext();
+    const result = await handleContextWindow(["500"], ctx);
+    expect(result).toContain("Invalid size");
+  });
+
+  it("updates agent LLM config for default conversation", async () => {
+    const ctx = makeMockContext({
+      getCurrentConvId: vi.fn().mockReturnValue("default"),
+    });
+    const result = await handleContextWindow(["128K"], ctx);
+
+    expect(updateAgentLLMConfig).toHaveBeenCalledWith(
+      "agent-test-123",
+      "anthropic/claude-sonnet-4-6",
+      { context_window: 128000 },
+    );
+    expect(result).toContain("128K");
+    expect(result).toContain("128,000");
+  });
+
+  it("updates conversation LLM config for named conversation", async () => {
+    const ctx = makeMockContext({
+      getCurrentConvId: vi.fn().mockReturnValue("conv-abc"),
+    });
+    const result = await handleContextWindow(["1M"], ctx);
+
+    expect(updateConversationLLMConfig).toHaveBeenCalledWith(
+      "conv-abc",
+      "anthropic/claude-sonnet-4-6",
+      { context_window: 1000000 },
+    );
+    expect(result).toContain("1M");
   });
 });
