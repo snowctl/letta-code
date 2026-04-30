@@ -58,14 +58,16 @@ export async function handleOperatorCommand(
 
 function handleHelp(ctx: OperatorCommandContext): string {
   const p = ctx.commandPrefix;
-  const cmd = (name: string, desc: string) => `\`${p}${name}\` — ${desc}`;
+  const cmd = (name: string, desc: string) => `- \`${p}${name}\` — ${desc}`;
   return [
     "**Commands**",
     "",
+    "**Model**",
     cmd("models", "list available models with context window sizes"),
     cmd("model <handle>", "switch the active model"),
     cmd("ctx <size>", "set context window size (e.g. 128K, 1M)"),
     "",
+    "**Conversations**",
     cmd("conv list", "list conversations"),
     cmd("conv new", "start a new conversation"),
     cmd("conv fork", "fork the current conversation"),
@@ -74,6 +76,7 @@ function handleHelp(ctx: OperatorCommandContext): string {
     cmd("reset", "wipe messages on the current conversation"),
     cmd("reset <n>", "wipe messages on conversation n (run conv list first)"),
     "",
+    "**System**",
     cmd("compact", "force memory compaction"),
     cmd("recompile", "recompile system prompt"),
     cmd("cancel", "cancel the active run"),
