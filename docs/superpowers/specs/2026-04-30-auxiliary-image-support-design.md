@@ -101,7 +101,7 @@ async def describe_image_async(data_url: str, *, prompt: Optional[str] = None) -
 
 **Cache:** module-level `OrderedDict` keyed by `(task: str, content_hash: str, aux_model: str)`, capped at 256 entries with LRU eviction. `content_hash = sha256(image_bytes)` extracted from the `data:…;base64,…` URL. Cache hits skip the aux call entirely. Thread-safe via a single `threading.Lock`.
 
-**Default prompt:** `"Describe this image concisely (1–3 sentences). Focus on visible content; do not editorialize."` — overridable by the caller.
+**Default prompt:** `"Describe this image. Be concise but capture text content (OCR if visible) and notable visual elements."` — chosen because the most common tool-return image source (Read of a screenshot, terminal-state image, error dialog) tends to need OCR over prose. Overridable per call via the `prompt` kwarg, and globally via the `LETTA_AUX_VISION_PROMPT` env var.
 
 **Errors:** raises a new `AuxUnavailable` exception in `letta/errors.py` for the missing-config and aux-call-failed cases. Callers decide whether to fall back to placeholder text or strip the image.
 
@@ -234,15 +234,18 @@ Whether the LLM call that follows is sync, async, or streaming is irrelevant to 
 
 ## Configuration
 
-Three new environment variables consumed by `_resolve_aux_config`:
+Environment variables consumed by `_resolve_aux_config`, with fallbacks to vanilla OpenAI-SDK env vars so aux can piggyback on the same provider when convenient:
 
-| Variable | Example | Required |
-|---|---|---|
-| `LETTA_AUX_VISION_BASE_URL` | `https://crof.ai/v1` | yes (or feature is no-op) |
-| `LETTA_AUX_VISION_MODEL` | `qwen3.6-27b` | yes |
-| `LETTA_AUX_VISION_API_KEY` | `nahcrof_…` | yes (or `OPENAI_API_KEY` as fallback)
+| Variable | Fallback | Example | Required |
+|---|---|---|---|
+| `LETTA_AUX_VISION_BASE_URL` | `OPENAI_BASE_URL` | `https://crof.ai/v1` | yes (one of them) |
+| `LETTA_AUX_VISION_API_KEY` | `OPENAI_API_KEY` | `nahcrof_…` | yes (one of them) |
+| `LETTA_AUX_VISION_MODEL` | *(none — must be explicit)* | `qwen3.6-27b` | yes |
+| `LETTA_AUX_VISION_PROMPT` | *(uses module default)* | `"Describe…"` | no |
 
-When any are missing: `_resolve_aux_config` returns `None`, log a single warning per process (`logger.warning("auxiliary_client: LETTA_AUX_VISION_* not configured; vision auxiliary disabled")`), and both pre-call and reactive paths gracefully degrade — pre-call no-ops (image goes through unchanged), reactive falls back to today's strip-images behavior.
+`_resolve_aux_config` reads the LETTA-specific var first, then the OPENAI-prefixed fallback. `MODEL` has no fallback because aggregator endpoints serve many models — picking one implicitly would be too magical.
+
+When `BASE_URL` or `API_KEY` cannot be resolved, or `MODEL` is unset: `_resolve_aux_config` returns `None`, log a single warning per process (`logger.warning("auxiliary_client: LETTA_AUX_VISION_* not configured (missing %s); vision auxiliary disabled", missing_keys)`), and both pre-call and reactive paths gracefully degrade — pre-call no-ops (image goes through unchanged), reactive falls back to today's strip-images behavior.
 
 Per-agent opt-in (no env vars needed beyond the above):
 
@@ -351,5 +354,6 @@ The current `_strip_tool_return_image_messages`-based retry tests stay green: th
 3. Rebuild the Docker image on cypher (same flow as commit `239561ae`).
 4. Restart letta-server. Set `LETTA_AUX_VISION_*` in `~/Argos/.env`. Set `capability_overrides.vision = "unsupported"` on the kimi-k2.6 agent.
 5. Verify with the actual problem: send an image via the agent's matrix bot, confirm the agent describes it. Confirm cache hit on a second send of the same image (server logs).
-6. Once confirmed working, restore the agent's `capability_overrides.vision` to default (`{}`) so reactive fallback is what's exercised in production. Re-test: image goes to main, fails empty-stream, retry kicks in with aux, agent describes image. (This is the path real users will hit when crof.ai later "fixes" Kimi but introduces another flake — should still work.)
-7. Optional: file an issue with crof.ai linking the reproducer evidence so they have it on record.
+6. Leave the agent on `capability_overrides.vision = "unsupported"` permanently. Pre-call is both more reliable AND more efficient than reactive for this provider — every image-bearing turn under reactive mode would otherwise pay one wasted main call (full prompt billing on the failed empty-stream response) before the retry. Reactive is the safety net for *unknown* providers, not the default for known-broken ones.
+7. Optional follow-up: separately exercise the reactive path on a different agent (e.g. set up a one-off agent on a vision-capable model that you can occasionally toggle to "unsupported"-then-back-to-"auto" in a test) to verify the empty-stream / 400 retry hooks work end-to-end.
+8. Optional follow-up: when crof.ai fixes the kimi+system bug, re-test with `vision = "auto"` to confirm native vision works again. Until then, no need to revert.
