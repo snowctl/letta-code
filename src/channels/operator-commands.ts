@@ -1,8 +1,11 @@
 import type { Letta } from "@letta-ai/letta-client";
 import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
-import { recompileAgentSystemPrompt } from "../agent/modify.js";
 import { getAvailableModelHandles } from "../agent/available-models.js";
-import { updateAgentLLMConfig, updateConversationLLMConfig } from "../agent/modify.js";
+import {
+  recompileAgentSystemPrompt,
+  updateAgentLLMConfig,
+  updateConversationLLMConfig,
+} from "../agent/modify.js";
 
 export interface OperatorCommandContext {
   agentId: string;
@@ -281,7 +284,7 @@ async function handleReset(
 
 async function handleModels(ctx: OperatorCommandContext): Promise<string> {
   const [result, agent] = await Promise.all([
-    getAvailableModelHandles(),
+    getAvailableModelHandles({ forceRefresh: true }),
     ctx.client.agents.retrieve(ctx.agentId),
   ]);
 
