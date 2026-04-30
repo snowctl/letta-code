@@ -709,12 +709,14 @@ export async function handleIncomingMessage(
     // eslint-disable-next-line no-constant-condition
     while (true) {
       if (accumulatedChannelText !== "") {
-        // This is a retry — clear adapter stream states so the next segment posts fresh
+        // Notify adapters of a segment boundary so they reset rate-limit timers.
+        // Do NOT clear accumulatedChannelText: adapters reuse the same message
+        // (preserving messageId across resets), so we must keep accumulating to
+        // avoid replacing earlier segments' text with only the new segment's text.
         if (channelSources && channelSources.length > 0) {
           void getChannelRegistry()?.dispatchStreamReset(channelSources);
         }
       }
-      accumulatedChannelText = "";
       lastAssistantMsgId = null;
       runIdSent = false;
       let latestErrorText: string | null = null;
