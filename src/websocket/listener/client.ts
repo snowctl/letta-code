@@ -22,7 +22,10 @@ import {
   getChannelRegistry,
 } from "../../channels/registry";
 import type { ChannelTurnSource } from "../../channels/types";
-import { resetContextHistory } from "../../cli/helpers/contextTracker";
+import {
+  resetContextHistory,
+  resetContextHistoryOnReconnect,
+} from "../../cli/helpers/contextTracker";
 import {
   ensureFileIndex,
   getIndexRoot,
@@ -4287,7 +4290,7 @@ async function startConnectedListenerRuntime(
       resetSharedReminderState(reminderState);
     }
     for (const contextTracker of runtime.contextTrackerByConversation.values()) {
-      resetContextHistory(contextTracker);
+      resetContextHistoryOnReconnect(contextTracker);
     }
     for (const conversationRuntime of runtime.conversationRuntimes.values()) {
       const scope = {

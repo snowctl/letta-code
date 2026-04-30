@@ -93,13 +93,13 @@ function parseBase64Url(b64url: string): Buffer {
  * Matrix uses AES-256-CTR with a JWK key and 128-bit IV per the spec.
  */
 export function decryptMatrixAttachment(
-  encrypted: ArrayBuffer,
+  encrypted: ArrayBuffer | Buffer,
   file: MatrixEncryptedFile,
 ): Buffer {
   const key = parseBase64Url(file.key.k);
   const iv = parseBase64Url(file.iv);
   const decipher = createDecipheriv("aes-256-ctr", key, iv);
-  const data = Buffer.from(encrypted);
+  const data = Buffer.isBuffer(encrypted) ? encrypted : Buffer.from(encrypted);
   return Buffer.concat([decipher.update(data), decipher.final()]);
 }
 
@@ -195,7 +195,7 @@ export function collectMatrixMediaCandidate(
 
 export async function downloadMatrixAttachment(
   candidate: MatrixMediaCandidate,
-  buffer: ArrayBuffer,
+  buffer: ArrayBuffer | Buffer,
   accountId: string,
   maxBytes: number,
   transcribeVoice: boolean,
@@ -214,10 +214,11 @@ export async function downloadMatrixAttachment(
     return null;
   }
 
+  const bufferNorm = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
   let downloaded: Buffer;
   if (candidate.encryptedFile) {
     try {
-      downloaded = decryptMatrixAttachment(buffer, candidate.encryptedFile);
+      downloaded = decryptMatrixAttachment(bufferNorm, candidate.encryptedFile);
     } catch (err) {
       console.warn(
         "[matrix] Failed to decrypt E2EE attachment:",
@@ -226,7 +227,7 @@ export async function downloadMatrixAttachment(
       return null;
     }
   } else {
-    downloaded = Buffer.from(buffer);
+    downloaded = bufferNorm;
   }
 
   const ext = candidate.filename ? extname(candidate.filename) : "";

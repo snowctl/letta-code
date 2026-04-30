@@ -30,9 +30,20 @@ export function createContextTracker(): ContextTracker {
   };
 }
 
-/** Reset token tracking (e.g. on agent/conversation switch). currentTurnId is monotonic. */
+/** Full reset (e.g. on agent/conversation switch). currentTurnId is monotonic. */
 export function resetContextHistory(ct: ContextTracker): void {
   ct.lastContextTokens = 0;
+  ct.contextTokensHistory = [];
+  ct.pendingCompaction = false;
+  ct.pendingReflectionTrigger = false;
+}
+
+/**
+ * Reconnect reset: clears history and flags but keeps lastContextTokens.
+ * The token count from the previous connection is still valid — wiping it
+ * causes the context footer to disappear on the first turn after reconnect.
+ */
+export function resetContextHistoryOnReconnect(ct: ContextTracker): void {
   ct.contextTokensHistory = [];
   ct.pendingCompaction = false;
   ct.pendingReflectionTrigger = false;

@@ -241,7 +241,7 @@ interface MatrixClientLike {
   mxcToHttp(mxc: string): string;
   downloadContent(
     mxcUrl: string,
-  ): Promise<{ body: ArrayBuffer; contentType: string }>;
+  ): Promise<{ data: Buffer; contentType: string }>;
   getUserProfile(userId: string): Promise<{ displayname?: string }>;
   getJoinedRoomMembers(roomId: string): Promise<string[]>;
   setTyping(roomId: string, isTyping: boolean, timeout?: number): Promise<void>;
@@ -1007,10 +1007,10 @@ export function createMatrixAdapter(
         const candidate = collectMatrixMediaCandidate(eventObj);
         const attachments = [];
         if (candidate) {
-          let mediaBuffer: ArrayBuffer | null = null;
+          let mediaBuffer: Buffer | null = null;
           try {
-            const { body } = await client.downloadContent(candidate.mxcUrl);
-            mediaBuffer = body;
+            const { data } = await client.downloadContent(candidate.mxcUrl);
+            mediaBuffer = data;
           } catch (err) {
             console.warn(
               "[Matrix] Failed to download media:",
