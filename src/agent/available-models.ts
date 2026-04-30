@@ -109,9 +109,7 @@ async function refreshByokProviders(): Promise<void> {
 
 async function fetchFromNetwork(): Promise<CacheEntry> {
   const client = await getClient();
-  const modelsList = await client.models.list({
-    provider_category: ["base", "byok"],
-  });
+  const modelsList = await client.models.list();
   const handles = new Set(
     modelsList.map((m) => m.handle).filter((h): h is string => !!h),
   );
