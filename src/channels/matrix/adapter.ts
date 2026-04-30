@@ -1615,11 +1615,29 @@ export function createMatrixAdapter(
             let messageId: string | null = null;
 
             if (useStreamReplace) {
+              // Wait for the rate-limit window to clear before replacing the
+              // stream preview. editStreamMessage throttles edits to
+              // currentInterval ms, but the finished handler fires immediately
+              // after the turn ends — so the stream-replace can arrive at the
+              // homeserver within milliseconds of the last streaming edit and
+              // get silently dropped with M_LIMIT_EXCEEDED.
+              const waitMs = streamState.pendingTimer
+                ? streamState.currentInterval // was already rate-limited; wait the full backoff
+                : Math.max(
+                    0,
+                    streamState.currentInterval -
+                      (Date.now() - streamState.lastEditAt),
+                  );
               if (streamState.pendingTimer)
                 clearTimeout(streamState.pendingTimer);
               if (streamState.cleanupTimeout)
                 clearTimeout(streamState.cleanupTimeout);
               streamStates.delete(chatId);
+              if (waitMs > 0) {
+                await new Promise<void>((resolve) =>
+                  setTimeout(resolve, waitMs),
+                );
+              }
               await matrixClient
                 .sendEvent(chatId, "m.room.message", {
                   msgtype: "m.text",
