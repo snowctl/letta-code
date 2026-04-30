@@ -1587,13 +1587,23 @@ export function createMatrixAdapter(
             ? ` <span data-mx-color="#8b949e">· ${formatCompact(eventUsage.contextTokens)} / ${formatCompact(eventUsage.contextWindowMax)} tokens</span>`
             : "";
 
+          // Build footer content once, used in both branches below.
+          const footerHtml =
+            `<hr><span data-mx-color="#3fb950">✓</span> ` +
+            `<span data-mx-color="#8b949e">completed in ${durationStr}</span>${usageHtml}`;
+          const footerText = `\n✓ completed in ${durationStr}${usageSuffix}`;
+
           if (pendingText && matrixClient) {
             const html = markdownToMatrixHtml(pendingText);
+            // Bake footer directly into the content so the footer and the
+            // message body are delivered in a single Matrix event. Sending a
+            // separate edit afterwards races with homeserver rate-limits and
+            // causes the footer to be silently dropped on intermittent turns.
             const finalContent = {
               msgtype: "m.text",
-              body: pendingText,
+              body: pendingText + footerText,
               format: "org.matrix.custom.html",
-              formatted_body: html,
+              formatted_body: html + footerHtml,
             };
 
             // If there is a streaming preview for this room, replace it with
@@ -1613,7 +1623,7 @@ export function createMatrixAdapter(
               await matrixClient
                 .sendEvent(chatId, "m.room.message", {
                   msgtype: "m.text",
-                  body: pendingText,
+                  body: `* ${pendingText}${footerText}`,
                   "m.new_content": finalContent,
                   "m.relates_to": {
                     rel_type: "m.replace",
@@ -1649,41 +1659,9 @@ export function createMatrixAdapter(
                   messageId,
                 );
               }
-              // Append completion footer to the sent message
-              const footerHtml =
-                `<hr><span data-mx-color="#3fb950">✓</span> ` +
-                `<span data-mx-color="#8b949e">completed in ${durationStr}</span>${usageHtml}`;
-              const footerText = `\n✓ completed in ${durationStr}${usageSuffix}`;
-              await matrixClient
-                .sendMessage(chatId, {
-                  msgtype: "m.text",
-                  body: `* ${pendingText}${footerText}`,
-                  format: "org.matrix.custom.html",
-                  formatted_body: `* ${html}${footerHtml}`,
-                  "m.new_content": {
-                    msgtype: "m.text",
-                    body: pendingText + footerText,
-                    format: "org.matrix.custom.html",
-                    formatted_body: html + footerHtml,
-                  },
-                  "m.relates_to": {
-                    rel_type: "m.replace",
-                    event_id: messageId,
-                  },
-                })
-                .catch((err: unknown) => {
-                  console.warn(
-                    "[Matrix] Failed to append completion footer:",
-                    err instanceof Error ? err.message : err,
-                  );
-                });
             }
           } else if (lastResponse && matrixClient) {
             // Fallback: no pending text from auto-forward (e.g. silent turn)
-            const footerHtml =
-              `<hr><span data-mx-color="#3fb950">✓</span> ` +
-              `<span data-mx-color="#8b949e">completed in ${durationStr}</span>${usageHtml}`;
-            const footerText = `\n✓ completed in ${durationStr}${usageSuffix}`;
             await matrixClient
               .sendMessage(chatId, {
                 msgtype: "m.text",
