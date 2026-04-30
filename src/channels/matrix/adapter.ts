@@ -99,12 +99,14 @@ async function getUndiciDispatcher(): Promise<{
   // Tight idle-eviction values: any pooled socket idle longer than
   // keepAliveTimeout is closed by undici before the server's idle-close
   // can leave it stale in our pool. keepAliveMaxTimeout caps the absolute
-  // age of any pooled socket. headersTimeout/bodyTimeout are belts on top
-  // of our own AbortSignal so a half-open response can't hang silently.
+  // age of any pooled socket. bodyTimeout is a belt on top of our own
+  // AbortSignal so a half-open response can't hang silently.
+  // headersTimeout is intentionally omitted: Matrix sync long-polling holds
+  // connections open for 30 s before sending any response headers, which
+  // would cause a 15 s headersTimeout to fire on every sync cycle.
   const dispatcher = new undici.Agent({
     keepAliveTimeout: 10_000,
     keepAliveMaxTimeout: 30_000,
-    headersTimeout: 15_000,
     bodyTimeout: 65_000,
     connect: { timeout: 10_000 },
   });
@@ -294,20 +296,16 @@ export function createMatrixAdapter(
     ReturnType<typeof setInterval>
   >();
 
-  // ── Inbound metadata caches ───────────────────────────────────────
-  // getJoinedRoomMembers and getUserProfile are HTTP round-trips to the
-  // homeserver. Doing them sequentially on every inbound message added
-  // hundreds of ms before the typing indicator could fire. Cache with a
-  // short TTL — membership and display names rarely change between turns.
+  // ── Inbound metadata cache ────────────────────────────────────────
+  // getJoinedRoomMembers is an HTTP round-trip to the homeserver, used
+  // only to determine chatType (direct vs channel). Membership rarely
+  // changes between messages, so cache with a short TTL and invalidate
+  // on m.room.member state events. Display names are not fetched at
+  // all — the agent gets senderId, which is unique and sufficient.
   const MEMBERS_CACHE_TTL_MS = 5 * 60 * 1000;
-  const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
   const roomMembersCache = new Map<
     string,
     { members: string[]; expiresAt: number }
-  >();
-  const userProfileCache = new Map<
-    string,
-    { displayname?: string; expiresAt: number }
   >();
 
   async function getRoomMembersCached(
@@ -323,23 +321,6 @@ export function createMatrixAdapter(
       expiresAt: now + MEMBERS_CACHE_TTL_MS,
     });
     return members;
-  }
-
-  async function getUserProfileCached(
-    client: MatrixClientLike,
-    userId: string,
-  ): Promise<{ displayname?: string }> {
-    const now = Date.now();
-    const hit = userProfileCache.get(userId);
-    if (hit && hit.expiresAt > now) return { displayname: hit.displayname };
-    const profile = await client
-      .getUserProfile(userId)
-      .catch(() => ({ displayname: undefined }));
-    userProfileCache.set(userId, {
-      displayname: (profile as { displayname?: string }).displayname,
-      expiresAt: now + PROFILE_CACHE_TTL_MS,
-    });
-    return profile;
   }
 
   // ── Tool block state ─────────────────────────────────────────────
@@ -1096,19 +1077,14 @@ export function createMatrixAdapter(
 
         if (!textContent && attachments.length === 0) return;
 
-        const [members, profile] = await Promise.all([
-          getRoomMembersCached(client, roomIdStr),
-          getUserProfileCached(client, senderIdStr),
-        ]);
+        const members = await getRoomMembersCached(client, roomIdStr);
         const chatType = members.length === 2 ? "direct" : "channel";
-        const senderName = profile.displayname ?? senderIdStr;
 
         const msg: InboundChannelMessage = {
           channel: "matrix",
           accountId,
           chatId: roomIdStr,
           senderId: senderIdStr,
-          senderName,
           text: textContent,
           timestamp: Date.now(),
           messageId: eventObj.event_id as string | undefined,
@@ -1135,12 +1111,10 @@ export function createMatrixAdapter(
           return;
         }
 
-        // Invalidate caches on membership/profile state changes so the next
-        // inbound message picks up fresh display names and member counts.
+        // Invalidate the room-members cache on membership state changes
+        // so the next inbound message picks up the new member count.
         if (type === "m.room.member") {
           roomMembersCache.delete(roomIdStr);
-          const stateKey = eventObj.state_key as string | undefined;
-          if (stateKey) userProfileCache.delete(stateKey);
           return;
         }
       });
