@@ -1819,6 +1819,13 @@ export function createMatrixAdapter(
               body: accumulatedText,
             });
             sentinel.messageId = String(eventId);
+            // If more text arrived while the initial sendMessage was in flight,
+            // send an immediate edit so the latest content is visible right away
+            // instead of waiting for the next handleStreamText call + interval check.
+            if (sentinel.lastText !== accumulatedText) {
+              sentinel.lastEditAt = Date.now();
+              void editStreamMessage(roomId, sentinel.lastText);
+            }
           } catch (error) {
             streamStates.delete(roomId);
             console.error(
