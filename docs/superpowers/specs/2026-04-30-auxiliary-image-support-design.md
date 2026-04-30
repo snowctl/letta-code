@@ -187,7 +187,8 @@ to:
 if image_urls:
     if image_describer is not None:
         descriptions = [_safely_describe(image_describer, u) for u in image_urls]
-        joined = "\n\n".join(f"[Image (auto-described): {d}]" for d in descriptions)
+        envelopes = [_format_tool_image_envelope(d) for d in descriptions]
+        joined = "\n\n".join(envelopes)
         text = f"{body_text}\n\n{joined}".strip() if body_text else joined
         # NOTE: do NOT add to pending_image_urls — no synthetic user msg.
     else:
@@ -197,7 +198,23 @@ else:
     text = body_text
 ```
 
-`_safely_describe` is a tiny inline helper that catches `AuxUnavailable` and substitutes `"[Image (auto-description failed)]"` so a single aux failure can't poison the whole serialization.
+The envelope format for tool-return images, produced by `_format_tool_image_envelope(description)`:
+
+```
+The active model cannot view images directly; an auto-generated description follows.
+Caption: {description}
+```
+
+Note: the existing `[Image: <filename>]` source-label stays in `body_text` (produced by the upstream tool — Read, ViewImage). The envelope is appended *after* it, so the final tool message body looks like:
+
+```
+[Image: docs/architecture-diagram.png]
+
+The active model cannot view images directly; an auto-generated description follows.
+Caption: System architecture diagram showing three layers …
+```
+
+`_safely_describe` is a tiny inline helper that catches `AuxUnavailable` and substitutes `"[Image (auto-description failed; original image not visible to current model)]"` so a single aux failure can't poison the whole serialization.
 
 ### 3a. `letta/llm_api/openai_client.py` — `fill_image_content_in_messages`
 
@@ -216,9 +233,17 @@ def fill_image_content_in_messages(
 
 When `image_describer` is `None`: behavior unchanged (produces multimodal `[text, image_url]` user content as today).
 
-When provided: instead of `image_url`, the function calls `image_describer(data_url)` for each image part on the pydantic user message and emits text-only content `[text, text(f"[Image (auto-described): {description}]")]`. Role stays `user`. The same `_safely_describe` wrapper catches `AuxUnavailable` and substitutes the failure placeholder.
+When provided: instead of `image_url`, the function calls `image_describer(data_url)` for each image part on the pydantic user message and emits text-only content `[text(original_user_text), text(_format_user_image_envelope(filename, description))]`. Role stays `user`. The same `_safely_describe` wrapper catches `AuxUnavailable` and substitutes the failure placeholder.
 
-This means **both ingestion paths — tool returns *and* direct uploads — produce identical text shape when aux is engaged**, so the main model's prompt looks consistent regardless of how the image arrived.
+The envelope format for direct-user-upload images, produced by `_format_user_image_envelope(filename, description)`:
+
+```
+[Image attached by user: {filename}]
+The active model cannot view images directly; an auto-generated description follows.
+Caption: {description}
+```
+
+Filename is taken from the pydantic `ImageContent.source` if available (e.g. matrix's downloaded local path) or `"unknown"` otherwise. The two envelopes (tool vs user) differ only in the source label — both share the "active model cannot view images directly" phrasing and `Caption:` label so the consuming model gets a consistent envelope shape regardless of where the image arrived from.
 
 ### 4. `letta/llm_api/openai_client.py` — repurpose retry hooks
 
@@ -313,7 +338,7 @@ Or in agent state JSON:
 3. For each image source (tool return and user upload):
    - Compute `content_hash = sha256(image_bytes)` from the data URL.
    - Cache lookup. Hit → use cached description. Miss → aux call with the bare `[user_msg(prompt+image_url)]` request (no system prompt, no agent state), cache the result.
-   - Inline `{"type": "text", "text": f"[Image (auto-described): {description}]"}` in place of the image content. Role of the carrying message is preserved (tool stays tool, user stays user). Synthetic image-only user message is not generated for tool returns.
+   - Wrap the description in the appropriate envelope (`_format_tool_image_envelope` or `_format_user_image_envelope`) and inline as text content in place of the original image content. Role of the carrying message is preserved (tool stays tool, user stays user). Synthetic image-only user message is not generated for tool returns.
 4. Serialized messages — text-only, no `image_url` parts anywhere — go to the main LLM. No reactive retry path triggers; the LLM sees only text.
 5. Pydantic message in postgres is **untouched** — agent memory still holds the original `ImageContent`. The next time this image is sent to the same vision-unsupported model, step 3's cache hits and no fresh aux roundtrip is paid.
 
@@ -335,7 +360,7 @@ Or in agent state JSON:
 | Condition | Behavior |
 |---|---|
 | `LETTA_AUX_VISION_*` env vars missing | `_resolve_aux_config` returns `None`. `describe_image` raises `AuxUnavailable`. Pre-call path no-ops (image goes unchanged). Reactive path falls back to `_strip_tool_return_image_messages`. Single warning per process. |
-| Aux call HTTP 4xx / 5xx / network error | `describe_image` raises `AuxUnavailable`. Pre-call path's `_safely_describe` inlines `[Image (auto-description failed)]`. Reactive path falls back to `_strip_tool_return_image_messages`. Both log a warning with the underlying error. Main agent step never blocks. |
+| Aux call HTTP 4xx / 5xx / network error | `describe_image` raises `AuxUnavailable`. Pre-call path's `_safely_describe` inlines `[Image (auto-description failed; original image not visible to current model)]`. Reactive path falls back to `_strip_tool_return_image_messages`. Both log a warning with the underlying error. Main agent step never blocks. |
 | Aux returns empty / whitespace-only string | Inline whatever was returned (don't retry, avoid loops). |
 | Cache eviction during step | Next aux call re-describes; no correctness impact. |
 | Image bytes malformed / not decodable | `describe_image` raises `AuxUnavailable`; same fallback as aux call failure. |
