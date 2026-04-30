@@ -293,7 +293,11 @@ async function handleModels(ctx: OperatorCommandContext): Promise<string> {
 
   for (const handle of result.handles) {
     const ctx_k = result.contextWindows.get(handle);
-    const ctxStr = ctx_k ? ` — ${Math.round(ctx_k / 1000)}K ctx` : "";
+    const ctxStr = ctx_k
+      ? ctx_k >= 1_000_000
+        ? ` — ${Math.round(ctx_k / 1_000_000)}M ctx`
+        : ` — ${Math.round(ctx_k / 1000)}K ctx`
+      : "";
     const active = handle === activeModel;
     lines.push(
       `- ${active ? "**" : ""}\`${handle}\`${active ? "**" : ""}${ctxStr}`,
