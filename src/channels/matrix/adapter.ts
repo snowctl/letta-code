@@ -1168,6 +1168,10 @@ export function createMatrixAdapter(
 
         if (!textContent && attachments.length === 0) return;
 
+        // Start typing before the member-lookup network call so the indicator
+        // appears immediately rather than after the round-trip completes.
+        startTypingInterval(roomIdStr);
+
         const members = await getRoomMembersCached(client, roomIdStr);
         const chatType = members.length === 2 ? "direct" : "channel";
 
