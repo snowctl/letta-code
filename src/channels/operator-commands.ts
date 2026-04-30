@@ -58,21 +58,26 @@ export async function handleOperatorCommand(
 
 function handleHelp(ctx: OperatorCommandContext): string {
   const p = ctx.commandPrefix;
+  const cmd = (name: string, desc: string) => `\`${p}${name}\` — ${desc}`;
   return [
-    `${p}cancel — cancel the active run`,
-    `${p}compact — force memory compaction`,
-    `${p}recompile — recompile system prompt`,
-    `${p}conv list — list conversations`,
-    `${p}conv new — start a new conversation`,
-    `${p}conv fork — fork the current conversation`,
-    `${p}conv switch <n> — switch to conversation <n>`,
-    `${p}conv delete <n> — delete conversation <n>`,
-    `${p}reset — wipe messages on the current conversation`,
-    `${p}models — list available models`,
-    `${p}model <handle> — switch the active model`,
-    `${p}ctx <size> — set context window (e.g. 128K, 1M, 200000)`,
-    `${p}reset <n> — wipe messages on conversation <n> (run conv list first)`,
-    `${p}help — show this message`,
+    "**Commands**",
+    "",
+    cmd("models", "list available models with context window sizes"),
+    cmd("model <handle>", "switch the active model"),
+    cmd("ctx <size>", "set context window size (e.g. 128K, 1M)"),
+    "",
+    cmd("conv list", "list conversations"),
+    cmd("conv new", "start a new conversation"),
+    cmd("conv fork", "fork the current conversation"),
+    cmd("conv switch <n>", "switch to conversation n"),
+    cmd("conv delete <n>", "delete conversation n"),
+    cmd("reset", "wipe messages on the current conversation"),
+    cmd("reset <n>", "wipe messages on conversation n (run conv list first)"),
+    "",
+    cmd("compact", "force memory compaction"),
+    cmd("recompile", "recompile system prompt"),
+    cmd("cancel", "cancel the active run"),
+    cmd("help", "show this message"),
   ].join("\n");
 }
 
@@ -122,7 +127,7 @@ async function handleConv(
     case "delete":
       return await convDelete(args[1], ctx);
     default:
-      return "Unknown conv sub-command. Options: list, new, fork, switch <n>, delete <n>.";
+      return "Unknown sub-command. Options: `conv list`, `conv new`, `conv fork`, `conv switch <n>`, `conv delete <n>`.";
   }
 }
 
@@ -177,7 +182,7 @@ async function convSwitch(
 ): Promise<string> {
   const n = parseInt(nStr ?? "", 10);
   if (Number.isNaN(n) || n < 1) {
-    return "Usage: conv switch <number>";
+    return "Usage: `!conv switch <number>`";
   }
   if (n === 1) {
     await ctx.setCurrentConvId("default");
@@ -203,7 +208,7 @@ async function convDelete(
 ): Promise<string> {
   const n = parseInt(nStr ?? "", 10);
   if (Number.isNaN(n) || n < 1) {
-    return "Usage: conv delete <number>";
+    return "Usage: `!conv delete <number>`";
   }
   const cache = ctx.getConvListCache();
   if (!cache) {
@@ -246,7 +251,7 @@ async function handleReset(
   } else {
     const n = parseInt(args[0] ?? "", 10);
     if (Number.isNaN(n) || n < 1) {
-      return "Usage: reset [number]  (no number = current conversation)";
+      return "Usage: `!reset [number]` — omit number to reset current conversation";
     }
     if (n === 1) {
       targetId = "default";
@@ -316,7 +321,7 @@ async function handleModelSwitch(
   ctx: OperatorCommandContext,
 ): Promise<string> {
   if (args.length === 0) {
-    return "Usage: !model <provider/model-name>";
+    return "Usage: `!model <provider/model-name>`";
   }
 
   const handle = args[0] as string;
@@ -350,7 +355,7 @@ async function handleContextWindow(
   ctx: OperatorCommandContext,
 ): Promise<string> {
   if (args.length === 0) {
-    return `Usage: !ctx <size>  (e.g. !ctx 128K, !ctx 1M, !ctx 200000)`;
+    return "Usage: `!ctx <size>` — e.g. `!ctx 128K`, `!ctx 1M`, `!ctx 200000`";
   }
 
   const size = parseContextWindowSize(args[0] as string);

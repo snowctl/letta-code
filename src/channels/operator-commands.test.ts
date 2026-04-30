@@ -141,7 +141,7 @@ describe("handleModelSwitch", () => {
   it("should return usage when no args provided", async () => {
     const ctx = makeMockContext();
     const result = await handleModelSwitch([], ctx);
-    expect(result).toBe("Usage: !model <provider/model-name>");
+    expect(result).toContain("!model <provider/model-name>");
   });
 
   it("should return format error for handles without /", async () => {
