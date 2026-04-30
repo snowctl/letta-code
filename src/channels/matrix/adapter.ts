@@ -1456,7 +1456,14 @@ export function createMatrixAdapter(
       // Deferred: store text for the "finished" lifecycle handler to send
       // after finalizeReasoningMessage() to maintain Matrix timeline order.
       for (const source of sources) {
-        pendingResponseTextByChatId.set(source.chatId, text);
+        // If sendMessage (ChannelAction/NotifyUser) already delivered a message
+        // this turn, lastResponseByChatId is set. Skip storing pending text so
+        // the "finished" handler uses the lastResponse fallback to append the
+        // footer — avoiding a duplicate post when accumulatedChannelText from a
+        // prior segment is carried into runtime.finalAssistantText.
+        if (!lastResponseByChatId.has(source.chatId)) {
+          pendingResponseTextByChatId.set(source.chatId, text);
+        }
       }
       return undefined;
     },
