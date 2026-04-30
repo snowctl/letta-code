@@ -289,18 +289,19 @@ async function handleModels(ctx: OperatorCommandContext): Promise<string> {
   ]);
 
   const activeModel = agent.model;
-  const lines: string[] = ["Models:"];
+  const lines: string[] = ["**Models:**", ""];
 
   for (const handle of result.handles) {
-    if (handle === activeModel) {
-      lines.push(`**\`${handle}\`**`);
-    } else {
-      lines.push(`\`${handle}\``);
-    }
+    const ctx_k = result.contextWindows.get(handle);
+    const ctxStr = ctx_k ? ` — ${Math.round(ctx_k / 1000)}K ctx` : "";
+    const active = handle === activeModel;
+    lines.push(
+      `- ${active ? "**" : ""}\`${handle}\`${active ? "**" : ""}${ctxStr}`,
+    );
   }
 
   lines.push("");
-  lines.push("Use !model <handle> to switch.");
+  lines.push("Use `!model <handle>` to switch.");
   return lines.join("\n");
 }
 

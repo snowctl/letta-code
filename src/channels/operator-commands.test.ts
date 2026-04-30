@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "bun:test";
+import { beforeEach, describe, expect, it, vi } from "bun:test";
 
 vi.mock("../agent/available-models.js", () => ({
   getAvailableModelHandles: vi.fn(),
@@ -10,17 +10,28 @@ vi.mock("../agent/modify.js", () => ({
 }));
 
 import { getAvailableModelHandles } from "../agent/available-models.js";
-import { updateAgentLLMConfig, updateConversationLLMConfig } from "../agent/modify.js";
-import { handleModels, handleModelSwitch, handleHelp } from "./operator-commands.js";
+import {
+  updateAgentLLMConfig,
+  updateConversationLLMConfig,
+} from "../agent/modify.js";
 import type { OperatorCommandContext } from "./operator-commands.js";
+import {
+  handleHelp,
+  handleModelSwitch,
+  handleModels,
+} from "./operator-commands.js";
 
-function makeMockContext(overrides: Partial<OperatorCommandContext> = {}): OperatorCommandContext {
+function makeMockContext(
+  overrides: Partial<OperatorCommandContext> = {},
+): OperatorCommandContext {
   return {
     agentId: "agent-test-123",
     chatId: "!room:example.org",
     client: {
       agents: {
-        retrieve: vi.fn().mockResolvedValue({ model: "anthropic/claude-sonnet-4-6" }),
+        retrieve: vi
+          .fn()
+          .mockResolvedValue({ model: "anthropic/claude-sonnet-4-6" }),
       },
     } as any,
     commandPrefix: "!",
@@ -33,9 +44,13 @@ function makeMockContext(overrides: Partial<OperatorCommandContext> = {}): Opera
   };
 }
 
-function mockResult(handles: string[]) {
+function mockResult(
+  handles: string[],
+  ctxWindows: Record<string, number> = {},
+) {
   return {
     handles: new Set(handles),
+    contextWindows: new Map(Object.entries(ctxWindows)),
     source: "cache" as const,
     fetchedAt: Date.now(),
   };
@@ -48,7 +63,11 @@ describe("handleModels", () => {
 
   it("should list models with the active one bolded", async () => {
     (getAvailableModelHandles as any).mockResolvedValue(
-      mockResult(["letta/auto", "anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-7"]),
+      mockResult([
+        "letta/auto",
+        "anthropic/claude-sonnet-4-6",
+        "anthropic/claude-opus-4-7",
+      ]),
     );
 
     const ctx = makeMockContext();
@@ -58,7 +77,7 @@ describe("handleModels", () => {
     expect(result).toContain("**`anthropic/claude-sonnet-4-6`**");
     expect(result).toContain("`letta/auto`");
     expect(result).toContain("`anthropic/claude-opus-4-7`");
-    expect(result).toContain("Use !model <handle> to switch.");
+    expect(result).toContain("Use `!model <handle>` to switch.");
   });
 
   it("should bold only the active model", async () => {
@@ -107,7 +126,9 @@ describe("handleModels", () => {
   });
 
   it("should propagate errors", async () => {
-    (getAvailableModelHandles as any).mockRejectedValue(new Error("Server unreachable"));
+    (getAvailableModelHandles as any).mockRejectedValue(
+      new Error("Server unreachable"),
+    );
 
     const ctx = makeMockContext();
     await expect(handleModels(ctx)).rejects.toThrow("Server unreachable");
@@ -148,10 +169,18 @@ describe("handleModelSwitch", () => {
       mockResult(["anthropic/claude-sonnet-4-6"]),
     );
 
-    const ctx = makeMockContext({ getCurrentConvId: vi.fn().mockReturnValue("default") });
-    const result = await handleModelSwitch(["anthropic/claude-sonnet-4-6"], ctx);
+    const ctx = makeMockContext({
+      getCurrentConvId: vi.fn().mockReturnValue("default"),
+    });
+    const result = await handleModelSwitch(
+      ["anthropic/claude-sonnet-4-6"],
+      ctx,
+    );
 
-    expect(updateAgentLLMConfig).toHaveBeenCalledWith("agent-test-123", "anthropic/claude-sonnet-4-6");
+    expect(updateAgentLLMConfig).toHaveBeenCalledWith(
+      "agent-test-123",
+      "anthropic/claude-sonnet-4-6",
+    );
     expect(updateConversationLLMConfig).not.toHaveBeenCalled();
     expect(result).toBe("Model switched to anthropic/claude-sonnet-4-6.");
   });
@@ -161,10 +190,15 @@ describe("handleModelSwitch", () => {
       mockResult(["anthropic/claude-opus-4-7"]),
     );
 
-    const ctx = makeMockContext({ getCurrentConvId: vi.fn().mockReturnValue("conv-abc") });
+    const ctx = makeMockContext({
+      getCurrentConvId: vi.fn().mockReturnValue("conv-abc"),
+    });
     const result = await handleModelSwitch(["anthropic/claude-opus-4-7"], ctx);
 
-    expect(updateConversationLLMConfig).toHaveBeenCalledWith("conv-abc", "anthropic/claude-opus-4-7");
+    expect(updateConversationLLMConfig).toHaveBeenCalledWith(
+      "conv-abc",
+      "anthropic/claude-opus-4-7",
+    );
     expect(updateAgentLLMConfig).not.toHaveBeenCalled();
     expect(result).toBe("Model switched to anthropic/claude-opus-4-7.");
   });
@@ -174,7 +208,9 @@ describe("handleModelSwitch", () => {
       mockResult(["letta/auto"]),
     );
 
-    const ctx = makeMockContext({ getCurrentConvId: vi.fn().mockReturnValue("") });
+    const ctx = makeMockContext({
+      getCurrentConvId: vi.fn().mockReturnValue(""),
+    });
     const result = await handleModelSwitch(["letta/auto"], ctx);
 
     expect(updateAgentLLMConfig).toHaveBeenCalled();
