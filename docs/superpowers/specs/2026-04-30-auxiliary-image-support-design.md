@@ -204,20 +204,24 @@ else:
 The envelope format for tool-return images, produced by `_format_tool_image_envelope(description)`:
 
 ```
-The active model cannot view images directly; an auto-generated description follows.
-Caption: {description}
+<system-interrupt>
+The active model cannot view images directly; an auto-generated description follows. Description: {description}
+</system-interrupt>
 ```
 
-Note: the existing `[Image: <filename>]` source-label stays in `body_text` (produced by the upstream tool — Read, ViewImage). The envelope is appended *after* it, so the final tool message body looks like:
+Note: the existing `[Image: <filename>]` source-label stays in `body_text` (produced by the upstream tool — Read, ViewImage) and sits OUTSIDE the system-interrupt tag, since it's informational context rather than system-injected content. The envelope is appended *after* the source label, so the final tool message body looks like:
 
 ```
 [Image: docs/architecture-diagram.png]
 
-The active model cannot view images directly; an auto-generated description follows.
-Caption: System architecture diagram showing three layers …
+<system-interrupt>
+The active model cannot view images directly; an auto-generated description follows. Description: System architecture diagram showing three layers …
+</system-interrupt>
 ```
 
-`_safely_describe` is a tiny inline helper that catches `AuxUnavailable` and substitutes `"[Image (auto-description failed; original image not visible to current model)]"` so a single aux failure can't poison the whole serialization.
+The `<system-interrupt>` tag mirrors letta-code's existing `<system-reminder>` convention for system-injected content, so models conditioned by letta's system prompt naturally recognize this region as not-user-authored.
+
+`_safely_describe` is a tiny inline helper that catches `AuxUnavailable` and substitutes `"<system-interrupt>The active model cannot view images directly, and the auto-description service is unavailable. The original image is not visible to the current model.</system-interrupt>"` so a single aux failure can't poison the whole serialization.
 
 ### 3a. `letta/llm_api/openai_client.py` — `fill_image_content_in_messages`
 
@@ -242,11 +246,25 @@ The envelope format for direct-user-upload images, produced by `_format_user_ima
 
 ```
 [Image attached by user: {filename}]
-The active model cannot view images directly; an auto-generated description follows.
-Caption: {description}
+<system-interrupt>
+The active model cannot view images directly; an auto-generated description follows. Description: {description}
+</system-interrupt>
 ```
 
-Filename is taken from the pydantic `ImageContent.source` if available (e.g. matrix's downloaded local path) or `"unknown"` otherwise. The two envelopes (tool vs user) differ only in the source label — both share the "active model cannot view images directly" phrasing and `Caption:` label so the consuming model gets a consistent envelope shape regardless of where the image arrived from.
+Filename is taken from the pydantic `ImageContent.source` if available (e.g. matrix's downloaded local path) or `"unknown"` otherwise. The source label is plaintext (outside the tag), the description is wrapped in `<system-interrupt>`. Both envelopes (tool vs user) share the same tag wrapper and `Description:` label — only the source-label line differs — so the consuming model sees a consistent shape regardless of where the image arrived from.
+
+A complete user-upload message including the user's caption (e.g. matrix message text + photo) becomes:
+
+```
+what do you think of this?
+
+[Image attached by user: dog.png]
+<system-interrupt>
+The active model cannot view images directly; an auto-generated description follows. Description: A golden retriever wearing a red collar, sitting on grass, looking toward the camera.
+</system-interrupt>
+```
+
+The user's caption sits outside the tag (preserving its user-authored intent); the auto-description sits inside (clearly marking it as system-injected).
 
 ### 4. `letta/llm_api/openai_client.py` — repurpose retry hooks
 
@@ -363,7 +381,7 @@ Or in agent state JSON:
 | Condition | Behavior |
 |---|---|
 | `LETTA_AUX_VISION_*` env vars missing | `_resolve_aux_config` returns `None`. `describe_image` raises `AuxUnavailable`. Pre-call path no-ops (image goes unchanged). Reactive path falls back to `_strip_tool_return_image_messages`. Single warning per process. |
-| Aux call HTTP 4xx / 5xx / network error | `describe_image` raises `AuxUnavailable`. Pre-call path's `_safely_describe` inlines `[Image (auto-description failed; original image not visible to current model)]`. Reactive path falls back to `_strip_tool_return_image_messages`. Both log a warning with the underlying error. Main agent step never blocks. |
+| Aux call HTTP 4xx / 5xx / network error | `describe_image` raises `AuxUnavailable`. Pre-call path's `_safely_describe` inlines `<system-interrupt>The active model cannot view images directly, and the auto-description service is unavailable. The original image is not visible to the current model.</system-interrupt>`. Reactive path falls back to `_strip_tool_return_image_messages`. Both log a warning with the underlying error. Main agent step never blocks. |
 | Aux returns empty / whitespace-only string | Inline whatever was returned (don't retry, avoid loops). |
 | Cache eviction during step | Next aux call re-describes; no correctness impact. |
 | Image bytes malformed / not decodable | `describe_image` raises `AuxUnavailable`; same fallback as aux call failure. |
