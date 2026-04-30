@@ -2039,6 +2039,12 @@ export function createMatrixAdapter(
       return;
     }
 
+    if (command === "!ctx") {
+      const args = parts.slice(1).filter(Boolean);
+      await sendReply(await dispatchOperatorCommand("ctx", args, roomId));
+      return;
+    }
+
     if (command === "!help") {
       await sendReply(await dispatchOperatorCommand("help", [], roomId));
       return;

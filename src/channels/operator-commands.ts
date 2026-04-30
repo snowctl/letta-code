@@ -324,7 +324,8 @@ async function handleModelSwitch(
   ctx: OperatorCommandContext,
 ): Promise<string> {
   if (args.length === 0) {
-    return "Usage: `!model <provider/model-name>`";
+    const agent = await ctx.client.agents.retrieve(ctx.agentId);
+    return `Current model: \`${agent.model ?? "unknown"}\``;
   }
 
   const handle = args[0] as string;
