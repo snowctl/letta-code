@@ -1162,6 +1162,7 @@ export async function handleIncomingMessage(
           agent_id: agentId,
           conversation_id: conversationId,
         });
+        runtime.listener.queuePumpKicker?.(runtime);
 
         const errorMessage =
           errorDetail || `Unexpected stop reason: ${stopReason}`;
@@ -1273,6 +1274,7 @@ export async function handleIncomingMessage(
       agent_id: agentId || null,
       conversation_id: conversationId,
     });
+    runtime.listener.queuePumpKicker?.(runtime);
 
     const errorMessage = error instanceof Error ? error.message : String(error);
     emitLoopErrorNotice(socket, runtime, {

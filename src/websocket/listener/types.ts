@@ -215,7 +215,8 @@ export type ListenerRuntime = {
    * Re-kick the queue pump for a scoped runtime after a turn completes.
    * Set by startConnectedListenerRuntime so turn.ts can drain queued
    * task notifications (e.g. subagent completions) once isProcessing flips
-   * back to false. No-op when not in listener mode.
+   * back to false. Optional because it is assigned after construction;
+   * callers use optional chaining.
    */
   queuePumpKicker?: (runtime: ConversationRuntime) => void;
 };
