@@ -550,7 +550,26 @@ export async function handleIncomingMessage(
                 (agent as { last_run_completion?: string | null })
                   .last_run_completion ?? null,
             };
-            const ctxWindow = agent.llm_config?.context_window;
+            // Prefer context_window_size_max from the /context endpoint — it
+            // reflects the user-configured limit, not just the model's maximum.
+            let ctxWindow = agent.llm_config?.context_window;
+            try {
+              const ctxInfo = await (
+                client as unknown as {
+                  get: <T>(path: string) => Promise<T>;
+                }
+              ).get<{ context_window_size_max?: number }>(
+                `/v1/agents/${agentId}/context`,
+              );
+              if (
+                ctxInfo.context_window_size_max &&
+                ctxInfo.context_window_size_max > 0
+              ) {
+                ctxWindow = ctxInfo.context_window_size_max;
+              }
+            } catch {
+              // Non-fatal — fall back to llm_config.context_window.
+            }
             if (ctxWindow && ctxWindow > 0) {
               runtime.contextWindowMax = ctxWindow;
               runtime.listener.contextWindowMaxByConversation.set(
