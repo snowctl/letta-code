@@ -416,6 +416,11 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
       }
     }
 
+    const { ensureOpenAIProxyProvider } = await import(
+      "../../agent/provider-setup"
+    );
+    void ensureOpenAIProxyProvider();
+
     const { initializeChannels } = await import("../../channels/registry");
     await initializeChannels(channelNames);
   }

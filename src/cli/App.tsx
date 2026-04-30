@@ -75,6 +75,7 @@ import {
   INTERRUPT_RECOVERY_ALERT,
   shouldRecommendDefaultPrompt,
 } from "../agent/promptAssets";
+import { ensureOpenAIProxyProvider } from "../agent/provider-setup";
 import { reconcileExistingAgentState } from "../agent/reconcileExistingAgentState";
 import { recordSessionEnd } from "../agent/sessionHistory";
 import { SessionStats } from "../agent/stats";
@@ -1185,8 +1186,10 @@ export default function App({
   systemInfoReminderEnabled?: boolean;
 }) {
   // Warm the model-access cache in the background so /model is fast on first open.
+  // Also ensure the openai-proxy provider is registered and has models synced.
   useEffect(() => {
     prefetchAvailableModelHandles();
+    void ensureOpenAIProxyProvider();
   }, []);
 
   // Track current agent (can change when swapping)
