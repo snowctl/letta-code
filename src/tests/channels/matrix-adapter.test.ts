@@ -184,6 +184,7 @@ beforeEach(() => {
 
   mock.module("../../agent/modify", () => ({
     recompileAgentSystemPrompt: async () => "ok",
+    updateAgentLLMConfig: async () => {},
   }));
 });
 
@@ -261,7 +262,6 @@ test("matrixMessageActions.handleAction edit sends m.replace with new content", 
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
-  client.sendMessage.mockResolvedValueOnce("$edit-event");
 
   const { matrixMessageActions } = await import(
     "../../channels/matrix/messageActions"
@@ -287,12 +287,15 @@ test("matrixMessageActions.handleAction edit sends m.replace with new content", 
   } as any);
 
   expect(result).toContain("Message edited");
-  expect(result).toContain("$edit-event");
-  expect(client.sendMessage).toHaveBeenCalledTimes(1);
-  const callArgs = client.sendMessage.mock.calls[0]?.[1] as Record<
-    string,
-    unknown
-  >;
+  // result contains the replace event's own ID (from sendEvent), not the target.
+  expect(result).toContain("$fake-reaction-id");
+  // Edit now goes through MatrixSender.edit → sendEvent (not sendMessage)
+  expect(client.sendMessage).not.toHaveBeenCalled();
+  const editCall = client.sendEvent.mock.calls.find(
+    (c) => c[1] === "m.room.message",
+  );
+  expect(editCall).toBeDefined();
+  const callArgs = editCall![2] as Record<string, unknown>;
   expect(callArgs["m.relates_to"]).toEqual({
     rel_type: "m.replace",
     event_id: "$original-msg",
@@ -300,7 +303,11 @@ test("matrixMessageActions.handleAction edit sends m.replace with new content", 
   expect(callArgs["m.new_content"]).toBeDefined();
   const newContent = callArgs["m.new_content"] as Record<string, unknown>;
   expect(newContent.body).toBe("updated body");
+  // body gets "* " prefix for fallback clients; formatted_body does NOT have "* " prefix
   expect((callArgs.body as string).startsWith("* ")).toBe(true);
+  if (callArgs.formatted_body !== undefined) {
+    expect((callArgs.formatted_body as string).startsWith("* ")).toBe(false);
+  }
 });
 
 test("matrixMessageActions.handleAction edit returns error when messageId missing", async () => {
@@ -707,7 +714,6 @@ test("adapter sendMessage with removeReaction redacts event", async () => {
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
-  client.redactEvent.mockResolvedValueOnce("$redaction-event");
 
   const result = await adapter.sendMessage({
     channel: "matrix",
@@ -718,7 +724,8 @@ test("adapter sendMessage with removeReaction redacts event", async () => {
     targetMessageId: "$reaction-to-remove",
   });
 
-  expect(result.messageId).toBe("$redaction-event");
+  // The returned messageId is the redaction event's own ID (from redactEvent).
+  expect(result.messageId).toBe("$fake-redaction-id");
   expect(client.redactEvent).toHaveBeenCalledWith(
     "!room:example.com",
     "$reaction-to-remove",
@@ -1202,8 +1209,6 @@ test("Matrix turn state: finished(completed) edits last response with completion
     text: "Here are the results.",
   });
 
-  client.sendMessage.mockResolvedValueOnce("$footer-edit-1"); // completion footer edit
-
   await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
@@ -1211,10 +1216,23 @@ test("Matrix turn state: finished(completed) edits last response with completion
     outcome: "completed",
   });
 
-  // Two sendMessage calls: response + footer edit
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  // One sendMessage call (response); footer edit goes through sendEvent now
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
-  const [footerRoom, footerContent] = client.sendMessage.mock.calls[1] as [
+  // Footer edit is sent via sendEvent (MatrixSender.edit → sendEvent)
+  const footerEditCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      (c[2] as Record<string, unknown>)?.["m.relates_to"] !== undefined &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.rel_type === "m.replace",
+  );
+  expect(footerEditCall).toBeDefined();
+  const [footerRoom, , footerContent] = footerEditCall! as [
+    string,
     string,
     Record<string, unknown>,
   ];
@@ -1285,8 +1303,7 @@ test("Matrix tool block: second tool_call edits tool block via m.replace", async
   const client = getLifecycleFakeClient();
   client.sendMessage
     .mockResolvedValueOnce("$thinking-1")
-    .mockResolvedValueOnce("$tool-block-1")
-    .mockResolvedValueOnce("$tool-block-edit-1");
+    .mockResolvedValueOnce("$tool-block-1");
 
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
@@ -1304,25 +1321,30 @@ test("Matrix tool block: second tool_call edits tool block via m.replace", async
 
   await new Promise((r) => setTimeout(r, 10));
 
-  // 3 calls: thinking placeholder + tool block create + tool block edit
-  expect(client.sendMessage).toHaveBeenCalledTimes(3);
+  // 2 sendMessage calls: thinking placeholder + tool block create
+  // Tool block edit now goes through sendEvent (MatrixSender.edit)
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
 
-  const thirdCall = client.sendMessage.mock.calls[2] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const thirdContent = thirdCall[1];
-  const relatesTo = thirdContent["m.relates_to"] as
-    | Record<string, unknown>
-    | undefined;
-  expect(relatesTo?.rel_type).toBe("m.replace");
-  expect(relatesTo?.event_id).toBe("$tool-block-1");
+  // Tool block edit is the first m.room.message sendEvent with m.replace
+  const editCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.rel_type === "m.replace",
+  );
+  expect(editCall).toBeDefined();
+  const editContent = editCall![2] as Record<string, unknown>;
+  const relatesTo = editContent["m.relates_to"] as Record<string, unknown>;
+  expect(relatesTo.rel_type).toBe("m.replace");
+  expect(relatesTo.event_id).toBe("$tool-block-1");
 
-  const newContent = thirdContent["m.new_content"] as
-    | Record<string, unknown>
-    | undefined;
-  expect(newContent?.body).toContain("bash");
-  expect(newContent?.body).toContain("read_file");
+  const newContent = editContent["m.new_content"] as Record<string, unknown>;
+  expect(newContent.body).toContain("bash");
+  expect(newContent.body).toContain("read_file");
 });
 
 test("Matrix tool block: no size guard — block grows indefinitely", async () => {
@@ -1343,25 +1365,39 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
 
   await new Promise((r) => setTimeout(r, 200));
 
-  const calls = client.sendMessage.mock.calls as Array<
+  const sendMessageCalls = client.sendMessage.mock.calls as Array<
     [string, Record<string, unknown>]
   >;
   // calls[0]: thinking placeholder (no m.relates_to)
-  expect(calls[0]?.[1]["m.relates_to"]).toBeUndefined();
+  expect(sendMessageCalls[0]?.[1]["m.relates_to"]).toBeUndefined();
   expect(
-    (calls[0]?.[1] as Record<string, unknown>).formatted_body as string,
+    (sendMessageCalls[0]?.[1] as Record<string, unknown>)
+      .formatted_body as string,
   ).toContain("Thinking...");
   // calls[1]: tool block create (no m.relates_to)
-  expect(calls[1]?.[1]["m.relates_to"]).toBeUndefined();
-  // calls[2..150]: tool block edits
-  for (let i = 2; i < calls.length; i++) {
-    const relatesTo = calls[i]?.[1]["m.relates_to"] as
-      | Record<string, unknown>
-      | undefined;
-    expect(relatesTo?.rel_type).toBe("m.replace");
+  expect(sendMessageCalls[1]?.[1]["m.relates_to"]).toBeUndefined();
+  // 1 thinking placeholder + 1 tool block create = 2 sendMessage calls
+  expect(sendMessageCalls).toHaveLength(2);
+
+  // Tool block edits (149 of them) now go through sendEvent (MatrixSender.edit)
+  const editCalls = client.sendEvent.mock.calls.filter(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.rel_type === "m.replace",
+  );
+  for (const editCall of editCalls) {
+    const relatesTo = (editCall[2] as Record<string, unknown>)[
+      "m.relates_to"
+    ] as Record<string, unknown>;
+    expect(relatesTo.rel_type).toBe("m.replace");
   }
-  // 1 thinking placeholder + 1 tool block create + 149 edits = 151
-  expect(calls).toHaveLength(151);
+  // 149 tool block edits
+  expect(editCalls).toHaveLength(149);
 });
 
 test("Matrix tool block: cleared on finished, no redaction (thinking stays)", async () => {
@@ -1457,9 +1493,7 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   const client = getFakeClient();
   client.sendMessage
     .mockResolvedValueOnce("$thinking-1") // initial thinking message
-    .mockResolvedValueOnce("$answer-1") // plain answer (sendMessage)
-    .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
-    .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
+    .mockResolvedValueOnce("$answer-1"); // plain answer (sendMessage)
 
   const source = {
     channel: "matrix" as const,
@@ -1504,15 +1538,22 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
     outcome: "completed",
   });
 
-  // 4 calls total: thinking placeholder + answer + thinking finalize + completion footer edit
-  expect(client.sendMessage).toHaveBeenCalledTimes(4);
+  // 2 sendMessage calls (thinking + answer); finalize and footer go through sendEvent
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
 
-  // Third call: final edit of thinking message
-  const [, editContent] = client.sendMessage.mock.calls[2] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const ec = editContent as Record<string, unknown>;
+  // Thinking finalization: sendEvent with m.replace on thinking-1
+  const thinkingEditCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$thinking-1",
+  );
+  expect(thinkingEditCall).toBeDefined();
+  const ec = thinkingEditCall![2] as Record<string, unknown>;
   expect(ec["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$thinking-1",
@@ -1525,12 +1566,19 @@ test("matrix adapter: reasoning + response finalizes thinking at finished (not a
   expect(editHtml).toContain("I need to search for this.");
   expect(editHtml).toContain("Found 3 results.");
 
-  // Fourth call: completion footer edit on the answer message
-  const [, footerEditContent] = client.sendMessage.mock.calls[3] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const fe = footerEditContent as Record<string, unknown>;
+  // Completion footer edit: sendEvent with m.replace on answer-1
+  const footerEditCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$answer-1",
+  );
+  expect(footerEditCall).toBeDefined();
+  const fe = footerEditCall![2] as Record<string, unknown>;
   expect(fe["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$answer-1",
@@ -1661,9 +1709,7 @@ test("matrix adapter: thinking finalized when turn ends without response", async
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
-  client.sendMessage
-    .mockResolvedValueOnce("$thinking-1") // initial thinking message
-    .mockResolvedValueOnce("$thinking-final"); // final edit
+  client.sendMessage.mockResolvedValueOnce("$thinking-1"); // initial thinking message
 
   const source = {
     channel: "matrix" as const,
@@ -1687,13 +1733,20 @@ test("matrix adapter: thinking finalized when turn ends without response", async
   // NOT redacted — stays in room
   expect(client.redactEvent).not.toHaveBeenCalled();
 
-  // Final edit sent (summary changes from "Thinking..." to "Thinking")
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
-  const [, editContent] = client.sendMessage.mock.calls[1] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const ec = editContent as Record<string, unknown>;
+  // Final edit goes through sendEvent now (MatrixSender.edit)
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const editCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$thinking-1",
+  );
+  expect(editCall).toBeDefined();
+  const ec = editCall![2] as Record<string, unknown>;
   expect(ec["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$thinking-1",
@@ -1710,9 +1763,7 @@ test("matrix adapter: very long reasoning is sliding-window truncated to fit Mat
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
-  client.sendMessage
-    .mockResolvedValueOnce("$thinking-1") // initial thinking placeholder
-    .mockResolvedValueOnce("$thinking-final"); // final edit at "finished"
+  client.sendMessage.mockResolvedValueOnce("$thinking-1"); // initial thinking placeholder
 
   const source = {
     channel: "matrix" as const,
@@ -1738,12 +1789,20 @@ test("matrix adapter: very long reasoning is sliding-window truncated to fit Mat
     outcome: "completed",
   });
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
-  const [, editContent] = client.sendMessage.mock.calls[1] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const ec = editContent as Record<string, unknown>;
+  // Initial thinking placeholder is sendMessage; final edit goes through sendEvent
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const editCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$thinking-1",
+  );
+  expect(editCall).toBeDefined();
+  const ec = editCall![2] as Record<string, unknown>;
   const newContent = ec["m.new_content"] as Record<string, unknown>;
   const editHtml = newContent.formatted_body as string;
   const editBody = newContent.body as string;
@@ -1769,9 +1828,7 @@ test("matrix adapter: short reasoning is NOT truncated (no notice)", async () =>
   const adapter = await makeAdapter();
   await adapter.start();
   const client = getFakeClient();
-  client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")
-    .mockResolvedValueOnce("$thinking-final");
+  client.sendMessage.mockResolvedValueOnce("$thinking-1");
 
   const source = {
     channel: "matrix" as const,
@@ -1791,11 +1848,19 @@ test("matrix adapter: short reasoning is NOT truncated (no notice)", async () =>
     outcome: "completed",
   });
 
-  const [, editContent] = client.sendMessage.mock.calls[1] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const newContent = (editContent as Record<string, unknown>)[
+  // Final edit goes through sendEvent (MatrixSender.edit)
+  const editCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$thinking-1",
+  );
+  expect(editCall).toBeDefined();
+  const newContent = (editCall![2] as Record<string, unknown>)[
     "m.new_content"
   ] as Record<string, unknown>;
   const editBody = newContent.body as string;
@@ -1813,9 +1878,7 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   client.sendMessage
     .mockResolvedValueOnce("$thinking-1") // initial thinking message
     .mockResolvedValueOnce("$tool-block-1") // tool block
-    .mockResolvedValueOnce("$answer-1") // response
-    .mockResolvedValueOnce("$thinking-final") // final edit at "finished"
-    .mockResolvedValueOnce("$footer-edit-1"); // completion footer edit at "finished"
+    .mockResolvedValueOnce("$answer-1"); // response
 
   const source = {
     channel: "matrix" as const,
@@ -1856,8 +1919,8 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
     text: "Here is the answer.",
   });
 
-  // Only one thinking message — NOT a second placeholder
-  expect(client.sendMessage).toHaveBeenCalledTimes(3); // thinking + tool block + answer
+  // 3 sendMessage calls: thinking + tool block + answer
+  expect(client.sendMessage).toHaveBeenCalledTimes(3);
 
   // Finalize at "finished"
   await adapter.handleTurnLifecycleEvent?.({
@@ -1867,15 +1930,22 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
     outcome: "completed",
   });
 
-  // 5 calls: thinking + tool block + answer + thinking finalize + completion footer edit
-  expect(client.sendMessage).toHaveBeenCalledTimes(5);
+  // Still 3 sendMessage calls; finalize and footer now go through sendEvent
+  expect(client.sendMessage).toHaveBeenCalledTimes(3);
 
-  // 4th call: final edit of thinking message
-  const [, editContent] = client.sendMessage.mock.calls[3] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const ec = editContent as Record<string, unknown>;
+  // Final edit of thinking message via sendEvent
+  const thinkingEditCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$thinking-1",
+  );
+  expect(thinkingEditCall).toBeDefined();
+  const ec = thinkingEditCall![2] as Record<string, unknown>;
   expect(ec["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$thinking-1",
@@ -1886,12 +1956,19 @@ test("matrix adapter: multi-run thinking within one turn is appended with separa
   expect(editHtml).toContain("Second thought.");
   expect(editHtml).toContain("<hr>"); // separator between segments
 
-  // 5th call: completion footer edit on the answer message
-  const [, footerEditContent] = client.sendMessage.mock.calls[4] as [
-    string,
-    Record<string, unknown>,
-  ];
-  const fe = footerEditContent as Record<string, unknown>;
+  // Completion footer edit via sendEvent
+  const footerEditCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$answer-1",
+  );
+  expect(footerEditCall).toBeDefined();
+  const fe = footerEditCall![2] as Record<string, unknown>;
   expect(fe["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$answer-1",
@@ -2026,8 +2103,9 @@ test("matrix adapter !conv list replies with Conversations: list", async () => {
     ),
   );
   expect(call).toBeDefined();
-  const body = (call?.[1] as Record<string, unknown>).body as string;
-  expect(body).toContain("1. default (current)");
+  // The formatted_body (HTML) contains the numbered list; body has it stripped to just the text
+  const html = (call?.[1] as Record<string, unknown>).formatted_body as string;
+  expect(html).toContain("default (current)");
 });
 
 test("matrix adapter !compact replies Compaction triggered.", async () => {
@@ -2531,19 +2609,22 @@ async function setupToolProgressTestAdapter(graceMs = 0) {
 
 function getEditedFormattedBodies(client: FakeMatrixClient): string[] {
   const edits: string[] = [];
-  for (const call of client.sendMessage.mock.calls as Array<
-    [string, Record<string, unknown>]
+  // MatrixSender.edit now goes through sendEvent (not sendMessage)
+  for (const call of client.sendEvent.mock.calls as Array<
+    [string, string, Record<string, unknown>]
   >) {
-    const relatesTo = call[1]["m.relates_to"] as
+    if (call[1] !== "m.room.message") continue;
+    const content = call[2];
+    const relatesTo = content["m.relates_to"] as
       | Record<string, unknown>
       | undefined;
     if (relatesTo?.rel_type !== "m.replace") continue;
-    const newContent = call[1]["m.new_content"] as
+    const newContent = content["m.new_content"] as
       | Record<string, unknown>
       | undefined;
     const html =
       (newContent?.formatted_body as string | undefined) ??
-      (call[1].formatted_body as string | undefined) ??
+      (content.formatted_body as string | undefined) ??
       "";
     edits.push(html);
   }
@@ -2885,9 +2966,7 @@ test("Matrix turn state: finished(error) with thinking block appends error foote
   await adapter.start();
   const client = getLifecycleFakeClient();
 
-  client.sendMessage
-    .mockResolvedValueOnce("$thinking-1") // initial thinking placeholder
-    .mockResolvedValueOnce("$finalize-1"); // final edit at finished
+  client.sendMessage.mockResolvedValueOnce("$thinking-1"); // initial thinking placeholder
 
   await adapter.handleStreamReasoning?.("Checking email…", [
     MATRIX_LIFECYCLE_SOURCE,
@@ -2901,12 +2980,20 @@ test("Matrix turn state: finished(error) with thinking block appends error foote
     outcome: "error",
   });
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
-
-  const [, editContent] = client.sendMessage.mock.calls[1] as [
-    string,
-    Record<string, unknown>,
-  ];
+  // Final edit goes through sendEvent now (MatrixSender.edit)
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const editCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$thinking-1",
+  );
+  expect(editCall).toBeDefined();
+  const editContent = editCall![2] as Record<string, unknown>;
   expect(editContent["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$thinking-1",
@@ -2954,9 +3041,7 @@ test("Matrix turn state: finished(cancelled) with thinking block appends cancell
   await adapter.start();
   const client = getLifecycleFakeClient();
 
-  client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")
-    .mockResolvedValueOnce("$finalize-1");
+  client.sendMessage.mockResolvedValueOnce("$thinking-1");
 
   await adapter.handleStreamReasoning?.("Drafting essay…", [
     MATRIX_LIFECYCLE_SOURCE,
@@ -2970,12 +3055,20 @@ test("Matrix turn state: finished(cancelled) with thinking block appends cancell
     outcome: "cancelled",
   });
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
-
-  const [, editContent] = client.sendMessage.mock.calls[1] as [
-    string,
-    Record<string, unknown>,
-  ];
+  // Final edit goes through sendEvent now (MatrixSender.edit)
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const editCall = client.sendEvent.mock.calls.find(
+    (c) =>
+      c[1] === "m.room.message" &&
+      (
+        (c[2] as Record<string, unknown>)["m.relates_to"] as Record<
+          string,
+          unknown
+        >
+      )?.event_id === "$thinking-1",
+  );
+  expect(editCall).toBeDefined();
+  const editContent = editCall![2] as Record<string, unknown>;
   expect(editContent["m.relates_to"]).toMatchObject({
     rel_type: "m.replace",
     event_id: "$thinking-1",

@@ -27,6 +27,7 @@ import type {
   OutboundChannelMessage,
 } from "../types";
 import { ensureCrossSigning } from "./crossSigning";
+import { MatrixSender } from "./matrixSender";
 import {
   collectMatrixMediaCandidate,
   downloadMatrixAttachment,
@@ -357,6 +358,7 @@ export function createMatrixAdapter(
   } = account;
 
   let matrixClient: MatrixClientLike | null = null;
+  let sender: MatrixSender | null = null;
   let running = false;
 
   // Per-adapter conv list cache keyed by chatId
@@ -672,22 +674,11 @@ export function createMatrixAdapter(
   /** Edit the existing thinking-placeholder message with fresh HTML.
    *  No-op when there's no active placeholder or matrix client. */
   async function editPlaceholder(chatId: string, html: string): Promise<void> {
-    if (!matrixClient) return;
+    if (!sender) return;
     const messageId = reasoningMessageIdByChatId.get(chatId);
     if (!messageId || messageId === "__pending__") return;
-    await matrixClient
-      .sendMessage(chatId, {
-        msgtype: "m.text",
-        body: "* Thinking...",
-        format: "org.matrix.custom.html",
-        "m.new_content": {
-          msgtype: "m.text",
-          body: "* Thinking...",
-          format: "org.matrix.custom.html",
-          formatted_body: html,
-        },
-        "m.relates_to": { rel_type: "m.replace", event_id: messageId },
-      })
+    await sender
+      .edit(chatId, messageId, { text: "Thinking...", html })
       .catch((error) => {
         console.warn(
           "[Matrix] Failed to edit placeholder:",
@@ -725,14 +716,9 @@ export function createMatrixAdapter(
     text: string,
   ): Promise<void> {
     const state = streamStates.get(roomId);
-    if (!state || !matrixClient || state.messageId === "__pending__") return;
+    if (!state || !sender || state.messageId === "__pending__") return;
     try {
-      await matrixClient.sendEvent(roomId, "m.room.message", {
-        msgtype: "m.text",
-        body: text,
-        "m.new_content": { msgtype: "m.text", body: text },
-        "m.relates_to": { rel_type: "m.replace", event_id: state.messageId },
-      });
+      await sender.edit(roomId, state.messageId, { text });
       state.lastEditAt = Date.now();
       state.lastText = text;
     } catch (error: unknown) {
@@ -756,15 +742,13 @@ export function createMatrixAdapter(
    *  if it doesn't. Used at tool_started for tools that fire before any
    *  reasoning content has arrived (e.g. immediate tool calls). */
   async function ensureThinkingPlaceholder(chatId: string): Promise<void> {
-    if (!matrixClient) return;
+    if (!sender) return;
     if (reasoningMessageIdByChatId.has(chatId)) return; // already exists or pending
     reasoningMessageIdByChatId.set(chatId, "__pending__");
     try {
-      const eventId = await matrixClient.sendMessage(chatId, {
-        msgtype: "m.text",
-        body: "Thinking...",
-        format: "org.matrix.custom.html",
-        formatted_body: "<b>Thinking...</b>",
+      const eventId = await sender.sendNew(chatId, {
+        text: "Thinking...",
+        html: "<b>Thinking...</b>",
       });
       reasoningMessageIdByChatId.set(chatId, String(eventId));
       startReasoningFlush(chatId);
@@ -832,7 +816,7 @@ export function createMatrixAdapter(
     footer?: { html: string; text: string },
   ): Promise<void> {
     const messageId = reasoningMessageIdByChatId.get(chatId);
-    if (!messageId || messageId === "__pending__" || !matrixClient) return;
+    if (!messageId || messageId === "__pending__" || !sender) return;
     const rawBuffer = reasoningBufferByChatId.get(chatId) ?? "";
     // Skip if nothing to show and no footer to append.
     if (!rawBuffer && !footer) return;
@@ -848,19 +832,8 @@ export function createMatrixAdapter(
         : "") + (footer ? `<hr>${footer.html}` : "");
     const html = `<b>Thinking</b><br><blockquote>${innerHtml}</blockquote>`;
     const plainText = `Thinking\n${buffer}${footer ? `\n${footer.text}` : ""}`;
-    await matrixClient
-      .sendMessage(chatId, {
-        msgtype: "m.text",
-        body: `* ${plainText}`,
-        format: "org.matrix.custom.html",
-        "m.new_content": {
-          msgtype: "m.text",
-          body: plainText,
-          format: "org.matrix.custom.html",
-          formatted_body: html,
-        },
-        "m.relates_to": { rel_type: "m.replace", event_id: messageId },
-      })
+    await sender
+      .edit(chatId, messageId, { text: plainText, html })
       .catch((error: unknown) => {
         console.warn(
           "[Matrix] Failed to finalize reasoning message:",
@@ -892,7 +865,7 @@ export function createMatrixAdapter(
     const operation = previous
       .catch(() => {})
       .then(async () => {
-        if (!matrixClient) return;
+        if (!sender) return;
 
         // Send thinking placeholder before tool block to guarantee ordering
         if (
@@ -901,11 +874,9 @@ export function createMatrixAdapter(
         ) {
           reasoningMessageIdByChatId.set(chatId, "__pending__");
           try {
-            const eventId = await matrixClient.sendMessage(chatId, {
-              msgtype: "m.text",
-              body: "Thinking...",
-              format: "org.matrix.custom.html",
-              formatted_body: "<b>Thinking...</b>",
+            const eventId = await sender.sendNew(chatId, {
+              text: "Thinking...",
+              html: "<b>Thinking...</b>",
             });
             reasoningMessageIdByChatId.set(chatId, String(eventId));
             startReasoningFlush(chatId);
@@ -928,25 +899,14 @@ export function createMatrixAdapter(
 
         if (!state) {
           // Send new message
-          const eventId = await matrixClient.sendMessage(chatId, {
-            msgtype: "m.text",
-            body: text,
-          });
+          const eventId = await sender.sendNew(chatId, { text });
           toolBlockStateByChatId.set(chatId, {
             messageId: String(eventId),
             groups: newGroups,
           });
         } else {
           // Edit via m.relates_to / m.replace
-          await matrixClient.sendMessage(chatId, {
-            msgtype: "m.text",
-            body: `* ${text}`,
-            "m.new_content": { msgtype: "m.text", body: text },
-            "m.relates_to": {
-              rel_type: "m.replace",
-              event_id: state.messageId,
-            },
-          });
+          await sender.edit(chatId, state.messageId, { text });
           toolBlockStateByChatId.set(chatId, {
             messageId: state.messageId,
             groups: newGroups,
@@ -1053,10 +1013,10 @@ export function createMatrixAdapter(
   async function redactControlRequestReactions(
     req: PendingReactionRequest,
   ): Promise<void> {
-    const client = await ensureClient();
+    if (!sender) return;
     for (const [, reactionEventId] of req.sentReactionEventIds) {
       try {
-        await client.redactEvent(req.chatId, reactionEventId);
+        await sender.redact(req.chatId, reactionEventId);
       } catch {
         // best-effort cleanup
       }
@@ -1071,6 +1031,7 @@ export function createMatrixAdapter(
 
     async start(): Promise<void> {
       matrixClient = await createClient();
+      sender = new MatrixSender(matrixClient);
       const client = matrixClient;
 
       // Auto-accept room invites
@@ -1098,10 +1059,9 @@ export function createMatrixAdapter(
           if (body.startsWith("!")) {
             await handleBotCommand(roomIdStr, body, eventObj).catch(
               async (err) => {
-                await client
-                  .sendMessage(roomIdStr, {
-                    msgtype: "m.text",
-                    body: `Command failed: ${err instanceof Error ? err.message : String(err)}`,
+                await sender
+                  ?.sendNew(roomIdStr, {
+                    text: `Command failed: ${err instanceof Error ? err.message : String(err)}`,
                   })
                   .catch(() => {});
               },
@@ -1303,48 +1263,27 @@ export function createMatrixAdapter(
       // the agent.
       if (msg.editTargetMessageId) {
         const { html, plaintext } = markdownToMatrixHtml(msg.text);
-        const eventId = await client.sendMessage(msg.chatId, {
-          msgtype: "m.text",
-          // Element clients render `* <text>` as the fallback for users on
-          // older clients that don't honor m.replace. Match the format the
-          // adapter already uses for thinking-placeholder edits so behavior
-          // stays consistent.
-          body: `* ${plaintext}`,
-          format: "org.matrix.custom.html",
-          formatted_body: `* ${html}`,
-          "m.new_content": {
-            msgtype: "m.text",
-            body: msg.text,
-            format: "org.matrix.custom.html",
-            formatted_body: html,
-          },
-          "m.relates_to": {
-            rel_type: "m.replace",
-            event_id: msg.editTargetMessageId,
-          },
+        const eventId = await sender!.edit(msg.chatId, msg.editTargetMessageId, {
+          text: plaintext,
+          html,
         });
-        return { messageId: String(eventId) };
+        return { messageId: eventId };
       }
 
       // Reaction add
       if (msg.reaction) {
-        const eventId = await client.sendEvent(msg.chatId, "m.reaction", {
-          "m.relates_to": {
-            rel_type: "m.annotation",
-            event_id: msg.targetMessageId,
-            key: msg.reaction,
-          },
-        });
+        const eventId = await sender!.sendReaction(
+          msg.chatId,
+          msg.targetMessageId!,
+          msg.reaction,
+        );
         return { messageId: String(eventId) };
       }
 
       // Reaction remove
       if (msg.removeReaction && msg.targetMessageId) {
-        const redactionId = await client.redactEvent(
-          msg.chatId,
-          msg.targetMessageId,
-        );
-        return { messageId: String(redactionId) };
+        const redactionId = await sender!.redact(msg.chatId, msg.targetMessageId);
+        return { messageId: redactionId };
       }
 
       // Media upload
@@ -1378,23 +1317,8 @@ export function createMatrixAdapter(
       // (including ChannelAction). Finalization happens only at the "finished" lifecycle event.
       void stopTypingInterval(msg.chatId);
 
-      // Plain text or HTML
-      const content: Record<string, unknown> = {
-        msgtype: "m.text",
-        body: msg.text,
-      };
-
       // Always convert markdown to HTML for proper Matrix rendering
-      content.format = "org.matrix.custom.html";
       const { html, plaintext } = markdownToMatrixHtml(msg.text);
-      content.formatted_body = html;
-      content.body = plaintext;
-
-      if (msg.replyToMessageId) {
-        content["m.relates_to"] = {
-          "m.in_reply_to": { event_id: msg.replyToMessageId },
-        };
-      }
 
       // If a streaming preview message exists, replace it with the final
       // canonical message instead of sending a new one.
@@ -1404,32 +1328,31 @@ export function createMatrixAdapter(
           clearTimeout(streamState.cleanupTimeout);
         if (streamState.pendingTimer) clearTimeout(streamState.pendingTimer);
         streamStates.delete(msg.chatId);
-        await client.sendEvent(msg.chatId, "m.room.message", {
-          msgtype: "m.text",
-          body: msg.text,
-          "m.new_content": content,
-          "m.relates_to": {
-            rel_type: "m.replace",
-            event_id: streamState.messageId,
-          },
+        await sender!.edit(msg.chatId, streamState.messageId, {
+          text: plaintext,
+          html,
         });
 
         // Track for completion footer
         lastResponseByChatId.set(msg.chatId, {
           eventId: streamState.messageId,
           text: msg.text,
-          html: content.formatted_body as string,
+          html,
         });
         return { messageId: streamState.messageId };
       }
 
-      const eventId = await client.sendMessage(msg.chatId, content);
+      const eventId = await sender!.sendNew(msg.chatId, {
+        text: plaintext,
+        html,
+        replyToMessageId: msg.replyToMessageId,
+      });
 
       // Record the last plain-text response for the completion footer.
       lastResponseByChatId.set(msg.chatId, {
         eventId: String(eventId),
         text: msg.text,
-        html: content.formatted_body as string,
+        html,
       });
 
       return { messageId: String(eventId) };
@@ -1440,20 +1363,13 @@ export function createMatrixAdapter(
       text: string,
       options?: { replyToMessageId?: string },
     ): Promise<void> {
-      const client = await ensureClient();
+      await ensureClient();
       const { html, plaintext } = markdownToMatrixHtml(text);
-      const content: Record<string, unknown> = {
-        msgtype: "m.text",
-        body: plaintext,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
-      };
-      if (options?.replyToMessageId) {
-        content["m.relates_to"] = {
-          "m.in_reply_to": { event_id: options.replyToMessageId },
-        };
-      }
-      await client.sendMessage(chatId, content);
+      await sender!.sendNew(chatId, {
+        text: plaintext,
+        html,
+        replyToMessageId: options?.replyToMessageId,
+      });
     },
 
     async handleAutoForward(
@@ -1482,38 +1398,28 @@ export function createMatrixAdapter(
     async handleControlRequestEvent(
       event: ChannelControlRequestEvent,
     ): Promise<void> {
-      const client = await ensureClient();
+      await ensureClient();
       const { chatId, messageId, threadId } = event.source;
 
       const { promptText, emojis } = buildMatrixControlRequestPrompt(event);
 
       const { html, plaintext } = markdownToMatrixHtml(promptText);
-      const replyContent: Record<string, unknown> = {
-        msgtype: "m.text",
-        body: plaintext,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
-      };
       const replyToId = threadId ?? messageId;
-      if (replyToId) {
-        replyContent["m.relates_to"] = {
-          "m.in_reply_to": { event_id: replyToId },
-        };
-      }
-
-      const promptEventId = await client.sendMessage(chatId, replyContent);
+      const promptEventId = await sender!.sendNew(chatId, {
+        text: plaintext,
+        html,
+        replyToMessageId: replyToId ?? undefined,
+      });
 
       // Pre-react with all applicable emojis
       const sentReactionEventIds = new Map<string, string>();
       for (const emoji of emojis) {
         try {
-          const reactionEventId = await client.sendEvent(chatId, "m.reaction", {
-            "m.relates_to": {
-              rel_type: "m.annotation",
-              event_id: promptEventId,
-              key: emoji,
-            },
-          });
+          const reactionEventId = await sender!.sendReaction(
+            chatId,
+            promptEventId,
+            emoji,
+          );
           sentReactionEventIds.set(emoji, String(reactionEventId));
         } catch (err) {
           console.warn(`[matrix] Failed to pre-react with ${emoji}:`, err);
@@ -1702,18 +1608,8 @@ export function createMatrixAdapter(
             `<span data-mx-color="#8b949e">completed in ${durationStr}</span>${usageHtml}`;
           const footerText = `\n✓ completed in ${durationStr}${usageSuffix}`;
 
-          if (pendingText && matrixClient) {
+          if (pendingText && sender) {
             const { html, plaintext } = markdownToMatrixHtml(pendingText);
-            // Bake footer directly into the content so the footer and the
-            // message body are delivered in a single Matrix event. Sending a
-            // separate edit afterwards races with homeserver rate-limits and
-            // causes the footer to be silently dropped on intermittent turns.
-            const finalContent = {
-              msgtype: "m.text",
-              body: plaintext + footerText,
-              format: "org.matrix.custom.html",
-              formatted_body: html + footerHtml,
-            };
 
             // If there is a streaming preview for this room, replace it with
             // the final formatted content instead of sending a second message.
@@ -1752,15 +1648,10 @@ export function createMatrixAdapter(
                   setTimeout(resolve, waitMs),
                 );
               }
-              await matrixClient
-                .sendEvent(chatId, "m.room.message", {
-                  msgtype: "m.text",
-                  body: `* ${pendingText}${footerText}`,
-                  "m.new_content": finalContent,
-                  "m.relates_to": {
-                    rel_type: "m.replace",
-                    event_id: streamState.messageId,
-                  },
+              await sender
+                .edit(chatId, streamState.messageId, {
+                  text: plaintext + footerText,
+                  html: html + footerHtml,
                 })
                 .catch((err: unknown) => {
                   console.warn(
@@ -1770,8 +1661,11 @@ export function createMatrixAdapter(
                 });
               messageId = streamState.messageId;
             } else {
-              const sentEventId = await matrixClient
-                .sendMessage(chatId, finalContent)
+              const sentEventId = await sender
+                .sendNew(chatId, {
+                  text: plaintext + footerText,
+                  html: html + footerHtml,
+                })
                 .catch((err: unknown) => {
                   console.warn(
                     "[Matrix] handleAutoForward send failed:",
@@ -1792,26 +1686,14 @@ export function createMatrixAdapter(
                 );
               }
             }
-          } else if (lastResponse && matrixClient) {
+          } else if (lastResponse && sender) {
             // Fallback: no pending text from auto-forward (e.g. ChannelAction already sent
             // a message this turn, or streaming preview exists but pendingText was skipped
             // by the guard). Edit the lastResponse message to append the footer.
-            await matrixClient
-              .sendEvent(chatId, "m.room.message", {
-                msgtype: "m.text",
-                body: `* ${lastResponse.text}${footerText}`,
-                format: "org.matrix.custom.html",
-                formatted_body: `* ${lastResponse.html}${footerHtml}`,
-                "m.new_content": {
-                  msgtype: "m.text",
-                  body: lastResponse.text + footerText,
-                  format: "org.matrix.custom.html",
-                  formatted_body: lastResponse.html + footerHtml,
-                },
-                "m.relates_to": {
-                  rel_type: "m.replace",
-                  event_id: lastResponse.eventId,
-                },
+            await sender
+              .edit(chatId, lastResponse.eventId, {
+                text: lastResponse.text + footerText,
+                html: lastResponse.html + footerHtml,
               })
               .catch((err: unknown) => {
                 console.warn(
@@ -1839,12 +1721,10 @@ export function createMatrixAdapter(
             const fallbackDetail = event.error
               ? `: ${event.error}`
               : " — the turn didn't complete.";
-            await matrixClient
-              ?.sendMessage(chatId, {
-                msgtype: "m.text",
-                body: `⚠ Turn failed${fallbackDetail}`,
-                format: "org.matrix.custom.html",
-                formatted_body:
+            await sender
+              ?.sendNew(chatId, {
+                text: `⚠ Turn failed${fallbackDetail}`,
+                html:
                   `<span data-mx-color="#f85149">⚠ Turn failed</span>` +
                   `<span data-mx-color="#8b949e">${escapeHtml(fallbackDetail)}</span>`,
               })
@@ -1883,7 +1763,7 @@ export function createMatrixAdapter(
       sources: ChannelTurnSource[],
     ): Promise<void> {
       if (account.showReasoning === false) return;
-      const client = await ensureClient();
+      await ensureClient();
 
       for (const source of sources) {
         const { chatId } = source;
@@ -1909,11 +1789,9 @@ export function createMatrixAdapter(
         if (!reasoningMessageIdByChatId.has(chatId)) {
           reasoningMessageIdByChatId.set(chatId, "__pending__"); // claim the slot immediately
           try {
-            const eventId = await client.sendMessage(chatId, {
-              msgtype: "m.text",
-              body: "Thinking...",
-              format: "org.matrix.custom.html",
-              formatted_body: "<b>Thinking...</b>",
+            const eventId = await sender!.sendNew(chatId, {
+              text: "Thinking...",
+              html: "<b>Thinking...</b>",
             });
             reasoningMessageIdByChatId.set(chatId, String(eventId));
             startReasoningFlush(chatId);
@@ -1932,7 +1810,7 @@ export function createMatrixAdapter(
       accumulatedText: string,
       sources: ChannelTurnSource[],
     ): Promise<void> {
-      if (!running || !matrixClient) return;
+      if (!running || !sender) return;
 
       for (const source of sources) {
         const roomId = source.chatId;
@@ -1957,9 +1835,8 @@ export function createMatrixAdapter(
           streamStates.set(roomId, sentinel);
           await stopTypingInterval(roomId);
           try {
-            const eventId = await matrixClient.sendMessage(roomId, {
-              msgtype: "m.text",
-              body: accumulatedText,
+            const eventId = await sender.sendNew(roomId, {
+              text: accumulatedText,
             });
             sentinel.messageId = String(eventId);
             sentinel.pendingMessageId = null;
@@ -2098,33 +1975,29 @@ export function createMatrixAdapter(
     body: string,
     _event: Record<string, unknown>,
   ): Promise<void> {
-    const client = await ensureClient();
+    await ensureClient();
     const parts = body.trim().split(/\s+/);
     const command = parts[0]?.toLowerCase();
 
     if (command === "!start") {
-      await client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: "Hi! I'm a Letta AI assistant.\n\nTo pair this conversation with an agent, ask your admin for a pairing code and send it here.",
+      await sender!.sendNew(roomId, {
+        text: "Hi! I'm a Letta AI assistant.\n\nTo pair this conversation with an agent, ask your admin for a pairing code and send it here.",
       });
       return;
     }
 
     if (command === "!status") {
-      await client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: `Bot: ${userId}\nDM Policy: ${dmPolicy}`,
+      await sender!.sendNew(roomId, {
+        text: `Bot: ${userId}\nDM Policy: ${dmPolicy}`,
       });
       return;
     }
 
     const sendReply = async (text: string) => {
       const { html, plaintext } = markdownToMatrixHtml(text);
-      await client.sendMessage(roomId, {
-        msgtype: "m.text",
-        body: plaintext,
-        format: "org.matrix.custom.html",
-        formatted_body: html,
+      await sender!.sendNew(roomId, {
+        text: plaintext,
+        html,
       });
     };
 
@@ -2202,7 +2075,7 @@ export function createMatrixAdapter(
       if (pending.senderId !== null && senderIdStr !== pending.senderId) return;
 
       if (emoji === "📝") {
-        const client = await ensureClient();
+        await ensureClient();
         pending.awaitingFreeform = true;
         const freeformKey = buildFreeformKey(roomId, senderIdStr);
         awaitingFreeformByChat.set(freeformKey, pending.requestId);
@@ -2210,10 +2083,7 @@ export function createMatrixAdapter(
           pending.kind === "ask_user_question"
             ? "Please type your answer:"
             : "Please type your reason for denying:";
-        await client.sendMessage(roomId, {
-          msgtype: "m.text",
-          body: followUpText,
-        });
+        await sender!.sendNew(roomId, { text: followUpText });
         return;
       }
 
