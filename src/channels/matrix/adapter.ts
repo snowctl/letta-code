@@ -373,6 +373,9 @@ export function createMatrixAdapter(
 
   interface MatrixStreamState {
     messageId: string;
+    /** Resolves to the real messageId (or null on failure) once the initial
+     *  sendMessage call settles. Set only while messageId === "__pending__". */
+    pendingMessageId: Promise<string | null> | null;
     lastText: string;
     lastEditAt: number;
     pendingTimer: ReturnType<typeof setTimeout> | null;
@@ -1714,6 +1717,11 @@ export function createMatrixAdapter(
 
             // If there is a streaming preview for this room, replace it with
             // the final formatted content instead of sending a second message.
+            // If the initial sendMessage is still in-flight (__pending__), wait
+            // for it — otherwise the else branch posts a duplicate message.
+            if (streamStates.get(chatId)?.pendingMessageId) {
+              await streamStates.get(chatId)!.pendingMessageId;
+            }
             const streamState = streamStates.get(chatId);
             const useStreamReplace =
               streamState && streamState.messageId !== "__pending__";
@@ -1932,8 +1940,12 @@ export function createMatrixAdapter(
           // Claim the slot synchronously before the async send to prevent a
           // race where concurrent void-dispatched calls each see !existing and
           // each create a separate initial message.
+          let resolvePendingMessageId: (id: string | null) => void = () => {};
           const sentinel: MatrixStreamState = {
             messageId: "__pending__",
+            pendingMessageId: new Promise<string | null>((resolve) => {
+              resolvePendingMessageId = resolve;
+            }),
             lastText: accumulatedText,
             lastEditAt: Date.now(),
             pendingTimer: null,
@@ -1948,6 +1960,8 @@ export function createMatrixAdapter(
               body: accumulatedText,
             });
             sentinel.messageId = String(eventId);
+            sentinel.pendingMessageId = null;
+            resolvePendingMessageId(String(eventId));
             // If more text arrived while the initial sendMessage was in flight,
             // send an immediate edit so the latest content is visible right away
             // instead of waiting for the next handleStreamText call + interval check.
@@ -1957,6 +1971,7 @@ export function createMatrixAdapter(
             }
           } catch (error) {
             streamStates.delete(roomId);
+            resolvePendingMessageId(null);
             console.error(
               "[Matrix] Initial stream post failed:",
               error instanceof Error ? error.message : error,
