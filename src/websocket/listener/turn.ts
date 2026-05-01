@@ -709,13 +709,15 @@ export async function handleIncomingMessage(
     // eslint-disable-next-line no-constant-condition
     while (true) {
       if (accumulatedChannelText !== "") {
-        // Notify adapters of a segment boundary so they reset rate-limit timers.
-        // Do NOT clear accumulatedChannelText: adapters reuse the same message
-        // (preserving messageId across resets), so we must keep accumulating to
-        // avoid replacing earlier segments' text with only the new segment's text.
+        // Notify adapters of a segment boundary. The adapter will post a fresh
+        // stream message for this segment so post-tool responses appear after
+        // the tool block in the timeline.
         if (channelSources && channelSources.length > 0) {
           void getChannelRegistry()?.dispatchStreamReset(channelSources);
         }
+        // Reset so the next segment's stream message shows only new text.
+        // finalAssistantText captures the last segment's text for the footer.
+        accumulatedChannelText = "";
       }
       lastAssistantMsgId = null;
       runIdSent = false;

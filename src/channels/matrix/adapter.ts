@@ -2012,13 +2012,10 @@ export function createMatrixAdapter(
         if (state) {
           if (state.pendingTimer) clearTimeout(state.pendingTimer);
           if (state.cleanupTimeout) clearTimeout(state.cleanupTimeout);
-          // Preserve the messageId so the next streaming segment edits the
-          // same Matrix message rather than posting a fresh one. Reset the
-          // rate-limit interval and force an immediate edit on the next chunk.
-          state.pendingTimer = null;
-          state.cleanupTimeout = null;
-          state.currentInterval = MATRIX_STREAM_INTERVAL_MS;
-          state.lastEditAt = 0;
+          // Delete the stream state so the next segment posts a fresh Matrix
+          // message. This ensures the post-tool response appears after the
+          // tool block in the timeline, not before it.
+          streamStates.delete(source.chatId);
         }
       }
     },
