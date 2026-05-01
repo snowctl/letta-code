@@ -1,13 +1,4 @@
 // src/channels/matrix/adapter.ts
-import type { Letta } from "@letta-ai/letta-client";
-import type { Conversation } from "@letta-ai/letta-client/resources/conversations/conversations";
-import { getClient } from "../../agent/client";
-import { formatChannelControlRequestPrompt } from "../interactive";
-import {
-  handleOperatorCommand,
-  type OperatorCommandContext,
-} from "../operator-commands";
-import { getChannelRegistry } from "../registry";
 import {
   renderToolBlock,
   type ToolCallGroup,
@@ -16,14 +7,17 @@ import {
 import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
-  ChannelControlRequestKind,
   ChannelTurnLifecycleEvent,
   ChannelTurnSource,
-  InboundChannelMessage,
   MatrixChannelAccount,
   OutboundChannelMessage,
 } from "../types";
+import { createBotCommands } from "./botCommands";
 import { createMatrixBotSdkClient, type MatrixBotSdkClient } from "./client";
+import {
+  createControlRequests,
+  type PendingReactionRequest,
+} from "./controlRequests";
 import { ensureCrossSigning } from "./crossSigning";
 import {
   buildArgsPreview,
@@ -34,10 +28,13 @@ import {
   markdownToMatrixHtml,
   redactSecrets,
 } from "./htmlFormat";
+import {
+  makeRoomEventHandler,
+  makeRoomMessageHandler,
+  RoomMembersCache,
+} from "./inbound";
 import { MatrixSender } from "./matrixSender";
 import {
-  collectMatrixMediaCandidate,
-  downloadMatrixAttachment,
   inferMimeTypeFromExtension,
   kindToMatrixMsgtype,
   MATRIX_DEFAULT_MAX_DOWNLOAD_BYTES,
@@ -54,28 +51,6 @@ let toolProgressGraceMs = 1_000;
 export function __testSetToolProgressGraceMs(ms: number): void {
   toolProgressGraceMs = ms;
 }
-
-// ── Control request state ─────────────────────────────────────────────────────
-
-const KEYCAP_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
-
-type AskUserQuestionInput = {
-  questions?: Array<{
-    question?: string;
-    options?: Array<{ label?: string; description?: string }>;
-    multiSelect?: boolean;
-  }>;
-};
-
-type PendingReactionRequest = {
-  requestId: string;
-  kind: ChannelControlRequestKind;
-  chatId: string;
-  senderId: string | null;
-  sentEmojis: string[];
-  sentReactionEventIds: Map<string, string>;
-  awaitingFreeform: boolean;
-};
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
 
@@ -96,9 +71,10 @@ export function createMatrixAdapter(
   let matrixClient: MatrixBotSdkClient | null = null;
   let sender: MatrixSender | null = null;
   let running = false;
-
-  // Per-adapter conv list cache keyed by chatId
-  const convListCache = new Map<string, Conversation[]>();
+  let membersCache: RoomMembersCache | null = null;
+  let botCommandsApi: ReturnType<typeof createBotCommands> | null = null;
+  let controlRequestsApi: ReturnType<typeof createControlRequests> | null =
+    null;
 
   // Map from promptMessageEventId → PendingReactionRequest
   const pendingReactionRequests = new Map<string, PendingReactionRequest>();
@@ -127,33 +103,6 @@ export function createMatrixAdapter(
     string,
     ReturnType<typeof setInterval>
   >();
-
-  // ── Inbound metadata cache ────────────────────────────────────────
-  // getJoinedRoomMembers is an HTTP round-trip to the homeserver, used
-  // only to determine chatType (direct vs channel). Membership rarely
-  // changes between messages, so cache with a short TTL and invalidate
-  // on m.room.member state events. Display names are not fetched at
-  // all — the agent gets senderId, which is unique and sufficient.
-  const MEMBERS_CACHE_TTL_MS = 5 * 60 * 1000;
-  const roomMembersCache = new Map<
-    string,
-    { members: string[]; expiresAt: number }
-  >();
-
-  async function getRoomMembersCached(
-    client: MatrixBotSdkClient,
-    roomId: string,
-  ): Promise<string[]> {
-    const now = Date.now();
-    const hit = roomMembersCache.get(roomId);
-    if (hit && hit.expiresAt > now) return hit.members;
-    const members = await client.getJoinedRoomMembers(roomId).catch(() => []);
-    roomMembersCache.set(roomId, {
-      members,
-      expiresAt: now + MEMBERS_CACHE_TTL_MS,
-    });
-    return members;
-  }
 
   // ── Tool block state ─────────────────────────────────────────────
   interface MatrixToolBlockState {
@@ -555,23 +504,6 @@ export function createMatrixAdapter(
     return matrixClient;
   }
 
-  function buildFreeformKey(chatId: string, senderId: string): string {
-    return `${chatId}:${senderId}`;
-  }
-
-  async function redactControlRequestReactions(
-    req: PendingReactionRequest,
-  ): Promise<void> {
-    if (!sender) return;
-    for (const [, reactionEventId] of req.sentReactionEventIds) {
-      try {
-        await sender.redact(req.chatId, reactionEventId);
-      } catch {
-        // best-effort cleanup
-      }
-    }
-  }
-
   const adapter: ChannelAdapter = {
     id: `matrix:${accountId}`,
     channelId: "matrix",
@@ -588,6 +520,24 @@ export function createMatrixAdapter(
       sender = new MatrixSender(matrixClient);
       const client = matrixClient;
 
+      membersCache = new RoomMembersCache();
+      botCommandsApi = createBotCommands({
+        sender,
+        account,
+        accountId,
+        userId,
+        dmPolicy,
+      });
+      controlRequestsApi = createControlRequests({
+        sender,
+        client: matrixClient,
+        pendingReactionRequests,
+        awaitingFreeformByChat,
+        getOnMessage: () => adapter.onMessage,
+        userId,
+        accountId,
+      });
+
       // Auto-accept room invites
       client.on("room.invite", async (roomId: unknown) => {
         try {
@@ -597,139 +547,40 @@ export function createMatrixAdapter(
         }
       });
 
+      const mc = membersCache;
+      const bc = botCommandsApi;
+
       // Text messages and media
-      client.on("room.message", async (roomId: unknown, event: unknown) => {
-        const roomIdStr = roomId as string;
-        const eventObj = event as Record<string, unknown>;
-        if (eventObj.sender === userId) return;
-
-        const content = eventObj.content as Record<string, unknown> | undefined;
-        if (!content) return;
-        const msgtype = content.msgtype as string | undefined;
-
-        // Bot commands
-        if (msgtype === "m.text" || msgtype === "m.notice") {
-          const body = (content.body as string | undefined)?.trim() ?? "";
-          if (body.startsWith("!")) {
-            await handleBotCommand(roomIdStr, body, eventObj).catch(
-              async (err) => {
-                await sender
-                  ?.sendNew(roomIdStr, {
-                    text: `Command failed: ${err instanceof Error ? err.message : String(err)}`,
-                  })
-                  .catch(() => {});
-              },
-            );
-            return;
-          }
-        }
-
-        // Check freeform awaiting
-        const senderIdStr = eventObj.sender as string;
-        const freeformKey = buildFreeformKey(roomIdStr, senderIdStr);
-        const pendingId = awaitingFreeformByChat.get(freeformKey);
-        if (pendingId) {
-          const pendingEntry = [...pendingReactionRequests.entries()].find(
-            ([, v]) => v.requestId === pendingId,
-          );
-          if (pendingEntry) {
-            awaitingFreeformByChat.delete(freeformKey);
-            pendingReactionRequests.delete(pendingEntry[0]);
-            await redactControlRequestReactions(pendingEntry[1]);
-          }
-          // Fall through: emit as normal message so registry handles it as freeform response
-        }
-
-        // Attachments
-        const candidate = collectMatrixMediaCandidate(eventObj);
-        const attachments = [];
-        if (candidate) {
-          let mediaBuffer: Buffer | null = null;
-          try {
-            const { data } = await client.downloadContent(candidate.mxcUrl);
-            mediaBuffer = data;
-          } catch (err) {
-            console.warn(
-              "[Matrix] Failed to download media:",
-              err instanceof Error ? err.message : err,
-            );
-          }
-          if (mediaBuffer) {
-            const attachment = await downloadMatrixAttachment(
-              candidate,
-              mediaBuffer,
-              accountId,
-              maxMediaDownloadBytes,
-              transcribeVoice,
-            );
-            if (attachment) attachments.push(attachment);
-          }
-        }
-
-        const body = ((content.body as string | undefined) ?? "").trim();
-        // Suppress body text for any media-type event: either the candidate
-        // was parsed and body equals the filename (Matrix sends the filename
-        // as body by default), OR the candidate failed to parse (malformed
-        // E2EE / missing URL) in which case body is still just the filename.
-        const isMediaMsgtype = [
-          "m.image",
-          "m.video",
-          "m.audio",
-          "m.file",
-        ].includes(msgtype ?? "");
-        const textContent =
-          (candidate && body === candidate.filename) ||
-          (!candidate && isMediaMsgtype)
-            ? ""
-            : body;
-
-        if (!textContent && attachments.length === 0) return;
-
-        // Start typing before the member-lookup network call so the indicator
-        // appears immediately rather than after the round-trip completes.
-        startTypingInterval(roomIdStr);
-
-        const members = await getRoomMembersCached(client, roomIdStr);
-        const chatType = members.length === 2 ? "direct" : "channel";
-
-        const msg: InboundChannelMessage = {
-          channel: "matrix",
+      client.on(
+        "room.message",
+        makeRoomMessageHandler({
+          client: matrixClient,
+          account,
           accountId,
-          chatId: roomIdStr,
-          senderId: senderIdStr,
-          text: textContent,
-          timestamp: Date.now(),
-          messageId: eventObj.event_id as string | undefined,
-          chatType,
-          attachments: attachments.length > 0 ? attachments : undefined,
-        };
-
-        await adapter.onMessage?.(msg);
-      });
+          userId,
+          sender,
+          membersCache: mc,
+          pendingReactionRequests,
+          awaitingFreeformByChat,
+          startTyping: (chatId) => startTypingInterval(chatId),
+          redactControlRequestReactions:
+            controlRequestsApi.redactControlRequestReactions,
+          handleBotCommand: bc.handleBotCommand,
+          getOnMessage: () => adapter.onMessage,
+          transcribeVoice,
+          maxMediaDownloadBytes,
+        }),
+      );
 
       // Reactions and redactions
-      client.on("room.event", async (roomId: unknown, event: unknown) => {
-        const roomIdStr = roomId as string;
-        const eventObj = event as Record<string, unknown>;
-        const type = eventObj.type as string;
-
-        if (type === "m.reaction") {
-          await handleReactionEvent(roomIdStr, eventObj);
-          return;
-        }
-
-        if (type === "m.room.redaction") {
-          await handleRedactionEvent(roomIdStr, eventObj);
-          return;
-        }
-
-        // Invalidate the room-members cache on membership state changes
-        // so the next inbound message picks up the new member count.
-        if (type === "m.room.member") {
-          roomMembersCache.delete(roomIdStr);
-          return;
-        }
-      });
+      client.on(
+        "room.event",
+        makeRoomEventHandler({
+          membersCache: mc,
+          handleReactionEvent: controlRequestsApi.handleReactionEvent,
+          handleRedactionEvent: controlRequestsApi.handleRedactionEvent,
+        }),
+      );
 
       await client.start();
 
@@ -795,7 +646,8 @@ export function createMatrixAdapter(
       lastResponseByChatId.clear();
       turnStartedAtByChatId.clear();
       pendingResponseTextByChatId.clear();
-      convListCache.clear();
+      botCommandsApi?.getConvListCache().clear();
+      membersCache?.clear();
 
       await matrixClient?.stop();
       running = false;
@@ -960,44 +812,7 @@ export function createMatrixAdapter(
       event: ChannelControlRequestEvent,
     ): Promise<void> {
       await ensureClient();
-      const { chatId, messageId, threadId } = event.source;
-
-      const { promptText, emojis } = buildMatrixControlRequestPrompt(event);
-
-      const { html, plaintext } = markdownToMatrixHtml(promptText);
-      const replyToId = threadId ?? messageId;
-      const promptEventId = await sender!.sendNew(chatId, {
-        text: plaintext,
-        html,
-        replyToMessageId: replyToId ?? undefined,
-      });
-
-      // Pre-react with all applicable emojis
-      const sentReactionEventIds = new Map<string, string>();
-      for (const emoji of emojis) {
-        try {
-          const reactionEventId = await sender!.sendReaction(
-            chatId,
-            promptEventId,
-            emoji,
-          );
-          sentReactionEventIds.set(emoji, String(reactionEventId));
-        } catch (err) {
-          console.warn(`[matrix] Failed to pre-react with ${emoji}:`, err);
-        }
-      }
-
-      // senderId is null when the control request originates from a tool call
-      // (no associated Matrix user). Reaction handling skips the sender check in that case.
-      pendingReactionRequests.set(String(promptEventId), {
-        requestId: event.requestId,
-        kind: event.kind,
-        chatId,
-        senderId: null,
-        sentEmojis: emojis,
-        sentReactionEventIds,
-        awaitingFreeform: false,
-      });
+      await controlRequestsApi!.handleControlRequestEvent(event);
     },
 
     async handleTurnLifecycleEvent(
@@ -1463,354 +1278,5 @@ export function createMatrixAdapter(
     onMessage: undefined,
   };
 
-  // ── Internal helpers ──────────────────────────────────────────────────────
-
-  async function dispatchOperatorCommand(
-    command: string,
-    args: string[],
-    chatId: string,
-  ): Promise<string> {
-    if (command === "help") {
-      return handleOperatorCommand("help", [], {
-        commandPrefix: "!",
-        agentId: "",
-        chatId,
-        client: {} as Letta,
-        getCurrentConvId: () => "default",
-        setCurrentConvId: async () => {},
-        requestCancel: () => false,
-        getConvListCache: () => null,
-        setConvListCache: () => {},
-      });
-    }
-    const registry = getChannelRegistry();
-    const route = registry?.getRoute("matrix", chatId, accountId);
-    if (!route) return "This chat is not connected to an agent.";
-    const client = await getClient();
-    const opCtx: OperatorCommandContext = {
-      agentId: route.agentId,
-      chatId,
-      commandPrefix: "!",
-      client,
-      getCurrentConvId: () =>
-        getChannelRegistry()?.getRoute("matrix", chatId, accountId)
-          ?.conversationId ?? "default",
-      setCurrentConvId: async (id) => {
-        getChannelRegistry()?.updateRouteConversation(
-          "matrix",
-          chatId,
-          accountId,
-          id,
-        );
-      },
-      requestCancel: () => {
-        const liveConvId =
-          getChannelRegistry()?.getRoute("matrix", chatId, accountId)
-            ?.conversationId ?? "default";
-        return registry?.cancelActiveRun(route.agentId, liveConvId) ?? false;
-      },
-      getConvListCache: () => convListCache.get(chatId) ?? null,
-      setConvListCache: (list) => {
-        if (list === null) {
-          convListCache.delete(chatId);
-        } else {
-          convListCache.set(chatId, list);
-        }
-      },
-      onContextWindowChange: (size) => {
-        const liveConvId =
-          getChannelRegistry()?.getRoute("matrix", chatId, accountId)
-            ?.conversationId ?? "default";
-        getChannelRegistry()?.updateContextWindowMax(
-          route.agentId,
-          liveConvId,
-          size,
-        );
-      },
-    };
-    return handleOperatorCommand(command, args, opCtx);
-  }
-
-  async function handleBotCommand(
-    roomId: string,
-    body: string,
-    _event: Record<string, unknown>,
-  ): Promise<void> {
-    await ensureClient();
-    const parts = body.trim().split(/\s+/);
-    const command = parts[0]?.toLowerCase();
-
-    if (command === "!start") {
-      await sender!.sendNew(roomId, {
-        text: "Hi! I'm a Letta AI assistant.\n\nTo pair this conversation with an agent, ask your admin for a pairing code and send it here.",
-      });
-      return;
-    }
-
-    if (command === "!status") {
-      await sender!.sendNew(roomId, {
-        text: `Bot: ${userId}\nDM Policy: ${dmPolicy}`,
-      });
-      return;
-    }
-
-    const sendReply = async (text: string) => {
-      const { html, plaintext } = markdownToMatrixHtml(text);
-      await sender!.sendNew(roomId, {
-        text: plaintext,
-        html,
-      });
-    };
-
-    if (command === "!cancel") {
-      await sendReply(await dispatchOperatorCommand("cancel", [], roomId));
-      return;
-    }
-
-    if (command === "!compact") {
-      await sendReply(await dispatchOperatorCommand("compact", [], roomId));
-      return;
-    }
-
-    if (command === "!recompile") {
-      await sendReply(await dispatchOperatorCommand("recompile", [], roomId));
-      return;
-    }
-
-    if (command === "!conv") {
-      const args = parts.slice(1).filter(Boolean);
-      await sendReply(await dispatchOperatorCommand("conv", args, roomId));
-      return;
-    }
-
-    if (command === "!reset") {
-      const args = parts.slice(1).filter(Boolean);
-      await sendReply(await dispatchOperatorCommand("reset", args, roomId));
-      return;
-    }
-
-    if (command === "!models") {
-      await sendReply(await dispatchOperatorCommand("models", [], roomId));
-      return;
-    }
-
-    if (command === "!model") {
-      const args = parts.slice(1).filter(Boolean);
-      await sendReply(await dispatchOperatorCommand("model", args, roomId));
-      return;
-    }
-
-    if (command === "!ctx") {
-      const args = parts.slice(1).filter(Boolean);
-      await sendReply(await dispatchOperatorCommand("ctx", args, roomId));
-      return;
-    }
-
-    if (command === "!help") {
-      await sendReply(await dispatchOperatorCommand("help", [], roomId));
-      return;
-    }
-  }
-
-  async function handleReactionEvent(
-    roomId: string,
-    event: Record<string, unknown>,
-  ): Promise<void> {
-    const content = event.content as Record<string, unknown> | undefined;
-    const relatesTo = content?.["m.relates_to"] as
-      | Record<string, unknown>
-      | undefined;
-    if (!relatesTo) return;
-
-    const targetEventId = relatesTo.event_id as string | undefined;
-    const emoji = relatesTo.key as string | undefined;
-    const senderIdStr = event.sender as string;
-
-    if (!targetEventId || !emoji) return;
-    if (senderIdStr === userId) return;
-
-    // Check if this targets a pending control request
-    const pending = pendingReactionRequests.get(targetEventId);
-    if (pending) {
-      // If senderId is known, validate the reactor matches
-      if (pending.senderId !== null && senderIdStr !== pending.senderId) return;
-
-      if (emoji === "📝") {
-        await ensureClient();
-        pending.awaitingFreeform = true;
-        const freeformKey = buildFreeformKey(roomId, senderIdStr);
-        awaitingFreeformByChat.set(freeformKey, pending.requestId);
-        const followUpText =
-          pending.kind === "ask_user_question"
-            ? "Please type your answer:"
-            : "Please type your reason for denying:";
-        await sender!.sendNew(roomId, { text: followUpText });
-        return;
-      }
-
-      const syntheticText = emojiToSyntheticText(emoji);
-      if (!syntheticText) return;
-
-      pendingReactionRequests.delete(targetEventId);
-      await redactControlRequestReactions(pending);
-
-      const client = await ensureClient();
-      const members = await client.getJoinedRoomMembers(roomId).catch(() => []);
-      const chatType = members.length === 2 ? "direct" : "channel";
-
-      await adapter.onMessage?.({
-        channel: "matrix",
-        accountId,
-        chatId: roomId,
-        senderId: senderIdStr,
-        text: syntheticText,
-        timestamp: Date.now(),
-        chatType,
-      });
-      return;
-    }
-
-    // Normal reaction — emit as InboundChannelMessage
-    await adapter.onMessage?.({
-      channel: "matrix",
-      accountId,
-      chatId: roomId,
-      senderId: senderIdStr,
-      text: "",
-      timestamp: Date.now(),
-      reaction: {
-        action: "added",
-        emoji,
-        targetMessageId: targetEventId,
-      },
-    });
-  }
-
-  async function handleRedactionEvent(
-    _roomId: string,
-    event: Record<string, unknown>,
-  ): Promise<void> {
-    const redactedEventId = event.redacts as string | undefined;
-    if (!redactedEventId) return;
-
-    // Check if this redaction targets one of our own pre-reactions — if so, ignore
-    for (const [, pending] of pendingReactionRequests) {
-      for (const [, reactionEventId] of pending.sentReactionEventIds) {
-        if (reactionEventId === redactedEventId) {
-          return;
-        }
-      }
-    }
-    // Otherwise: user removed a non-control-request reaction.
-    // matrix-bot-sdk doesn't provide the emoji in the redaction event, so we skip emitting.
-  }
-
   return adapter;
-}
-
-// ── Control request prompt builder ────────────────────────────────────────────
-
-function buildMatrixControlRequestPrompt(event: ChannelControlRequestEvent): {
-  promptText: string;
-  emojis: string[];
-} {
-  switch (event.kind) {
-    case "generic_tool_approval": {
-      const inputStr = JSON.stringify(event.input, null, 2);
-      const truncated =
-        inputStr.length > 1200 ? `${inputStr.slice(0, 1197)}...` : inputStr;
-      const lines = [`The agent wants approval to run \`${event.toolName}\`.`];
-      if (truncated && truncated !== "{}")
-        lines.push("", "Tool input:", truncated);
-      lines.push("", "approve   deny   deny with reason");
-      return { promptText: lines.join("\n"), emojis: ["✅", "❌", "📝"] };
-    }
-
-    case "enter_plan_mode":
-      return {
-        promptText:
-          "The agent wants to enter plan mode before making changes.\n\napprove   deny",
-        emojis: ["✅", "❌"],
-      };
-
-    case "exit_plan_mode": {
-      const lines = [
-        "The agent is ready to leave plan mode and start implementing.",
-      ];
-      if (event.planContent?.trim()) {
-        const preview =
-          event.planContent.length > 1800
-            ? `${event.planContent.slice(0, 1797)}...`
-            : event.planContent;
-        lines.push("", "Proposed plan:", preview);
-        if (event.planFilePath?.trim())
-          lines.push("", `Plan file: ${event.planFilePath.trim()}`);
-      }
-      lines.push("", "approve   provide feedback");
-      return { promptText: lines.join("\n"), emojis: ["✅", "📝"] };
-    }
-
-    case "ask_user_question": {
-      const input = event.input as AskUserQuestionInput;
-      const questions = (input.questions ?? []).filter((q) =>
-        q.question?.trim(),
-      );
-      const firstQ = questions[0];
-
-      if (!firstQ || questions.length > 1) {
-        return {
-          promptText: formatChannelControlRequestPrompt(event),
-          emojis: [],
-        };
-      }
-
-      const options = firstQ.options ?? [];
-      const lines = [
-        "The agent needs an answer before it can continue.",
-        "",
-        firstQ.question ?? "Please choose an option:",
-      ];
-      const emojis: string[] = [];
-
-      options.slice(0, 10).forEach((opt, i) => {
-        const emoji = KEYCAP_EMOJIS[i]!;
-        emojis.push(emoji);
-        const label = opt.label?.trim() || `Option ${i + 1}`;
-        const desc = opt.description?.trim();
-        lines.push(
-          desc ? `  ${emoji}  ${label} — ${desc}` : `  ${emoji}  ${label}`,
-        );
-      });
-
-      if (options.length > 10) {
-        lines.push("", "Additional options (type the number or label):");
-        options.slice(10).forEach((opt, i) => {
-          lines.push(`  ${i + 11}) ${opt.label?.trim() || `Option ${i + 11}`}`);
-        });
-      }
-
-      if (options.length > 0) {
-        emojis.push("📝");
-        lines.push("  📝  type a custom answer");
-      }
-
-      return { promptText: lines.join("\n"), emojis };
-    }
-
-    default: {
-      const _exhaustive: never = event.kind;
-      return {
-        promptText: formatChannelControlRequestPrompt(event),
-        emojis: [],
-      };
-    }
-  }
-}
-
-function emojiToSyntheticText(emoji: string): string | null {
-  if (emoji === "✅") return "approve";
-  if (emoji === "❌") return "deny";
-  const keycapIndex = KEYCAP_EMOJIS.indexOf(emoji);
-  if (keycapIndex !== -1) return String(keycapIndex + 1);
-  return null;
 }
