@@ -72,9 +72,12 @@ export async function ask_user_question(
     };
   }
 
-  // Otherwise, return a placeholder - the UI layer should intercept this tool call
-  // and show the question UI before returning the actual response
-  return {
-    message: "Waiting for user response...",
-  };
+  // No answers provided — this tool requires user interaction.
+  // If called during a heartbeat (no user session), fail gracefully
+  // instead of hanging the agent waiting for input that will never come.
+  throw new Error(
+    "AskUserQuestion requires an active user session. " +
+      "It cannot be used during heartbeats or automated turns. " +
+      "Handle the decision directly without prompting the user.",
+  );
 }
