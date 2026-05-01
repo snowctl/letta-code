@@ -1793,9 +1793,11 @@ export function createMatrixAdapter(
               }
             }
           } else if (lastResponse && matrixClient) {
-            // Fallback: no pending text from auto-forward (e.g. silent turn)
+            // Fallback: no pending text from auto-forward (e.g. ChannelAction already sent
+            // a message this turn, or streaming preview exists but pendingText was skipped
+            // by the guard). Edit the lastResponse message to append the footer.
             await matrixClient
-              .sendMessage(chatId, {
+              .sendEvent(chatId, "m.room.message", {
                 msgtype: "m.text",
                 body: `* ${lastResponse.text}${footerText}`,
                 format: "org.matrix.custom.html",
