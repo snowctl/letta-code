@@ -1720,7 +1720,7 @@ export function createMatrixAdapter(
             // If the initial sendMessage is still in-flight (__pending__), wait
             // for it — otherwise the else branch posts a duplicate message.
             if (streamStates.get(chatId)?.pendingMessageId) {
-              await streamStates.get(chatId)!.pendingMessageId;
+              await streamStates.get(chatId)?.pendingMessageId;
             }
             const streamState = streamStates.get(chatId);
             const useStreamReplace =
