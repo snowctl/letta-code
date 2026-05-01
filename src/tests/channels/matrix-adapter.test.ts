@@ -1459,8 +1459,10 @@ test("Matrix tool block: no thinking placeholder when showReasoning is false", a
     string,
     Record<string, unknown>,
   ];
+  // ToolBlock now renders HTML — body and formatted_body both present.
   expect((content as Record<string, unknown>).body).toContain("bash");
-  expect((content as Record<string, unknown>).formatted_body).toBeUndefined();
+  // formatted_body is now set by ToolBlock (HTML rendering added in Task 6)
+  expect((content as Record<string, unknown>).formatted_body).toContain("bash");
 
   await adapter.stop();
 });
@@ -2636,12 +2638,12 @@ test("Matrix tool progress: tool_started is a no-op shim (per-tool timing moved 
   expect(edits.filter((e) => e.includes("Running"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: timeoutMs shim — no-op in Task 5 (Task 6 wires per-tool timing)", async () => {
-  // timeoutMs will be rendered in ToolBlock (Task 6). In Task 5, tool_started
-  // is a no-op shim — no placeholder edits occur.
+test("Matrix tool progress: tool_started creates tool block entry with args preview", async () => {
+  // In Task 6, tool_started is wired to ToolBlock.onToolStart which creates an
+  // entry with the args preview. The block is posted immediately.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
-  client.sendMessage.mockResolvedValue("$placeholder");
+  client.sendMessage.mockResolvedValue("$tool-block");
 
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
@@ -2654,8 +2656,14 @@ test("Matrix tool progress: timeoutMs shim — no-op in Task 5 (Task 6 wires per
   });
   await new Promise((r) => setTimeout(r, 50));
 
-  // No placeholder created/edited (onToolStart is a no-op shim).
-  expect(client.sendMessage).not.toHaveBeenCalled();
+  // Tool block was posted (tool_started creates block entry in Task 6).
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
+  expect((content as Record<string, unknown>).body).toContain("Bash");
+  expect((content as Record<string, unknown>).body).toContain("npm install");
 });
 
 test("Matrix tool progress: no-timeout tool_started — no-op shim in Task 5", async () => {
@@ -2713,12 +2721,12 @@ test("Matrix tool progress: tool_ended no-op shim — per-tool annotation moves 
   expect(edits.filter((e) => e.includes("took"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: error outcome — no-op shim in Task 5 (errored annotation in ToolBlock, Task 6)", async () => {
-  // Error annotation moves to ToolBlock in Task 6. In Task 5, no placeholder
-  // edits occur for tool_started/tool_ended.
+test("Matrix tool progress: error outcome renders 'errored' annotation in tool block", async () => {
+  // In Task 6, tool_ended with error outcome causes the ToolBlock to render
+  // an "errored after X:XX" annotation in the block.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
-  client.sendMessage.mockResolvedValue("$placeholder");
+  client.sendMessage.mockResolvedValue("$tool-block");
 
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
@@ -2741,9 +2749,9 @@ test("Matrix tool progress: error outcome — no-op shim in Task 5 (errored anno
   });
   await new Promise((r) => setTimeout(r, 30));
 
-  // No errored-after annotation (moved to ToolBlock in Task 6).
+  // ToolBlock edits to show "errored" annotation after tool_ended.
   const edits = getEditedFormattedBodies(client);
-  expect(edits.filter((e) => e.includes("errored"))).toHaveLength(0);
+  expect(edits.filter((e) => e.includes("errored"))).toHaveLength(1);
 });
 
 test("Matrix tool progress: new tool_started — no-op shim in Task 5 (per-tool ordering in ToolBlock, Task 6)", async () => {
@@ -2814,12 +2822,12 @@ test("Matrix tool progress: secret redaction in args — no-op shim in Task 5 (a
   expect(edits.filter((e) => e.includes("sk-supersecret"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: argsPreview truncation — no-op shim in Task 5 (preview in ToolBlock, Task 6)", async () => {
-  // Args preview truncation moves to ToolBlock in Task 6. In Task 5,
-  // tool_started is a no-op shim — no placeholder edits occur.
+test("Matrix tool progress: argsPreview truncation — long command is clipped to 80 chars in tool block", async () => {
+  // In Task 6, tool_started wires to ToolBlock.onToolStart which uses
+  // buildArgsPreview to show a truncated args preview (≤80 chars).
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
-  client.sendMessage.mockResolvedValue("$placeholder");
+  client.sendMessage.mockResolvedValue("$tool-block");
 
   const longCommand =
     "echo this is a very long command that should definitely exceed the eighty character preview limit imposed by buildArgsPreview";
@@ -2834,8 +2842,16 @@ test("Matrix tool progress: argsPreview truncation — no-op shim in Task 5 (pre
   });
   await new Promise((r) => setTimeout(r, 50));
 
-  // No placeholder with arg content (onToolStart is a no-op shim).
-  expect(client.sendMessage).not.toHaveBeenCalled();
+  // Tool block was posted with truncated preview (≤80 chars + "…" = 80 chars).
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
+  const [, content] = client.sendMessage.mock.calls[0] as [
+    string,
+    Record<string, unknown>,
+  ];
+  const body = (content as Record<string, unknown>).body as string;
+  // The args preview should be truncated (not the full longCommand).
+  expect(body).not.toContain(longCommand);
+  expect(body).toContain("…");
 });
 
 test("Matrix tool progress: ChannelAction and NotifyUser do not trigger tool-progress UI", async () => {
@@ -2859,10 +2875,13 @@ test("Matrix tool progress: ChannelAction and NotifyUser do not trigger tool-pro
   expect(edits.length).toBe(0);
 });
 
-test("Matrix tool progress: tool that completes inside grace window is invisible (no running, no annotation)", async () => {
-  const adapter = await setupToolProgressTestAdapter(120); // 120 ms grace
+test("Matrix tool progress: fast tool appears in block without duration (no running indicator)", async () => {
+  // In Task 6, ALL tool_started entries appear in the tool block.
+  // Fast tools (sub-1s) show no duration — no "(0:00)" flicker.
+  // The live ticker is not started if the tool ends before the 1s grace elapses.
+  const adapter = await setupToolProgressTestAdapter(120); // 120 ms grace (unused by ToolBlock directly)
   const client = getLifecycleFakeClient();
-  client.sendMessage.mockResolvedValue("$placeholder");
+  client.sendMessage.mockResolvedValue("$tool-block");
 
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
@@ -2872,7 +2891,7 @@ test("Matrix tool progress: tool that completes inside grace window is invisible
     args: { file_path: "/tmp/instant" },
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
-  // Tool ends well inside the 120 ms grace window.
+  // Tool ends well inside the 1s grace window.
   await new Promise((r) => setTimeout(r, 30));
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
@@ -2883,18 +2902,23 @@ test("Matrix tool progress: tool that completes inside grace window is invisible
     outcome: "success",
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
-  // Wait past the grace window to confirm nothing fires after the fact.
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise((r) => setTimeout(r, 50));
 
   const edits = getEditedFormattedBodies(client);
-  // No placeholder edits at all — neither running block nor took-annotation.
-  expect(edits.length).toBe(0);
-  // And no thinking placeholder was created either (since tool was suppressed
-  // and there was no reasoning content).
-  const placeholderCreates = (
+  // The block shows the tool but no "(running ...)" since it ended before 1s.
+  // There may be 1 edit (tool_ended triggers re-render showing completed entry
+  // without duration).
+  expect(edits.filter((e) => e.includes("running"))).toHaveLength(0);
+  // Tool block WAS created (all tools appear in block).
+  const blockCreates = (
     client.sendMessage.mock.calls as Array<[string, Record<string, unknown>]>
-  ).filter((c) => c[1]["m.relates_to"] === undefined);
-  expect(placeholderCreates.length).toBe(0);
+  ).filter(
+    (c) => (c[1] as Record<string, unknown>)["m.relates_to"] === undefined,
+  );
+  expect(blockCreates.length).toBe(1);
+  expect((blockCreates[0]![1] as Record<string, unknown>).body).toContain(
+    "Read",
+  );
 });
 
 test("Matrix tool progress: grace window — no-op shim in Task 5 (grace-based rendering in ToolBlock, Task 6)", async () => {

@@ -1,14 +1,9 @@
 // src/channels/matrix/turn/ChatTurn.ts
 //
-// Per-chat turn coordinator. Owns the ThinkingBlock and shimmed tool-block /
-// stream-message state for a single Matrix chat. Tasks 6 and 7 replace the
-// shim sections with proper ToolBlock and StreamingMessage instances.
+// Per-chat turn coordinator. Owns the ThinkingBlock, ToolBlock, and shimmed
+// stream-message state for a single Matrix chat. Task 7 replaces the stream
+// shim with a proper StreamingMessage instance.
 
-import {
-  renderToolBlock,
-  type ToolCallGroup,
-  upsertToolCallGroup,
-} from "../../tool-block";
 import type {
   ChannelTurnLifecycleEvent,
   ChannelTurnSource,
@@ -24,6 +19,7 @@ import {
 } from "../htmlFormat";
 import type { MatrixSender } from "../matrixSender";
 import { ThinkingBlock } from "./ThinkingBlock";
+import { ToolBlock, type ToolStartCall } from "./ToolBlock";
 
 const TYPING_TICK_MS = 4_000;
 const MATRIX_STREAM_INTERVAL_MS = 500;
@@ -56,13 +52,13 @@ interface StreamShimState {
 export class ChatTurn {
   // Blocks
   thinking: ThinkingBlock | null = null;
+  private toolBlock: ToolBlock | null = null;
 
   // Stream shim (replaced in Task 7 by StreamingMessage)
   private streamState: StreamShimState | null = null;
 
-  // Tool-block shim (replaced in Task 6 by ToolBlock)
-  private toolBlockMessageId: string | null = null;
-  private toolBlockGroups: ToolCallGroup[] = [];
+  // Serialized gate for finish/sendOutbound — waits for toolBlock.posted before
+  // committing the final response so the block always lands above the answer.
   private toolBlockOp: Promise<void> = Promise.resolve();
 
   // Lifecycle state
@@ -101,56 +97,37 @@ export class ChatTurn {
     this.thinking.appendChunk(text);
   }
 
-  /** Tool call scheduled into the tool-block list.
-   *  Shim — replaced in Task 6 by ToolBlock. */
+  /** Tool call scheduled into the tool-block list. */
   onToolCallScheduled(toolName: string, description?: string): void {
     // Mark tool interruption in thinking block so next reasoning chunk gets separator.
     if (this.thinking) this.thinking.markToolInterruption();
 
-    // Chain tool-block update to serialize edits.
-    this.toolBlockOp = this.toolBlockOp
-      .catch(() => {})
-      .then(async () => {
-        const newGroups = upsertToolCallGroup(
-          this.toolBlockGroups,
-          toolName,
-          description,
-        );
-        const text = renderToolBlock(newGroups);
-        if (this.toolBlockMessageId === null) {
-          const id = await this.deps.sender.sendNew(this.deps.chatId, { text });
-          this.toolBlockMessageId = id;
-        } else {
-          await this.deps.sender.edit(
-            this.deps.chatId,
-            this.toolBlockMessageId,
-            { text },
-          );
-        }
-        this.toolBlockGroups = newGroups;
-      })
-      .catch(() => {});
+    // Ensure a ToolBlock exists for this turn.
+    if (!this.toolBlock) {
+      this.toolBlock = new ToolBlock(this.deps.chatId, this.deps.sender);
+      // Serialize the gate on posted so the tool block always lands above the response.
+      this.toolBlockOp = this.toolBlock.posted.then(() => {}).catch(() => {});
+    }
+
+    // Add the scheduled entry to the block.
+    this.toolBlock.onToolScheduled(toolName, description);
   }
 
-  /** Live-progress signals — no-op shim.
-   *  Task 6 wires per-tool timers to the tool block.
-   *  The thinking-placeholder running-tool inset that today's adapter renders
-   *  is REMOVED here, fixing the empty-thinking-block bug. */
-  onToolStart(_call: {
-    toolCallId: string;
-    toolName: string;
-    args: Record<string, unknown>;
-    timeoutMs?: number;
-  }): void {
-    /* no-op shim until Task 6 */
+  /** Live-progress: tool started — wire to ToolBlock for per-tool timing (fixes #6). */
+  onToolStart(call: ToolStartCall): void {
+    if (!this.toolBlock) {
+      this.toolBlock = new ToolBlock(this.deps.chatId, this.deps.sender);
+      this.toolBlockOp = this.toolBlock.posted.then(() => {}).catch(() => {});
+    }
+    this.toolBlock.onToolStart(call);
   }
 
   onToolEnd(
-    _toolCallId: string,
+    toolCallId: string,
     _durationMs: number,
-    _outcome: "success" | "error",
+    outcome: "success" | "error",
   ): void {
-    /* no-op shim until Task 6 */
+    this.toolBlock?.onToolEnd(toolCallId, outcome);
   }
 
   /** handleStreamText — shim. Task 7 replaces with StreamingMessage. */
@@ -243,8 +220,12 @@ export class ChatTurn {
   ): Promise<void> {
     this.stopTyping();
 
-    // Drain tool-block edits BEFORE final response — fixes issue #1.
-    await this.toolBlockOp.catch(() => {});
+    // Finalize tool block BEFORE final response — fixes issue #1.
+    if (this.toolBlock) {
+      await this.toolBlock.finalize().catch(() => {});
+    } else {
+      await this.toolBlockOp.catch(() => {});
+    }
 
     const durationStr = formatElapsed(Date.now() - this.startedAt);
     const usage = event.usage;
@@ -316,7 +297,7 @@ export class ChatTurn {
   async sendOutbound(
     msg: OutboundChannelMessage,
   ): Promise<{ messageId: string }> {
-    // Drain tool-block first so it lands above the response.
+    // Wait for tool block to be posted so it lands above the response.
     await this.toolBlockOp.catch(() => {});
     this.stopTyping();
 
