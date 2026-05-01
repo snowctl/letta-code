@@ -1,8 +1,9 @@
 // src/channels/matrix/turn/ChatTurn.ts
 //
-// Per-chat turn coordinator. Owns the ThinkingBlock, ToolBlock, and shimmed
-// stream-message state for a single Matrix chat. Task 7 replaces the stream
-// shim with a proper StreamingMessage instance.
+// Per-chat turn coordinator. Owns the ThinkingBlock, ToolBlock, and
+// StreamingMessage for a single Matrix chat. Each stream segment closes by
+// replacing its preview with canonical HTML on tool interruption, not just on
+// turn-end. Task 9 swaps in the streaming-safe markdown formatter.
 
 import type {
   ChannelTurnLifecycleEvent,
@@ -18,12 +19,11 @@ import {
   markdownToMatrixHtml,
 } from "../htmlFormat";
 import type { MatrixSender } from "../matrixSender";
+import { type StreamingFormatter, StreamingMessage } from "./StreamingMessage";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolBlock, type ToolStartCall } from "./ToolBlock";
 
 const TYPING_TICK_MS = 4_000;
-const MATRIX_STREAM_INTERVAL_MS = 500;
-const MATRIX_STREAM_INTERVAL_MAX_MS = 8_000;
 
 export interface ChatTurnDeps {
   chatId: string;
@@ -36,30 +36,11 @@ export interface ChatTurnDeps {
   setLastSentMessageId: (conversationId: string, messageId: string) => void;
 }
 
-// ── Stream shim state (replaced in Task 7) ───────────────────────────────────
-
-interface StreamShimState {
-  messageId: string;
-  /** Resolves to the real messageId (or null on failure) once the initial
-   *  sendMessage call settles. Set only while messageId === "__pending__". */
-  pendingMessageId: Promise<string | null> | null;
-  lastText: string;
-  lastEditAt: number;
-  pendingTimer: ReturnType<typeof setTimeout> | null;
-  currentInterval: number;
-}
-
 export class ChatTurn {
   // Blocks
   thinking: ThinkingBlock | null = null;
   private toolBlock: ToolBlock | null = null;
-
-  // Stream shim (replaced in Task 7 by StreamingMessage)
-  private streamState: StreamShimState | null = null;
-
-  // Serialized gate for finish/sendOutbound — waits for toolBlock.posted before
-  // committing the final response so the block always lands above the answer.
-  private toolBlockOp: Promise<void> = Promise.resolve();
+  private currentStream: StreamingMessage | null = null;
 
   // Lifecycle state
   private lastResponse: { eventId: string; text: string; html: string } | null =
@@ -68,14 +49,18 @@ export class ChatTurn {
   private startedAt = Date.now();
   private typingTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Stream formatter — Task 9 swaps in streamingMarkdownToHtml
+  private streamFormatter: StreamingFormatter = (text) => {
+    const { html, plaintext } = markdownToMatrixHtml(text);
+    return { text: plaintext, html };
+  };
+
   constructor(private deps: ChatTurnDeps) {}
 
   dispose(): void {
     this.stopTyping();
-    if (this.streamState?.pendingTimer) {
-      clearTimeout(this.streamState.pendingTimer);
-    }
-    this.streamState = null;
+    this.currentStream?.dispose();
+    this.currentStream = null;
   }
 
   // ── Lifecycle delegates ────────────────────────────────────────────────────
@@ -105,8 +90,6 @@ export class ChatTurn {
     // Ensure a ToolBlock exists for this turn.
     if (!this.toolBlock) {
       this.toolBlock = new ToolBlock(this.deps.chatId, this.deps.sender);
-      // Serialize the gate on posted so the tool block always lands above the response.
-      this.toolBlockOp = this.toolBlock.posted.then(() => {}).catch(() => {});
     }
 
     // Add the scheduled entry to the block.
@@ -117,7 +100,6 @@ export class ChatTurn {
   onToolStart(call: ToolStartCall): void {
     if (!this.toolBlock) {
       this.toolBlock = new ToolBlock(this.deps.chatId, this.deps.sender);
-      this.toolBlockOp = this.toolBlock.posted.then(() => {}).catch(() => {});
     }
     this.toolBlock.onToolStart(call);
   }
@@ -130,78 +112,32 @@ export class ChatTurn {
     this.toolBlock?.onToolEnd(toolCallId, outcome);
   }
 
-  /** handleStreamText — shim. Task 7 replaces with StreamingMessage. */
+  /** handleStreamText — backed by StreamingMessage. */
   async onStreamText(accumulatedText: string): Promise<void> {
-    if (!this.streamState) {
-      // Claim slot synchronously to prevent races from concurrent calls.
-      let resolvePendingMessageId: (id: string | null) => void = () => {};
-      const sentinel: StreamShimState = {
-        messageId: "__pending__",
-        pendingMessageId: new Promise<string | null>((resolve) => {
-          resolvePendingMessageId = resolve;
-        }),
-        lastText: accumulatedText,
-        lastEditAt: Date.now(),
-        pendingTimer: null,
-        currentInterval: MATRIX_STREAM_INTERVAL_MS,
-      };
-      this.streamState = sentinel;
+    if (!this.currentStream) {
+      this.currentStream = new StreamingMessage(
+        this.deps.chatId,
+        this.deps.sender,
+        this.streamFormatter,
+      );
       this.stopTyping();
-      try {
-        const eventId = await this.deps.sender.sendNew(this.deps.chatId, {
-          text: accumulatedText,
-        });
-        sentinel.messageId = String(eventId);
-        sentinel.pendingMessageId = null;
-        resolvePendingMessageId(String(eventId));
-        // If more text arrived while the initial send was in flight,
-        // send an immediate edit so the latest content is visible right away.
-        if (sentinel.lastText !== accumulatedText) {
-          sentinel.lastEditAt = Date.now();
-          void this.editStreamMessage(sentinel.lastText);
-        }
-      } catch (error) {
-        this.streamState = null;
-        resolvePendingMessageId(null);
-        console.error(
-          "[Matrix] Initial stream post failed:",
-          error instanceof Error ? error.message : error,
-        );
-      }
-      return;
     }
-
-    // Still waiting for the initial sendMessage to resolve — keep latest text.
-    if (this.streamState.messageId === "__pending__") {
-      this.streamState.lastText = accumulatedText;
-      return;
-    }
-
-    this.streamState.lastText = accumulatedText;
-    const elapsed = Date.now() - this.streamState.lastEditAt;
-
-    if (elapsed >= this.streamState.currentInterval) {
-      if (this.streamState.pendingTimer) {
-        clearTimeout(this.streamState.pendingTimer);
-        this.streamState.pendingTimer = null;
-      }
-      void this.editStreamMessage(accumulatedText);
-    } else {
-      if (this.streamState.pendingTimer)
-        clearTimeout(this.streamState.pendingTimer);
-      const state = this.streamState;
-      state.pendingTimer = setTimeout(() => {
-        state.pendingTimer = null;
-        void this.editStreamMessage(state.lastText);
-      }, state.currentInterval - elapsed);
-    }
+    this.currentStream.onChunk(accumulatedText);
   }
 
+  /** Close the current stream segment, replacing its preview with fully-formatted
+   *  HTML. The segment becomes a properly-formatted message in the timeline.
+   *  Next onStreamText call starts a fresh segment. */
   async onStreamReset(): Promise<void> {
-    if (this.streamState?.pendingTimer) {
-      clearTimeout(this.streamState.pendingTimer);
-    }
-    this.streamState = null;
+    if (!this.currentStream) return;
+    const latestText = this.currentStream.latestTextSnapshot;
+    const { html, plaintext } = markdownToMatrixHtml(latestText);
+    const id = await this.currentStream.replaceWithFinal({
+      text: plaintext,
+      html,
+    });
+    this.lastResponse = { eventId: id, text: latestText, html };
+    this.currentStream = null;
   }
 
   setPendingResponseText(text: string): void {
@@ -223,8 +159,6 @@ export class ChatTurn {
     // Finalize tool block BEFORE final response — fixes issue #1.
     if (this.toolBlock) {
       await this.toolBlock.finalize().catch(() => {});
-    } else {
-      await this.toolBlockOp.catch(() => {});
     }
 
     const durationStr = formatElapsed(Date.now() - this.startedAt);
@@ -285,10 +219,9 @@ export class ChatTurn {
       }
     }
 
-    // Clean up dangling stream state.
-    if (this.streamState?.pendingTimer)
-      clearTimeout(this.streamState.pendingTimer);
-    this.streamState = null;
+    // Dispose any dangling stream.
+    this.currentStream?.dispose();
+    this.currentStream = null;
 
     this.deps.onDispose(this.deps.chatId);
   }
@@ -298,41 +231,22 @@ export class ChatTurn {
     msg: OutboundChannelMessage,
   ): Promise<{ messageId: string }> {
     // Wait for tool block to be posted so it lands above the response.
-    await this.toolBlockOp.catch(() => {});
+    if (this.toolBlock) {
+      await this.toolBlock.posted.catch(() => {});
+      await this.toolBlock.drainPending();
+    }
     this.stopTyping();
 
     const { html, plaintext } = markdownToMatrixHtml(msg.text);
 
-    if (this.streamState && this.streamState.messageId !== "__pending__") {
-      // Replace the open stream preview with the canonical response.
-      if (this.streamState.pendingTimer)
-        clearTimeout(this.streamState.pendingTimer);
-      const streamMessageId = this.streamState.messageId;
-      this.streamState = null;
-      await this.deps.sender.edit(this.deps.chatId, streamMessageId, {
+    if (this.currentStream) {
+      const id = await this.currentStream.replaceWithFinal({
         text: plaintext,
         html,
       });
-      this.lastResponse = { eventId: streamMessageId, text: msg.text, html };
-      return { messageId: streamMessageId };
-    }
-
-    // If still pending, wait for it before sending new message.
-    if (this.streamState?.pendingMessageId) {
-      await this.streamState.pendingMessageId;
-      // After awaiting, check if we can now do the stream replace.
-      if (this.streamState && this.streamState.messageId !== "__pending__") {
-        if (this.streamState.pendingTimer)
-          clearTimeout(this.streamState.pendingTimer);
-        const streamMessageId = this.streamState.messageId;
-        this.streamState = null;
-        await this.deps.sender.edit(this.deps.chatId, streamMessageId, {
-          text: plaintext,
-          html,
-        });
-        this.lastResponse = { eventId: streamMessageId, text: msg.text, html };
-        return { messageId: streamMessageId };
-      }
+      this.currentStream = null;
+      this.lastResponse = { eventId: id, text: msg.text, html };
+      return { messageId: id };
     }
 
     const id = await this.deps.sender.sendNew(this.deps.chatId, {
@@ -346,7 +260,7 @@ export class ChatTurn {
 
   // ── Private helpers ────────────────────────────────────────────────────────
 
-  /** Selects the send path for the final response. Refactored in Task 7. */
+  /** Selects the send path for the final response. */
   private async commitFinalResponse(
     footer: { text: string; html: string },
     sources: ReadonlyArray<ChannelTurnSource>,
@@ -355,50 +269,19 @@ export class ChatTurn {
       const { html, plaintext } = markdownToMatrixHtml(
         this.pendingResponseText,
       );
-      const finalText = plaintext + footer.text;
-      const finalHtml = html + footer.html;
-      let messageId: string | null = null;
+      const finalContent = {
+        text: plaintext + footer.text,
+        html: html + footer.html,
+      };
 
-      // If still pending, wait for it.
-      if (this.streamState?.pendingMessageId) {
-        await this.streamState.pendingMessageId;
-      }
-
-      const useStreamReplace =
-        this.streamState && this.streamState.messageId !== "__pending__";
-
-      if (useStreamReplace && this.streamState) {
-        // Wait for rate-limit window to clear before replacing.
-        const waitMs = this.streamState.pendingTimer
-          ? this.streamState.currentInterval
-          : Math.max(
-              0,
-              this.streamState.currentInterval -
-                (Date.now() - this.streamState.lastEditAt),
-            );
-        if (this.streamState.pendingTimer)
-          clearTimeout(this.streamState.pendingTimer);
-        const streamMessageId = this.streamState.messageId;
-        this.streamState = null;
-        if (waitMs > 0) {
-          await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
-        }
-        await this.deps.sender
-          .edit(this.deps.chatId, streamMessageId, {
-            text: finalText,
-            html: finalHtml,
-          })
-          .catch(() => {});
-        messageId = streamMessageId;
+      let messageId: string;
+      if (this.currentStream) {
+        messageId = await this.currentStream.replaceWithFinal(finalContent);
+        this.currentStream = null;
       } else {
-        this.streamState = null;
-        const sentEventId = await this.deps.sender
-          .sendNew(this.deps.chatId, {
-            text: finalText,
-            html: finalHtml,
-          })
-          .catch(() => null);
-        messageId = sentEventId ? String(sentEventId) : null;
+        messageId = await this.deps.sender
+          .sendNew(this.deps.chatId, finalContent)
+          .catch(() => "");
       }
 
       if (messageId) {
@@ -419,30 +302,6 @@ export class ChatTurn {
           html: this.lastResponse.html + footer.html,
         })
         .catch(() => {});
-    }
-  }
-
-  private async editStreamMessage(text: string): Promise<void> {
-    const state = this.streamState;
-    if (!state || state.messageId === "__pending__") return;
-    try {
-      await this.deps.sender.edit(this.deps.chatId, state.messageId, { text });
-      state.lastEditAt = Date.now();
-      state.lastText = text;
-    } catch (error: unknown) {
-      const errCode = (error as { errcode?: string }).errcode;
-      if (errCode === "M_LIMIT_EXCEEDED") {
-        state.currentInterval = Math.min(
-          state.currentInterval * 2,
-          MATRIX_STREAM_INTERVAL_MAX_MS,
-        );
-        if (state.pendingTimer) clearTimeout(state.pendingTimer);
-        state.pendingTimer = setTimeout(() => {
-          state.pendingTimer = null;
-          void this.editStreamMessage(state.lastText);
-        }, state.currentInterval);
-      }
-      // other errors: silently drop (streaming edit failures are non-fatal)
     }
   }
 

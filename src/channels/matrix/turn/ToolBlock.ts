@@ -200,6 +200,12 @@ export class ToolBlock implements MatrixBlock {
     this.scheduleEdit();
   }
 
+  /** Drain any pending serialized edits — used by sendOutbound to ensure the
+   *  tool block has settled before posting the outbound message. */
+  async drainPending(): Promise<void> {
+    await this.op.catch(() => {});
+  }
+
   async finalize(): Promise<void> {
     this.finalized = true;
     // Cancel all pending grace timers.
