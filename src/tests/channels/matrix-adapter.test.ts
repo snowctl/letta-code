@@ -1256,13 +1256,14 @@ test("Matrix turn state: finished(completed) edits last response with completion
   expect(body).toContain("✓ completed in");
 });
 
-test("Matrix tool block: first tool_call sends thinking placeholder then tool block", async () => {
+test("Matrix tool block: first tool_call sends tool block (no thinking placeholder without reasoning)", async () => {
+  // After the empty-thinking-block bug fix, ThinkingBlock is only created on
+  // the first onReasoningChunk. A tool_call without prior reasoning produces
+  // only the tool block — no separate thinking placeholder.
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
-  client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")
-    .mockResolvedValueOnce("$tool-block-1");
+  client.sendMessage.mockResolvedValueOnce("$tool-block-1");
 
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
@@ -1274,36 +1275,24 @@ test("Matrix tool block: first tool_call sends thinking placeholder then tool bl
 
   await new Promise((r) => setTimeout(r, 10));
 
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  // Only 1 sendMessage (tool block) — no thinking placeholder.
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
-  // First call: thinking placeholder (no m.relates_to = new message)
   const [room0, content0] = client.sendMessage.mock.calls[0] as [
     string,
     Record<string, unknown>,
   ];
   expect(room0).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
-  expect(
-    (content0 as Record<string, unknown>).formatted_body as string,
-  ).toContain("<b>Thinking...</b>");
+  expect((content0 as Record<string, unknown>).body).toContain("bash");
   expect((content0 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
-
-  // Second call: tool block (no m.relates_to = new message)
-  const [room1, content1] = client.sendMessage.mock.calls[1] as [
-    string,
-    Record<string, unknown>,
-  ];
-  expect(room1).toBe(MATRIX_LIFECYCLE_SOURCE.chatId);
-  expect((content1 as Record<string, unknown>).body).toContain("bash");
-  expect((content1 as Record<string, unknown>)["m.relates_to"]).toBeUndefined();
 });
 
 test("Matrix tool block: second tool_call edits tool block via m.replace", async () => {
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
-  client.sendMessage
-    .mockResolvedValueOnce("$thinking-1")
-    .mockResolvedValueOnce("$tool-block-1");
+  // No thinking placeholder — only tool block (no prior reasoning).
+  client.sendMessage.mockResolvedValueOnce("$tool-block-1");
 
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
@@ -1321,9 +1310,9 @@ test("Matrix tool block: second tool_call edits tool block via m.replace", async
 
   await new Promise((r) => setTimeout(r, 10));
 
-  // 2 sendMessage calls: thinking placeholder + tool block create
-  // Tool block edit now goes through sendEvent (MatrixSender.edit)
-  expect(client.sendMessage).toHaveBeenCalledTimes(2);
+  // 1 sendMessage call: tool block create (no thinking placeholder)
+  // Tool block edit goes through sendEvent (MatrixSender.edit)
+  expect(client.sendMessage).toHaveBeenCalledTimes(1);
 
   // Tool block edit is the first m.room.message sendEvent with m.replace
   const editCall = client.sendEvent.mock.calls.find(
@@ -1368,16 +1357,12 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
   const sendMessageCalls = client.sendMessage.mock.calls as Array<
     [string, Record<string, unknown>]
   >;
-  // calls[0]: thinking placeholder (no m.relates_to)
+  // Only 1 sendMessage: tool block create (no thinking placeholder without reasoning)
   expect(sendMessageCalls[0]?.[1]["m.relates_to"]).toBeUndefined();
-  expect(
-    (sendMessageCalls[0]?.[1] as Record<string, unknown>)
-      .formatted_body as string,
-  ).toContain("Thinking...");
-  // calls[1]: tool block create (no m.relates_to)
-  expect(sendMessageCalls[1]?.[1]["m.relates_to"]).toBeUndefined();
-  // 1 thinking placeholder + 1 tool block create = 2 sendMessage calls
-  expect(sendMessageCalls).toHaveLength(2);
+  expect((sendMessageCalls[0]?.[1] as Record<string, unknown>).body).toContain(
+    "tool_0",
+  );
+  expect(sendMessageCalls).toHaveLength(1);
 
   // Tool block edits (149 of them) now go through sendEvent (MatrixSender.edit)
   const editCalls = client.sendEvent.mock.calls.filter(
@@ -1400,14 +1385,14 @@ test("Matrix tool block: no size guard — block grows indefinitely", async () =
   expect(editCalls).toHaveLength(149);
 });
 
-test("Matrix tool block: cleared on finished, no redaction (thinking stays)", async () => {
+test("Matrix tool block: cleared on finished, second turn creates fresh tool block", async () => {
+  // After the empty-thinking-block bug fix, no thinking placeholder is sent for
+  // tool_call without prior reasoning. Each turn creates only a tool block.
   const adapter = await makeLifecycleAdapter();
   await adapter.start();
   const client = getLifecycleFakeClient();
   client.sendMessage
-    .mockResolvedValueOnce("$thinking-first")
     .mockResolvedValueOnce("$block-first")
-    .mockResolvedValueOnce("$thinking-second")
     .mockResolvedValueOnce("$block-second");
 
   await adapter.handleTurnLifecycleEvent?.({
@@ -1418,7 +1403,7 @@ test("Matrix tool block: cleared on finished, no redaction (thinking stays)", as
   });
   await new Promise((r) => setTimeout(r, 10));
 
-  // Finish with no response — thinking stays (buffer empty, no final edit, no redact)
+  // Finish with no response — no redactEvent call
   await adapter.handleTurnLifecycleEvent?.({
     type: "finished",
     batchId: "batch-1",
@@ -1438,20 +1423,15 @@ test("Matrix tool block: cleared on finished, no redaction (thinking stays)", as
   });
   await new Promise((r) => setTimeout(r, 10));
 
-  // Second turn's thinking placeholder is a new message (no m.relates_to)
-  const secondThinking = client.sendMessage.mock.calls[2] as [
-    string,
-    Record<string, unknown>,
-  ];
-  expect(secondThinking[1]["m.relates_to"]).toBeUndefined();
-  expect(
-    (secondThinking[1] as Record<string, unknown>).formatted_body as string,
-  ).toContain("Thinking...");
-  const secondTool = client.sendMessage.mock.calls[3] as [
+  // Second turn's tool block is a new message (no m.relates_to)
+  const secondTool = client.sendMessage.mock.calls[1] as [
     string,
     Record<string, unknown>,
   ];
   expect(secondTool[1]["m.relates_to"]).toBeUndefined();
+  expect((secondTool[1] as Record<string, unknown>).body).toContain(
+    "read_file",
+  );
 });
 
 test("Matrix tool block: no thinking placeholder when showReasoning is false", async () => {
@@ -1650,15 +1630,17 @@ test("matrix adapter skips reasoning drawer when showReasoning is false", async 
   await adapter.stop();
 });
 
-test("matrix adapter: thinking placeholder (no reasoning content) stays, plain answer sent", async () => {
+test("matrix adapter: tool_call without reasoning then plain answer (no thinking placeholder)", async () => {
+  // After the empty-thinking-block bug fix, tool_call without prior reasoning
+  // sends only the tool block — no thinking placeholder is created.
+  // The plain answer arrives after as a separate message.
   const { createMatrixAdapter } = await import("../../channels/matrix/adapter");
   const adapter = createMatrixAdapter(TEST_ACCOUNT);
   await adapter.start();
   const client = getFakeClient();
   client.sendMessage
-    .mockResolvedValueOnce("$thinking-placeholder") // from tool call path
     .mockResolvedValueOnce("$tool-block-1")
-    .mockResolvedValueOnce("$plain-response"); // plain answer (buffer empty, no final edit)
+    .mockResolvedValueOnce("$plain-response"); // plain answer
 
   const source = {
     channel: "matrix" as const,
@@ -1668,7 +1650,7 @@ test("matrix adapter: thinking placeholder (no reasoning content) stays, plain a
     conversationId: "conv1",
   };
 
-  // Tool call sends thinking placeholder then tool block
+  // Tool call sends only tool block (no thinking placeholder)
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_call",
     batchId: "b1",
@@ -1677,7 +1659,7 @@ test("matrix adapter: thinking placeholder (no reasoning content) stays, plain a
   });
   await new Promise((r) => setTimeout(r, 10));
 
-  // Response arrives — buffer is empty, so NO final edit of thinking message
+  // Response arrives
   const result = await adapter.sendMessage({
     channel: "matrix",
     accountId: "acc1",
@@ -1685,14 +1667,13 @@ test("matrix adapter: thinking placeholder (no reasoning content) stays, plain a
     text: "Done.",
   });
 
-  // Thinking placeholder is NOT redacted
+  // No redact
   expect(client.redactEvent).not.toHaveBeenCalled();
 
-  // 3 total sendMessage calls: thinking placeholder + tool block + plain answer
-  // (no final edit because buffer was empty)
-  expect(client.sendMessage).toHaveBeenCalledTimes(3);
+  // 2 total sendMessage calls: tool block + plain answer (no thinking placeholder)
+  expect(client.sendMessage).toHaveBeenCalledTimes(2);
 
-  const [, responseContent] = client.sendMessage.mock.calls[2] as [
+  const [, responseContent] = client.sendMessage.mock.calls[1] as [
     string,
     Record<string, unknown>,
   ];
@@ -2631,7 +2612,9 @@ function getEditedFormattedBodies(client: FakeMatrixClient): string[] {
   return edits;
 }
 
-test("Matrix tool progress: tool_started edits placeholder with running tool block", async () => {
+test("Matrix tool progress: tool_started is a no-op shim (per-tool timing moved to Task 6)", async () => {
+  // tool_started/tool_ended are no-op shims in Task 5. Per-tool timing
+  // moves to ToolBlock in Task 6. No placeholder edits should occur.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2646,20 +2629,16 @@ test("Matrix tool progress: tool_started edits placeholder with running tool blo
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
 
-  // Allow the placeholder-create + initial edit to settle.
   await new Promise((r) => setTimeout(r, 50));
 
+  // No placeholder edits — running-tool UI is removed from thinking block.
   const edits = getEditedFormattedBodies(client);
-  expect(edits.length).toBeGreaterThanOrEqual(1);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).toContain("Running");
-  expect(lastEdit).toContain("Bash");
-  expect(lastEdit).toContain("start-camofox.sh --headless");
-  // Default Bash timeout (120s) renders as 2:00 in the m:ss format.
-  expect(lastEdit).toMatch(/0:00\s*\/\s*2:00/);
+  expect(edits.filter((e) => e.includes("Running"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: timeoutMs shown in m:ss when agent set custom timeout", async () => {
+test("Matrix tool progress: timeoutMs shim — no-op in Task 5 (Task 6 wires per-tool timing)", async () => {
+  // timeoutMs will be rendered in ToolBlock (Task 6). In Task 5, tool_started
+  // is a no-op shim — no placeholder edits occur.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2675,12 +2654,13 @@ test("Matrix tool progress: timeoutMs shown in m:ss when agent set custom timeou
   });
   await new Promise((r) => setTimeout(r, 50));
 
-  const edits = getEditedFormattedBodies(client);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).toMatch(/0:00\s*\/\s*10:00/);
+  // No placeholder created/edited (onToolStart is a no-op shim).
+  expect(client.sendMessage).not.toHaveBeenCalled();
 });
 
-test("Matrix tool progress: no `/ max` shown when tool has no timeout", async () => {
+test("Matrix tool progress: no-timeout tool_started — no-op shim in Task 5", async () => {
+  // Per-tool timing moves to ToolBlock in Task 6. In Task 5, tool_started
+  // is a no-op shim — no placeholder edits occur.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2696,16 +2676,14 @@ test("Matrix tool progress: no `/ max` shown when tool has no timeout", async ()
   });
   await new Promise((r) => setTimeout(r, 50));
 
+  // No placeholder created/edited (onToolStart is a no-op shim).
   const edits = getEditedFormattedBodies(client);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).toContain("Running");
-  expect(lastEdit).toContain("Read");
-  expect(lastEdit).toContain("/etc/passwd");
-  // No "X / Y" deadline format; just elapsed.
-  expect(lastEdit).not.toMatch(/\d:\d{2}\s*\/\s*\d:\d{2}/);
+  expect(edits.filter((e) => e.includes("Running"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotation", async () => {
+test("Matrix tool progress: tool_ended no-op shim — per-tool annotation moves to ToolBlock in Task 6", async () => {
+  // tool_ended is a no-op shim in Task 5. Per-tool `took m:ss` annotations
+  // move to ToolBlock in Task 6. No placeholder edits occur.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2719,27 +2697,25 @@ test("Matrix tool progress: tool_ended replaces running with `took m:ss` annotat
     timeoutMs: 120_000,
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
-  await new Promise((r) => setTimeout(r, 30));
-
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-1",
     toolCallId: "call-bash-3",
     toolName: "Bash",
-    durationMs: 107_000, // 1:47
+    durationMs: 107_000,
     outcome: "success",
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
   await new Promise((r) => setTimeout(r, 30));
 
+  // No took-annotation in placeholder (moved to ToolBlock in Task 6).
   const edits = getEditedFormattedBodies(client);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).toContain("Bash");
-  expect(lastEdit).toMatch(/took\s*1:47/);
-  expect(lastEdit).not.toContain("Running");
+  expect(edits.filter((e) => e.includes("took"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: error outcome shows `errored after m:ss`", async () => {
+test("Matrix tool progress: error outcome — no-op shim in Task 5 (errored annotation in ToolBlock, Task 6)", async () => {
+  // Error annotation moves to ToolBlock in Task 6. In Task 5, no placeholder
+  // edits occur for tool_started/tool_ended.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2753,8 +2729,6 @@ test("Matrix tool progress: error outcome shows `errored after m:ss`", async () 
     timeoutMs: 120_000,
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
-  await new Promise((r) => setTimeout(r, 30));
-
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-1",
@@ -2767,17 +2741,18 @@ test("Matrix tool progress: error outcome shows `errored after m:ss`", async () 
   });
   await new Promise((r) => setTimeout(r, 30));
 
+  // No errored-after annotation (moved to ToolBlock in Task 6).
   const edits = getEditedFormattedBodies(client);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).toMatch(/errored after\s*0:04/);
+  expect(edits.filter((e) => e.includes("errored"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: a new tool_started clears the previous `took` annotation", async () => {
+test("Matrix tool progress: new tool_started — no-op shim in Task 5 (per-tool ordering in ToolBlock, Task 6)", async () => {
+  // Per-tool annotations and ordering move to ToolBlock in Task 6. In Task 5,
+  // tool_started/tool_ended are no-ops — no placeholder edits occur.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
 
-  // First tool runs and ends.
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
@@ -2787,7 +2762,6 @@ test("Matrix tool progress: a new tool_started clears the previous `took` annota
     timeoutMs: 120_000,
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
-  await new Promise((r) => setTimeout(r, 30));
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
     batchId: "batch-1",
@@ -2797,10 +2771,6 @@ test("Matrix tool progress: a new tool_started clears the previous `took` annota
     outcome: "success",
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
-  await new Promise((r) => setTimeout(r, 30));
-
-  // Second tool starts. The "took" annotation should be replaced with a fresh
-  // running block — not stacked alongside it.
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_started",
     batchId: "batch-1",
@@ -2811,14 +2781,16 @@ test("Matrix tool progress: a new tool_started clears the previous `took` annota
   });
   await new Promise((r) => setTimeout(r, 30));
 
+  // No "Running" or "took" in placeholder (moved to ToolBlock in Task 6).
   const edits = getEditedFormattedBodies(client);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).toContain("Running");
-  expect(lastEdit).toContain("Read");
-  expect(lastEdit).not.toContain("took");
+  expect(
+    edits.filter((e) => e.includes("Running") || e.includes("took")),
+  ).toHaveLength(0);
 });
 
-test("Matrix tool progress: secret-shaped substrings in args are redacted in the preview", async () => {
+test("Matrix tool progress: secret redaction in args — no-op shim in Task 5 (args preview in ToolBlock, Task 6)", async () => {
+  // Secret redaction in the args preview moves to ToolBlock in Task 6.
+  // In Task 5, tool_started is a no-op — no placeholder edits occur.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2837,14 +2809,14 @@ test("Matrix tool progress: secret-shaped substrings in args are redacted in the
   });
   await new Promise((r) => setTimeout(r, 50));
 
+  // No placeholder with secret content (onToolStart is a no-op shim).
   const edits = getEditedFormattedBodies(client);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).not.toContain("sk-supersecret");
-  expect(lastEdit).not.toContain("abcdef");
-  expect(lastEdit).toContain("&lt;redacted&gt;");
+  expect(edits.filter((e) => e.includes("sk-supersecret"))).toHaveLength(0);
 });
 
-test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis", async () => {
+test("Matrix tool progress: argsPreview truncation — no-op shim in Task 5 (preview in ToolBlock, Task 6)", async () => {
+  // Args preview truncation moves to ToolBlock in Task 6. In Task 5,
+  // tool_started is a no-op shim — no placeholder edits occur.
   const adapter = await setupToolProgressTestAdapter();
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2862,10 +2834,8 @@ test("Matrix tool progress: argsPreview truncates to ≤80 chars with ellipsis",
   });
   await new Promise((r) => setTimeout(r, 50));
 
-  const edits = getEditedFormattedBodies(client);
-  const lastEdit = edits[edits.length - 1]!;
-  expect(lastEdit).toContain("…");
-  expect(lastEdit).not.toContain("buildArgsPreview");
+  // No placeholder with arg content (onToolStart is a no-op shim).
+  expect(client.sendMessage).not.toHaveBeenCalled();
 });
 
 test("Matrix tool progress: ChannelAction and NotifyUser do not trigger tool-progress UI", async () => {
@@ -2927,7 +2897,10 @@ test("Matrix tool progress: tool that completes inside grace window is invisible
   expect(placeholderCreates.length).toBe(0);
 });
 
-test("Matrix tool progress: tool that survives the grace window renders normally and leaves a took-annotation", async () => {
+test("Matrix tool progress: grace window — no-op shim in Task 5 (grace-based rendering in ToolBlock, Task 6)", async () => {
+  // Grace-window rendering moves to ToolBlock in Task 6. In Task 5,
+  // tool_started/tool_ended are no-op shims — no placeholder edits occur
+  // regardless of grace window setting.
   const adapter = await setupToolProgressTestAdapter(50); // 50 ms grace
   const client = getLifecycleFakeClient();
   client.sendMessage.mockResolvedValue("$placeholder");
@@ -2941,7 +2914,6 @@ test("Matrix tool progress: tool that survives the grace window renders normally
     timeoutMs: 120_000,
     sources: [MATRIX_LIFECYCLE_SOURCE],
   });
-  // Wait past the grace window — the running block should now be visible.
   await new Promise((r) => setTimeout(r, 100));
   await adapter.handleTurnLifecycleEvent?.({
     type: "tool_ended",
@@ -2954,11 +2926,11 @@ test("Matrix tool progress: tool that survives the grace window renders normally
   });
   await new Promise((r) => setTimeout(r, 30));
 
+  // No running/took edits in placeholder (moved to ToolBlock in Task 6).
   const edits = getEditedFormattedBodies(client);
-  expect(edits.length).toBeGreaterThanOrEqual(2);
-  // The first edit should be the running block, the last the took-annotation.
-  expect(edits[0]!).toContain("Running");
-  expect(edits[edits.length - 1]!).toMatch(/took\s*0:03/);
+  expect(
+    edits.filter((e) => e.includes("Running") || e.includes("took")),
+  ).toHaveLength(0);
 });
 
 test("Matrix turn state: finished(error) with thinking block appends error footer in blockquote", async () => {
