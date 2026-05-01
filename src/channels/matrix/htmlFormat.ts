@@ -243,3 +243,73 @@ export function wordBoundaryTrim(text: string): string {
   // Ends with punctuation or special char — treat as complete, return as-is.
   return text;
 }
+
+// ── Streaming-safe markdown helpers ──────────────────────────────────────────
+
+/** Strip a trailing partial link/image syntax of the form `[label](something`
+ *  where the closing paren hasn't arrived yet. Returns the input unchanged
+ *  when no such trailing fragment exists. */
+function stripTrailingPartialLink(text: string): string {
+  // Match a [label]( with no closing ) afterwards.
+  const m = text.match(/\[[^\]]*\]\([^)]*$/);
+  if (!m) return text;
+  return text.slice(0, m.index);
+}
+
+/** Strip a trailing `<` that opens a tag never closed. */
+function stripTrailingPartialTag(text: string): string {
+  const lt = text.lastIndexOf("<");
+  if (lt === -1) return text;
+  const after = text.slice(lt);
+  if (after.includes(">")) return text; // closed
+  return text.slice(0, lt);
+}
+
+/** Close any unclosed ``` triple-fence by appending one. */
+function closeUnclosedFences(text: string): string {
+  const fences = (text.match(/```/g) ?? []).length;
+  if (fences % 2 === 1) return `${text}\n\`\`\``;
+  return text;
+}
+
+/** Close any unclosed single-backtick inline code on the last line. */
+function closeUnclosedInlineCode(text: string): string {
+  const lines = text.split("\n");
+  const lastLine = lines[lines.length - 1] ?? "";
+  // Count single backticks that aren't part of triple-backtick sequences.
+  const singles = (lastLine.match(/(?<!`)`(?!`)/g) ?? []).length;
+  if (singles % 2 === 1) return `${text}\``;
+  return text;
+}
+
+/** Close unclosed bold and italic markers.
+ *  Process double-markers before single so "**foo" closes properly. */
+function closeUnclosedEmphasis(text: string): string {
+  let s = text;
+  // **bold**
+  if ((s.match(/\*\*/g) ?? []).length % 2 === 1) s += "**";
+  // __bold__
+  if ((s.match(/__/g) ?? []).length % 2 === 1) s += "__";
+  // single * — not adjacent to another *
+  const singleStars = (s.match(/(?<!\*)\*(?!\*)/g) ?? []).length;
+  if (singleStars % 2 === 1) s += "*";
+  const singleUnders = (s.match(/(?<!_)_(?!_)/g) ?? []).length;
+  if (singleUnders % 2 === 1) s += "_";
+  return s;
+}
+
+/** Render partial markdown as Matrix HTML without producing broken output
+ *  for fragments mid-stream. Pre-processes to close unclosed fences/
+ *  emphasis and strip trailing partial link/tag syntax, then runs marked. */
+export function streamingMarkdownToHtml(partial: string): { text: string; html: string } {
+  let safe = partial;
+  // Strip trailing partial tag/link FIRST (before counting emphasis markers).
+  safe = stripTrailingPartialTag(safe);
+  safe = stripTrailingPartialLink(safe);
+  // Close structural markdown fragments.
+  safe = closeUnclosedFences(safe);
+  safe = closeUnclosedInlineCode(safe);
+  safe = closeUnclosedEmphasis(safe);
+  const { html, plaintext } = markdownToMatrixHtml(safe);
+  return { html, text: plaintext };
+}

@@ -17,6 +17,7 @@ import {
   formatCompact,
   formatElapsed,
   markdownToMatrixHtml,
+  streamingMarkdownToHtml,
 } from "../htmlFormat";
 import type { MatrixSender } from "../matrixSender";
 import { type StreamingFormatter, StreamingMessage } from "./StreamingMessage";
@@ -49,9 +50,10 @@ export class ChatTurn {
   private startedAt = Date.now();
   private typingTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Stream formatter — Task 9 swaps in streamingMarkdownToHtml
+  // Stream formatter — uses streaming-safe markdown for live previews.
+  // replaceWithFinal callers use markdownToMatrixHtml directly (input is complete).
   private streamFormatter: StreamingFormatter = (text) => {
-    const { html, plaintext } = markdownToMatrixHtml(text);
+    const { html, text: plaintext } = streamingMarkdownToHtml(text);
     return { text: plaintext, html };
   };
 
