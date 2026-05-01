@@ -3,7 +3,11 @@
 // Reasoning text only. Lazy-constructed by ChatTurn on the first
 // onReasoningChunk — turns with no reasoning never post a placeholder.
 
-import { clipReasoningForMatrix, escapeHtml, wordBoundaryTrim } from "../htmlFormat";
+import {
+  clipReasoningForMatrix,
+  escapeHtml,
+  wordBoundaryTrim,
+} from "../htmlFormat";
 import type { MatrixSender } from "../matrixSender";
 
 export interface MatrixBlock {

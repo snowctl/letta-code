@@ -69,7 +69,11 @@ export class MatrixSender {
     }
     outer["m.new_content"] = newContent;
     outer["m.relates_to"] = { rel_type: "m.replace", event_id: targetEventId };
-    const eventId = await this.client.sendEvent(roomId, "m.room.message", outer);
+    const eventId = await this.client.sendEvent(
+      roomId,
+      "m.room.message",
+      outer,
+    );
     return String(eventId);
   }
 

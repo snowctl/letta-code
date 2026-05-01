@@ -70,7 +70,6 @@ export function makeRoomMessageHandler(deps: RoomMessageHandlerDeps) {
     startTyping,
     redactControlRequestReactions,
     handleBotCommand,
-    getOnMessage,
     transcribeVoice,
     maxMediaDownloadBytes,
   } = deps;

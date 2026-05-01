@@ -21,14 +21,20 @@ export function htmlTableToAscii(html: string): string | null {
   const rowRegex = /<tr[^>]*>(.*?)<\/tr>/gis;
   const cellRegex = /<(?:th|td)[^>]*>([\s\S]*?)<\/(?:th|td)>/gi;
 
-  let rowMatch: RegExpExecArray | null;
-  while ((rowMatch = rowRegex.exec(html)) !== null) {
+  for (
+    let rowMatch = rowRegex.exec(html);
+    rowMatch !== null;
+    rowMatch = rowRegex.exec(html)
+  ) {
     const rowHtml = rowMatch[1] ?? "";
     const cells: string[] = [];
-    let cellMatch: RegExpExecArray | null;
-    while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+    for (
+      let cellMatch = cellRegex.exec(rowHtml);
+      cellMatch !== null;
+      cellMatch = cellRegex.exec(rowHtml)
+    ) {
       // Strip HTML tags from cell content, collapse whitespace
-      let cell = (cellMatch[1] ?? "")
+      const cell = (cellMatch[1] ?? "")
         .replace(/<[^>]+>/g, "")
         .replace(/&nbsp;/g, " ")
         .replace(/&amp;/g, "&")
@@ -47,7 +53,7 @@ export function htmlTableToAscii(html: string): string | null {
   if (rows.length === 0) return null;
 
   // Calculate column widths
-  const numCols = Math.max(...rows.map(r => r.length));
+  const numCols = Math.max(...rows.map((r) => r.length));
   const widths = new Array(numCols).fill(0);
   for (const row of rows) {
     for (let i = 0; i < numCols; i++) {
@@ -67,14 +73,16 @@ export function htmlTableToAscii(html: string): string | null {
     return s + " ".repeat(Math.max(0, padLen));
   };
 
-  const separator = rows.map((_, i) => {
-    const w = widths[i];
-    return "-".repeat(w);
-  }).join(" | ");
+  const separator = rows
+    .map((_, i) => {
+      const w = widths[i];
+      return "-".repeat(w);
+    })
+    .join(" | ");
 
   const lines: string[] = [];
   for (let ri = 0; ri < rows.length; ri++) {
-    const row = rows[ri]!;
+    const row = rows[ri] ?? [];
     const cells = row.map((c, i) => pad(c, widths[i])).join(" | ");
     lines.push(cells);
     // Insert separator after header row (first row)
@@ -93,7 +101,10 @@ export function htmlTableToAscii(html: string): string | null {
  * is kept as `formatted_body`. This ensures Element X iOS (which doesn't
  * render <table>) still sees a readable representation.
  */
-export function markdownToMatrixHtml(text: string): { html: string; plaintext: string } {
+export function markdownToMatrixHtml(text: string): {
+  html: string;
+  plaintext: string;
+} {
   const html = (marked.parse(text) as string).trimEnd();
   const ascii = htmlTableToAscii(html);
   return {
@@ -301,7 +312,10 @@ function closeUnclosedEmphasis(text: string): string {
 /** Render partial markdown as Matrix HTML without producing broken output
  *  for fragments mid-stream. Pre-processes to close unclosed fences/
  *  emphasis and strip trailing partial link/tag syntax, then runs marked. */
-export function streamingMarkdownToHtml(partial: string): { text: string; html: string } {
+export function streamingMarkdownToHtml(partial: string): {
+  text: string;
+  html: string;
+} {
   let safe = partial;
   // Strip trailing partial tag/link FIRST (before counting emphasis markers).
   safe = stripTrailingPartialTag(safe);

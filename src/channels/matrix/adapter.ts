@@ -29,14 +29,11 @@ import {
 import { ChatTurn } from "./turn/ChatTurn";
 import { ChatTurnRegistry } from "./turn/ChatTurnRegistry";
 
-// ── Tool-progress UX threshold ────────────────────────────────────────────────
-// Kept for backward-compat with tests that call __testSetToolProgressGraceMs.
-// Task 6 wires per-tool timing into ToolBlock; this shim becomes a no-op.
-let toolProgressGraceMs = 1_000;
-
-/** Test-only override of the grace window. Production code must not call this. */
-export function __testSetToolProgressGraceMs(ms: number): void {
-  toolProgressGraceMs = ms;
+/** Test-only shim — previously controlled the tool-progress grace window.
+ *  Task 6 moved per-tool timing into ToolBlock (LIVE_GRACE_MS). This export
+ *  is kept for backward-compat with tests; it is a deliberate no-op. */
+export function __testSetToolProgressGraceMs(_ms: number): void {
+  // no-op: grace window is now controlled by ToolBlock.LIVE_GRACE_MS
 }
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
@@ -100,10 +97,12 @@ export function createMatrixAdapter(
       registry = new ChatTurnRegistry((chatId) => {
         return new ChatTurn({
           chatId,
+          // biome-ignore lint/style/noNonNullAssertion: start() sets both sender and matrixClient before registry is used
           sender: sender!,
+          // biome-ignore lint/style/noNonNullAssertion: start() sets both sender and matrixClient before registry is used
           client: matrixClient!,
           account,
-          onDispose: (id) => registry!.delete(id),
+          onDispose: (id) => registry?.delete(id),
           setLastSentMessageId: (convId, msgId) =>
             lastSentMessageIdByConversationId.set(convId, msgId),
         });
@@ -151,7 +150,7 @@ export function createMatrixAdapter(
           membersCache: mc,
           pendingReactionRequests,
           awaitingFreeformByChat,
-          startTyping: (chatId) => registry!.getOrCreate(chatId).onProcessing(),
+          startTyping: (chatId) => registry?.getOrCreate(chatId).onProcessing(),
           redactControlRequestReactions:
             controlRequestsApi.redactControlRequestReactions,
           handleBotCommand: bc.handleBotCommand,
@@ -227,6 +226,7 @@ export function createMatrixAdapter(
       // the agent.
       if (msg.editTargetMessageId) {
         const { html, plaintext } = markdownToMatrixHtml(msg.text);
+        // biome-ignore lint/style/noNonNullAssertion: ensureClient() above guarantees sender is non-null
         const eventId = await sender!.edit(
           msg.chatId,
           msg.editTargetMessageId,
@@ -240,8 +240,10 @@ export function createMatrixAdapter(
 
       // Reaction add
       if (msg.reaction) {
+        // biome-ignore lint/style/noNonNullAssertion: ensureClient() above guarantees sender is non-null
         const eventId = await sender!.sendReaction(
           msg.chatId,
+          // biome-ignore lint/style/noNonNullAssertion: msg.reaction implies msg.targetMessageId is set
           msg.targetMessageId!,
           msg.reaction,
         );
@@ -250,6 +252,7 @@ export function createMatrixAdapter(
 
       // Reaction remove
       if (msg.removeReaction && msg.targetMessageId) {
+        // biome-ignore lint/style/noNonNullAssertion: ensureClient() above guarantees sender is non-null
         const redactionId = await sender!.redact(
           msg.chatId,
           msg.targetMessageId,
@@ -276,6 +279,7 @@ export function createMatrixAdapter(
 
       // Delegate plain-text path to ChatTurn (drains tool block, handles
       // stream-replace, tracks lastResponse for completion footer).
+      // biome-ignore lint/style/noNonNullAssertion: ensureClient() above guarantees the adapter is running and registry is set
       return registry!.getOrCreate(msg.chatId).sendOutbound(msg);
     },
 
@@ -286,7 +290,7 @@ export function createMatrixAdapter(
     ): Promise<void> {
       await ensureClient();
       const { html, plaintext } = markdownToMatrixHtml(text);
-      await sender!.sendNew(chatId, {
+      await sender?.sendNew(chatId, {
         text: plaintext,
         html,
         replyToMessageId: options?.replyToMessageId,
@@ -300,7 +304,7 @@ export function createMatrixAdapter(
       // Deferred: store text in ChatTurn; the "finished" handler sends it
       // after finalizing the thinking block to maintain timeline order.
       for (const source of sources) {
-        registry!.getOrCreate(source.chatId).setPendingResponseText(text);
+        registry?.getOrCreate(source.chatId).setPendingResponseText(text);
       }
       return undefined;
     },
@@ -313,7 +317,7 @@ export function createMatrixAdapter(
       event: ChannelControlRequestEvent,
     ): Promise<void> {
       await ensureClient();
-      await controlRequestsApi!.handleControlRequestEvent(event);
+      await controlRequestsApi?.handleControlRequestEvent(event);
     },
 
     async handleTurnLifecycleEvent(
@@ -322,13 +326,13 @@ export function createMatrixAdapter(
       if (!running) return;
 
       if (event.type === "queued") {
-        registry!.getOrCreate(event.source.chatId).onQueued();
+        registry?.getOrCreate(event.source.chatId).onQueued();
         return;
       }
 
       if (event.type === "processing") {
         for (const source of event.sources) {
-          registry!.getOrCreate(source.chatId).onProcessing();
+          registry?.getOrCreate(source.chatId).onProcessing();
         }
         return;
       }
@@ -341,7 +345,7 @@ export function createMatrixAdapter(
         )
           return;
         for (const source of event.sources) {
-          registry!.getOrCreate(source.chatId).onToolStart({
+          registry?.getOrCreate(source.chatId).onToolStart({
             toolCallId: event.toolCallId,
             toolName: event.toolName,
             args: event.args,
@@ -358,8 +362,8 @@ export function createMatrixAdapter(
         )
           return;
         for (const source of event.sources) {
-          registry!
-            .get(source.chatId)
+          registry
+            ?.get(source.chatId)
             ?.onToolEnd(event.toolCallId, event.durationMs, event.outcome);
         }
         return;
@@ -372,8 +376,8 @@ export function createMatrixAdapter(
         )
           return;
         for (const source of event.sources) {
-          registry!
-            .getOrCreate(source.chatId)
+          registry
+            ?.getOrCreate(source.chatId)
             .onToolCallScheduled(event.toolName, event.description);
         }
         return;
@@ -382,7 +386,7 @@ export function createMatrixAdapter(
       // "finished" — use getOrCreate so a cold error event still sends a
       // fallback message even when no prior turn state exists.
       for (const source of event.sources) {
-        await registry!.getOrCreate(source.chatId).finish(event);
+        await registry?.getOrCreate(source.chatId).finish(event);
       }
     },
 
@@ -392,7 +396,7 @@ export function createMatrixAdapter(
     ): Promise<void> {
       if (!running) return;
       for (const source of sources) {
-        await registry!.getOrCreate(source.chatId).onReasoningChunk(chunk);
+        await registry?.getOrCreate(source.chatId).onReasoningChunk(chunk);
       }
     },
 
@@ -402,8 +406,8 @@ export function createMatrixAdapter(
     ): Promise<void> {
       if (!running) return;
       for (const source of sources) {
-        await registry!
-          .getOrCreate(source.chatId)
+        await registry
+          ?.getOrCreate(source.chatId)
           .onStreamText(accumulatedText);
       }
     },
@@ -411,7 +415,7 @@ export function createMatrixAdapter(
     async handleStreamReset(sources: ChannelTurnSource[]): Promise<void> {
       if (!running) return;
       for (const source of sources) {
-        await registry!.get(source.chatId)?.onStreamReset();
+        await registry?.get(source.chatId)?.onStreamReset();
       }
     },
 
