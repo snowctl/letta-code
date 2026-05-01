@@ -3,7 +3,7 @@
 // Reasoning text only. Lazy-constructed by ChatTurn on the first
 // onReasoningChunk — turns with no reasoning never post a placeholder.
 
-import { clipReasoningForMatrix, escapeHtml } from "../htmlFormat";
+import { clipReasoningForMatrix, escapeHtml, wordBoundaryTrim } from "../htmlFormat";
 import type { MatrixSender } from "../matrixSender";
 
 export interface MatrixBlock {
@@ -97,7 +97,14 @@ export class ThinkingBlock implements MatrixBlock {
   }
 
   private buildPlaceholderHtml(): string | null {
-    const buffer = clipReasoningForMatrix(this.buffer);
+    // Split on separator markers, word-trim only the last segment, rejoin.
+    const SEP = "\n--\n";
+    const parts = this.buffer.split(SEP);
+    const lastPart = parts[parts.length - 1] ?? "";
+    const trimmedLast = wordBoundaryTrim(lastPart);
+    parts[parts.length - 1] = trimmedLast;
+    const trimmed = parts.join(SEP);
+    const buffer = clipReasoningForMatrix(trimmed);
     if (!buffer) return null;
     const inner = escapeHtml(buffer)
       .replace(/\n--\n/g, "<hr>")

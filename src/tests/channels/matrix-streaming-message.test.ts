@@ -33,7 +33,8 @@ test("subsequent chunks edit, throttled to 250ms floor", async () => {
   const sm = new StreamingMessage("!r:t", sender, passthroughFormatter);
   sm.onChunk("hello");
   await sm.posted;
-  sm.onChunk("hello world");
+  // Use "hello world more" so wordBoundaryTrim gives "hello world" — growth past "hello".
+  sm.onChunk("hello world more");
   // Within 250ms window, no edit yet.
   await new Promise((r) => setTimeout(r, 50));
   expect(edit).not.toHaveBeenCalled();

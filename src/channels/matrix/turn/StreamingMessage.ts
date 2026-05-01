@@ -4,6 +4,7 @@
 // produces a sequence of messages: stream segment 1 → tool → stream segment 2
 // → final. StreamingMessage owns the throttle/backoff/leading-edge edit logic
 // for a single segment. Task 9 wires in the streaming-safe markdown formatter.
+import { wordBoundaryTrim } from "../htmlFormat";
 import type { MatrixSender } from "../matrixSender";
 import type { MatrixBlock } from "./ThinkingBlock";
 
@@ -126,15 +127,15 @@ export class StreamingMessage implements MatrixBlock {
 
   async flushNow(): Promise<void> {
     if (this.disposed || this.eventId === null) return;
-    const text = this.latestText;
-    if (text === this.lastFlushedText) return;
-    const { text: rendered, html } = this.formatter(text);
+    const flushable = wordBoundaryTrim(this.latestText);
+    if (flushable === this.lastFlushedText) return;
+    const { text: rendered, html } = this.formatter(flushable);
     try {
       await this.sender.edit(this.chatId, this.eventId, {
         text: rendered,
         html,
       });
-      this.lastFlushedText = text;
+      this.lastFlushedText = flushable;
       this.lastEditAt = Date.now();
     } catch (err) {
       const code = (err as { errcode?: string }).errcode;

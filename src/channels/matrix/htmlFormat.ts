@@ -222,3 +222,24 @@ export function clipReasoningForMatrix(buffer: string): string {
   );
   return noticeWithSeparator + tail;
 }
+
+/** Trim text to the last whitespace boundary so streamed flushes end on
+ *  a complete word. Returns the full input when no whitespace has yet
+ *  appeared (initial post can't withhold all text), or when the text
+ *  ends at a word boundary (trailing punctuation or alphanumeric at end
+ *  of a sentence). */
+export function wordBoundaryTrim(text: string): string {
+  // If the text ends with trailing whitespace, strip it.
+  if (/\s$/.test(text)) {
+    return text.trimEnd();
+  }
+  // If the text ends with a letter or digit (mid-word), trim to last space.
+  // Punctuation at end (. ! ? , ; : ) ] " ') signals a complete word/sentence.
+  if (/[a-zA-Z0-9]$/.test(text)) {
+    const lastSpace = text.search(/\s\S*$/);
+    if (lastSpace <= 0) return text; // no whitespace or nothing before it
+    return text.slice(0, lastSpace);
+  }
+  // Ends with punctuation or special char — treat as complete, return as-is.
+  return text;
+}
